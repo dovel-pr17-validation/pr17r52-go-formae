@@ -1,0 +1,449 @@
+// © 2025 Platform Engineering Labs Inc.
+//
+// SPDX-License-Identifier: FSL-1.1-ALv2
+
+package metastructure
+
+import (
+	"fmt"
+	"time"
+
+	"ergo.services/actor/statemachine"
+	"ergo.services/ergo/gen"
+
+	"github.com/platform-engineering-labs/formae/internal/datastore"
+	"github.com/platform-engineering-labs/formae/internal/metastructure/actornames"
+	"github.com/platform-engineering-labs/formae/internal/metastructure/changeset"
+	"github.com/platform-engineering-labs/formae/internal/metastructure/config"
+	"github.com/platform-engineering-labs/formae/internal/metastructure/forma_command"
+	"github.com/platform-engineering-labs/formae/internal/metastructure/forma_persister"
+	"github.com/platform-engineering-labs/formae/internal/metastructure/messages"
+	"github.com/platform-engineering-labs/formae/internal/metastructure/resource_update"
+	"github.com/platform-engineering-labs/formae/internal/metastructure/target_update"
+	pkgmodel "github.com/platform-engineering-labs/formae/pkg/model"
+)
+
+// Synchronizer is the actor responsible for keeping all resources in inventory in sync with the deployed
+// infrastructure. It runs on a scheduled interval.
+//
+// The state transitions are as follows:
+//
+//				+-----------------------+
+//			 -->|         Idle          |---
+//			|   +-----------------------+   |
+//			|                               |
+//			|                               |
+//			|                               |
+//			|                               |
+//			|                               |                 -
+//			|                               |
+//			|   +-----------------------+   |
+//			 ---|     Synchronizing     |<---
+//				+-----------------------+
+
+func NewSynchronizer() gen.ProcessBehavior {
+	return &Synchronizer{}
+}
+
+type SynchronizeSingleResource struct {
+	URI pkgmodel.FormaeURI
+}
+
+type ResourceSynchronized struct {
+	URI pkgmodel.FormaeURI
+}
+
+const (
+	StateIdle          = gen.Atom("idle")
+	StateSynchronizing = gen.Atom("synchronizing")
+
+	// InitialDelay is the delay before the first synchronization run to allow
+	// the plugins to register.
+	InitialDelay = 2 * time.Second
+)
+
+type Synchronizer struct {
+	statemachine.StateMachine[SynchronizerData]
+}
+
+type SynchronizerData struct {
+	datastore datastore.Datastore
+	cfg       pkgmodel.SynchronizationConfig
+
+	timeStarted time.Time
+	commandID   string
+
+	// excludedResources counts, per resource, how many in-flight changesets are
+	// writing it. Anything present is held out of synchronization; a resource
+	// drops out only when the last writer releases it. It is a count rather
+	// than a set because a set cannot express two writers: the first to finish
+	// would release a claim it did not solely hold, and the other changeset
+	// would keep writing with the synchronizer free to read mid-write.
+	excludedResources map[string]int
+}
+
+// Messages processed by Synchronizer
+
+type Synchronize struct{}
+
+const syncTickName = gen.Atom("sync-tick")
+
+// rescheduleAction returns the action that schedules the next periodic
+// synchronization. Setting a GenericTimeout with the same name auto-cancels
+// any prior pending timer, so exactly one tick is in flight at any time.
+func rescheduleAction(data SynchronizerData) []statemachine.Action {
+	if !data.cfg.Enabled {
+		return nil
+	}
+	return []statemachine.Action{statemachine.GenericTimeout{
+		Name:     syncTickName,
+		Duration: data.cfg.Interval,
+		Message:  Synchronize{},
+	}}
+}
+
+func (s *Synchronizer) Init(args ...any) (statemachine.StateMachineSpec[SynchronizerData], error) {
+	ds, ok := s.Env("Datastore")
+	if !ok {
+		s.Log().Error("Missing 'Datastore' environment variable")
+		return statemachine.StateMachineSpec[SynchronizerData]{}, fmt.Errorf("synchronizer: missing 'Datastore' environment variable")
+	}
+
+	cfg, ok := s.Env("SynchronizationConfig")
+	if !ok {
+		s.Log().Error("Missing 'SynchronizationConfig' environment variable")
+		return statemachine.StateMachineSpec[SynchronizerData]{}, fmt.Errorf("synchronizer: missing 'SynchronizationConfig' environment variable")
+	}
+
+	synchronizerCfg := cfg.(pkgmodel.SynchronizationConfig)
+	if !synchronizerCfg.Enabled {
+		s.Log().Warning("Synchronization is disabled")
+	}
+
+	data := SynchronizerData{
+		datastore:         ds.(datastore.Datastore),
+		cfg:               synchronizerCfg,
+		excludedResources: make(map[string]int),
+	}
+
+	spec := statemachine.NewStateMachineSpec(StateIdle,
+		statemachine.WithData(data),
+
+		statemachine.WithStateEnterCallback(onStateChange),
+
+		statemachine.WithStateMessageHandler(StateIdle, synchronize),
+		statemachine.WithStateMessageHandler(StateSynchronizing, synchronize),
+		statemachine.WithStateMessageHandler(StateSynchronizing, changesetCompleted),
+
+		// Handle resource exclusion in both states
+		statemachine.WithStateMessageHandler(StateIdle, registerInProgressResource),
+		statemachine.WithStateMessageHandler(StateSynchronizing, registerInProgressResource),
+		statemachine.WithStateMessageHandler(StateIdle, unregisterInProgressResource),
+		statemachine.WithStateMessageHandler(StateSynchronizing, unregisterInProgressResource),
+	)
+
+	if synchronizerCfg.Enabled {
+		if _, err := s.SendAfter(s.PID(), Synchronize{}, 2*time.Second); err != nil {
+			return statemachine.StateMachineSpec[SynchronizerData]{}, fmt.Errorf("failed to send initial synchronize message: %s", err)
+		}
+		s.Log().Info("Resource synchronization ready")
+	}
+
+	return spec, nil
+}
+
+func onStateChange(oldState gen.Atom, newState gen.Atom, data SynchronizerData, proc gen.Process) (gen.Atom, SynchronizerData, error) {
+	if oldState == StateSynchronizing && newState == StateIdle {
+		proc.Log().Debug("Synchronization finished duration=%s", time.Since(data.timeStarted))
+	}
+	return newState, data, nil
+}
+
+func synchronize(from gen.PID, state gen.Atom, data SynchronizerData, message Synchronize, proc gen.Process) (gen.Atom, SynchronizerData, []statemachine.Action, error) {
+	if state == StateSynchronizing {
+		proc.Log().Debug("Synchronizer already running, consider configuring a longer interval")
+		return state, data, nil, nil
+	}
+
+	data.timeStarted = time.Now()
+	proc.Log().Debug("Starting resource synchronization timestamp=%v", data.timeStarted)
+
+	return synchronizeAllResources(state, data, proc)
+}
+
+func synchronizeAllResources(state gen.Atom, data SynchronizerData, proc gen.Process) (gen.Atom, SynchronizerData, []statemachine.Action, error) {
+	resourcesByStack, err := data.datastore.LoadAllResourcesByStack()
+	if err != nil {
+		proc.Log().Error("failed to load stacks: %v", err)
+		return state, data, nil, gen.TerminateReasonPanic
+	}
+
+	existingTargets, err := data.datastore.LoadAllTargets()
+	if err != nil {
+		proc.Log().Error("failed to load targets: %v", err)
+		return state, data, nil, gen.TerminateReasonPanic
+	}
+
+	// Collect unique namespaces from all resources and query plugin availability + schemas upfront
+	namespaceSeen := make(map[string]bool)
+	for _, resources := range resourcesByStack {
+		for _, res := range resources {
+			namespaceSeen[res.Namespace()] = true
+		}
+	}
+
+	type pluginCache struct {
+		available    bool
+		schemas      map[string]pkgmodel.Schema
+		matchFilters []pkgmodel.MatchFilter
+	}
+	pluginInfoByNamespace := make(map[string]pluginCache)
+	for namespace := range namespaceSeen {
+		response, err := messages.UnwrapCall(proc.Call(
+			gen.ProcessID{Name: actornames.PluginCoordinator, Node: proc.Node().Name()},
+			messages.GetPluginInfo{Namespace: namespace},
+		))
+		if err != nil {
+			proc.Log().Debug("Failed to check plugin availability, skipping namespace=%s: %v",
+				namespace, err)
+			pluginInfoByNamespace[namespace] = pluginCache{available: false}
+			continue
+		}
+
+		pluginInfo, ok := response.(messages.PluginInfoResponse)
+		if !ok || !pluginInfo.Found {
+			proc.Log().Debug("Plugin not available yet, skipping namespace from sync namespace=%s",
+				namespace)
+			pluginInfoByNamespace[namespace] = pluginCache{available: false}
+			continue
+		}
+
+		pluginInfoByNamespace[namespace] = pluginCache{
+			available:    true,
+			schemas:      pluginInfo.ResourceSchemas,
+			matchFilters: pluginInfo.MatchFilters,
+		}
+	}
+
+	// Stamp fresh schemas on resources before converting to Forma
+	for _, resources := range resourcesByStack {
+		for _, res := range resources {
+			cache, ok := pluginInfoByNamespace[res.Namespace()]
+			if !ok || !cache.available {
+				continue
+			}
+			if freshSchema, ok := cache.schemas[res.Type]; ok {
+				res.Schema = freshSchema
+			}
+		}
+	}
+
+	var allResourceUpdates []resource_update.ResourceUpdate
+	for stackLabel, resources := range resourcesByStack {
+		// Convert resources to Forma for compatibility with GenerateResourceUpdates
+		forma := pkgmodel.FormaFromResources(resources)
+
+		resourceUpdates, err := resource_update.GenerateResourceUpdates(
+			forma,
+			pkgmodel.CommandSync,
+			pkgmodel.FormaApplyModePatch,
+			resource_update.FormaCommandSourceSynchronize,
+			existingTargets,
+			data.datastore,
+			nil, nil,
+			false,
+		)
+		if err != nil {
+			proc.Log().Error("failed to generate resource updates for stack %s: %v", stackLabel, err)
+			return state, data, nil, gen.TerminateReasonPanic
+		}
+
+		allResourceUpdates = append(allResourceUpdates, resourceUpdates...)
+	}
+
+	// Filter out resources that are currently being updated by non-sync operations
+	filteredResourceUpdates := make([]resource_update.ResourceUpdate, 0, len(allResourceUpdates))
+	for _, update := range allResourceUpdates {
+		resourceURI := string(update.URI())
+		if _, excluded := data.excludedResources[resourceURI]; !excluded {
+			filteredResourceUpdates = append(filteredResourceUpdates, update)
+		} else {
+			proc.Log().Debug("Excluding resource from sync (in-progress operation) resourceURI=%s", resourceURI)
+		}
+	}
+	allResourceUpdates = filteredResourceUpdates
+
+	// Filter out resources whose plugins aren't registered
+	availableResourceUpdates := make([]resource_update.ResourceUpdate, 0, len(allResourceUpdates))
+	for _, update := range allResourceUpdates {
+		namespace := update.DesiredState.Namespace()
+		cache, ok := pluginInfoByNamespace[namespace]
+		if !ok || !cache.available {
+			proc.Log().Debug("Plugin not available, skipping resource from sync namespace=%s resourceURI=%s",
+				namespace, string(update.URI()))
+			continue
+		}
+		availableResourceUpdates = append(availableResourceUpdates, update)
+	}
+	allResourceUpdates = availableResourceUpdates
+
+	// Attach per-namespace, per-type discovery filters to each update so the
+	// ResourcePersister can evict unmanaged rows whose freshly-read cloud state
+	// matches a filter. Scoped strictly to the update's own namespace cache to
+	// prevent filter bleed across namespaces.
+	for i := range allResourceUpdates {
+		namespace := allResourceUpdates[i].DesiredState.Namespace()
+		if cache, ok := pluginInfoByNamespace[namespace]; ok && cache.available {
+			filters := pkgmodel.FiltersForType(cache.matchFilters, allResourceUpdates[i].DesiredState.Type)
+			if len(filters) > 0 {
+				allResourceUpdates[i].MatchFilters = filters
+			}
+		}
+	}
+
+	if len(allResourceUpdates) == 0 {
+		proc.Log().Debug("Synchronizer: no resources found to synchronize")
+		return StateIdle, data, rescheduleAction(data), nil
+	}
+
+	var resourcesToSynchronize []pkgmodel.Resource
+	for _, update := range allResourceUpdates {
+		resourcesToSynchronize = append(resourcesToSynchronize, update.DesiredState)
+	}
+	syncCommand := forma_command.NewFormaCommand(
+		&pkgmodel.Forma{
+			Targets:   []pkgmodel.Target{},
+			Resources: resourcesToSynchronize,
+		},
+		&config.FormaCommandConfig{Mode: pkgmodel.FormaApplyModePatch},
+		pkgmodel.CommandSync,
+		allResourceUpdates,
+		nil, // No target updates on sync
+		nil, // No stack updates on sync
+		nil, // No policy updates on sync
+		nil, // No generator updates on sync
+		"synchronizer",
+		"",
+		"",
+		forma_command.SourceSynchronizer,
+	)
+	data.commandID = syncCommand.ID
+	proc.Log().Debug("Synchronizer: created sync command commandID=%s resourceUpdateCount=%d", syncCommand.ID, len(allResourceUpdates))
+
+	_, err = messages.UnwrapCall(proc.Call(
+		gen.ProcessID{Name: actornames.FormaCommandPersister, Node: proc.Node().Name()},
+		forma_persister.StoreNewFormaCommand{Command: *syncCommand}))
+	if err != nil {
+		proc.Log().Error("failed to store batch forma command: %v", err)
+		return state, data, nil, gen.TerminateReasonPanic
+	}
+
+	synth, err := target_update.SynthesizeResolveTargetUpdates(
+		resource_update.ReferencedTargetLabels(allResourceUpdates),
+		resource_update.SourceTargetByKsuid(allResourceUpdates),
+		nil, data.datastore)
+	if err != nil {
+		proc.Log().Error("Synchronizer: failed to build changeset, skipping sync cycle commandID=%s: %v", syncCommand.ID, err)
+		finalizeFailedCommand(syncCommand, proc)
+		return StateIdle, data, rescheduleAction(data), nil
+	}
+	// No generator draws: a sync command only reads the inventory, so no
+	// destination in it is waiting for a generated value.
+	cs, err := changeset.NewChangeset(allResourceUpdates, synth, nil, syncCommand.ID, pkgmodel.CommandSync, syncCommand.Config.Mode)
+	if err != nil {
+		proc.Log().Error("Synchronizer: failed to build changeset, skipping sync cycle commandID=%s: %v", syncCommand.ID, err)
+		finalizeFailedCommand(syncCommand, proc)
+		return StateIdle, data, rescheduleAction(data), nil
+	}
+
+	proc.Log().Debug("Ensuring ChangesetExecutor for sync command commandID=%s", syncCommand.ID)
+	_, err = proc.Call(
+		gen.ProcessID{Name: actornames.ChangesetSupervisor, Node: proc.Node().Name()},
+		changeset.EnsureChangesetExecutor{CommandID: syncCommand.ID},
+	)
+	if err != nil {
+		proc.Log().Error("failed to ensure ChangesetExecutor for sync command %s: %v", syncCommand.ID, err)
+		return state, data, nil, gen.TerminateReasonPanic
+	}
+
+	proc.Log().Debug("Starting ChangesetExecutor for sync command commandID=%s", syncCommand.ID)
+	err = proc.Send(
+		gen.ProcessID{Name: actornames.ChangesetExecutor(syncCommand.ID), Node: proc.Node().Name()},
+		changeset.Start{Changeset: cs, NotifyOnComplete: true},
+	)
+	if err != nil {
+		proc.Log().Error("failed to start ChangesetExecutor for sync command %s: %v", syncCommand.ID, err)
+		return state, data, nil, gen.TerminateReasonPanic
+	}
+
+	return StateSynchronizing, data, nil, nil
+}
+
+func changesetCompleted(from gen.PID, state gen.Atom, data SynchronizerData, message changeset.ChangesetCompleted, proc gen.Process) (gen.Atom, SynchronizerData, []statemachine.Action, error) {
+	if message.CommandID != data.commandID {
+		proc.Log().Error("Synchronizer received ChangesetCompleted for unknown command ID commandID=%s", message.CommandID)
+		return state, data, nil, nil
+	}
+
+	return StateIdle, data, rescheduleAction(data), nil
+}
+
+// excludeFromSync claims uri on behalf of one in-flight changeset.
+func excludeFromSync(excluded map[string]int, uri string) {
+	excluded[uri]++
+}
+
+// releaseFromSync drops one changeset's claim on uri, lifting the exclusion
+// only once the last writer has released it. A release with no matching claim
+// is inert rather than an error: it must not leave a negative count that a
+// later claim would have to climb out of before the resource is protected.
+func releaseFromSync(excluded map[string]int, uri string) {
+	remaining, claimed := excluded[uri]
+	if !claimed {
+		return
+	}
+	if remaining <= 1 {
+		delete(excluded, uri)
+		return
+	}
+	excluded[uri] = remaining - 1
+}
+
+func registerInProgressResource(from gen.PID, state gen.Atom, data SynchronizerData, message messages.RegisterInProgressResource, proc gen.Process) (gen.Atom, SynchronizerData, []statemachine.Action, error) {
+	excludeFromSync(data.excludedResources, message.ResourceURI)
+	proc.Log().Debug("Resource registered as in-progress, excluded from sync resourceURI=%s", message.ResourceURI)
+	return state, data, nil, nil
+}
+
+func unregisterInProgressResource(from gen.PID, state gen.Atom, data SynchronizerData, message messages.UnregisterInProgressResource, proc gen.Process) (gen.Atom, SynchronizerData, []statemachine.Action, error) {
+	releaseFromSync(data.excludedResources, message.ResourceURI)
+	proc.Log().Debug("Resource unregistered from in-progress, can be synced resourceURI=%s", message.ResourceURI)
+	return state, data, nil, nil
+}
+
+// finalizeFailedCommand marks all resource updates in the command as failed and then
+// finalizes the command itself, preventing persisted commands from being left in a
+// non-terminal pending state when changeset construction fails after storage.
+func finalizeFailedCommand(cmd *forma_command.FormaCommand, proc gen.Process) {
+	refs := make([]forma_persister.ResourceUpdateRef, 0, len(cmd.ResourceUpdates))
+	for _, ru := range cmd.ResourceUpdates {
+		refs = append(refs, forma_persister.ResourceUpdateRef{
+			URI:       ru.URI(),
+			Operation: ru.Operation,
+		})
+	}
+	persister := gen.ProcessID{Name: actornames.FormaCommandPersister, Node: proc.Node().Name()}
+	if len(refs) > 0 {
+		if _, err := messages.UnwrapCall(proc.Call(persister, forma_persister.MarkResourcesAsFailed{
+			CommandID:          cmd.ID,
+			Resources:          refs,
+			ResourceModifiedTs: time.Now(),
+		})); err != nil {
+			proc.Log().Error("Synchronizer: failed to mark resources as failed for aborted command commandID=%s: %v", cmd.ID, err)
+			return
+		}
+	}
+	if _, err := messages.UnwrapCall(proc.Call(persister, forma_persister.FinalizeIncompleteCommand{CommandID: cmd.ID})); err != nil {
+		proc.Log().Error("Synchronizer: failed to finalize aborted command commandID=%s: %v", cmd.ID, err)
+	}
+}

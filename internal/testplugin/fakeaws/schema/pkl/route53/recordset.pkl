@@ -1,0 +1,74 @@
+/*
+ * © 2025 Platform Engineering Labs Inc.
+ *
+ * SPDX-License-Identifier: FSL-1.1-ALv2
+ */
+
+/*
+ * FakeAWS Route53 RecordSet - minimal copy for testing.
+ */
+module fakeaws.route53.recordset
+
+import "../fakeaws.pkl"
+import "@formae/formae.pkl"
+
+const type = "FakeAWS::Route53::RecordSet"
+
+@fakeaws.SubResourceHint
+open class AliasTarget extends formae.SubResource {
+    @fakeaws.FieldHint {
+        outputField = "DNSName"
+    }
+    dnsName: String|formae.Resolvable
+
+    evaluateTargetHealth: Boolean?
+
+    hostedZoneId: String|formae.Resolvable
+}
+
+@fakeaws.ResourceHint {
+    type = module.type
+    identifier = "Id"
+    portable = true
+}
+open class RecordSet extends formae.Resource {
+    @fakeaws.FieldHint {
+    }
+    aliasTarget: AliasTarget?
+
+    @fakeaws.FieldHint
+    comment: String?
+
+    @fakeaws.FieldHint {
+        createOnly = true
+    }
+    hostedZoneId: (String|formae.Resolvable)?
+
+    @fakeaws.FieldHint {
+        createOnly = true
+    }
+    hostedZoneName: String?
+
+    @fakeaws.FieldHint {
+        createOnly = true
+    }
+    name: String
+
+    region: fakeaws.Region?
+
+    @fakeaws.FieldHint {
+    }
+    resourceRecords: Listing<String>?
+
+    @fakeaws.FieldHint {
+        outputField = "TTL"
+    }
+    ttl: Number?
+
+    @fakeaws.FieldHint {
+    }
+    type: String
+
+    @fakeaws.FieldHint
+    weight: Int?
+}

@@ -1,0 +1,376 @@
+// © 2025 Platform Engineering Labs Inc.
+//
+// SPDX-License-Identifier: FSL-1.1-ALv2
+
+package model
+
+import (
+	"fmt"
+	"net/url"
+	"slices"
+	"sort"
+	"strings"
+
+	"github.com/tidwall/gjson"
+)
+
+type TripletKey struct {
+	Stack string
+	Label string
+	Type  string
+}
+
+type TripletURI string
+
+func (t TripletURI) IsValid() bool {
+	if string(t) == "" {
+		return false
+	}
+
+	fu, err := url.Parse(string(t))
+	if err != nil {
+		return false
+	}
+
+	if fu.Scheme != "formae" {
+		return false
+	}
+
+	if len(strings.Split(fu.Path, "/")) < 1 {
+		return false
+	}
+
+	return true
+}
+
+func (t TripletURI) Fqn() string {
+	fu, _ := url.Parse(string(t))
+
+	return fu.Host
+}
+
+func (t TripletURI) Namespace() string {
+	fu, _ := url.Parse(string(t))
+	parts := strings.Split(fu.Host, ".")
+
+	return parts[len(parts)-1]
+}
+
+func (t TripletURI) PropertyPath() string {
+	fu, _ := url.Parse(string(t))
+
+	return strings.TrimLeft(fu.Fragment, "/")
+}
+
+func (t TripletURI) Stack() string {
+	fu, _ := url.Parse(string(t))
+	frags := strings.Split(strings.Trim(fu.Path, "/"), "/")
+
+	return frags[0]
+}
+
+func (t TripletURI) ResourceLabel() string {
+	fu, _ := url.Parse(string(t))
+	frags := strings.Split(strings.Trim(fu.Path, "/"), "/")
+
+	return frags[1]
+}
+
+func (t TripletURI) ResourceType() string {
+	fu, _ := url.Parse(string(t))
+	frags := strings.Split(strings.Trim(fu.Host, "/"), ".")
+	slices.Reverse(frags)
+
+	return strings.ToUpper(strings.Join(frags, "::"))
+}
+
+// FormaeURI represents a KSUID-based resource URI
+type FormaeURI string
+
+func NewFormaeURI(uri, property string) FormaeURI {
+	if property == "" {
+		return FormaeURI(fmt.Sprintf("formae://%s#", uri))
+	}
+	return FormaeURI(fmt.Sprintf("formae://%s#/%s", uri, property))
+}
+
+func (f FormaeURI) IsValid() bool {
+	s := string(f)
+	if !strings.HasPrefix(s, "formae://") {
+		return false
+	}
+
+	remainder := s[9:]
+	if !strings.Contains(remainder, "#") {
+		return false
+	}
+
+	parts := strings.SplitN(remainder, "#", 2)
+	if len(parts) != 2 || len(parts[0]) == 0 {
+		return false
+	}
+
+	fragment := parts[1]
+	return fragment == "" || strings.HasPrefix(fragment, "/")
+}
+
+func (f FormaeURI) KSUID() string {
+	s := string(f)
+	if !strings.HasPrefix(s, "formae://") {
+		return ""
+	}
+
+	remainder := s[9:]
+	parts := strings.SplitN(remainder, "#", 2)
+	if len(parts) != 2 {
+		return ""
+	}
+
+	return parts[0]
+}
+
+func (f FormaeURI) PropertyPath() string {
+	s := string(f)
+	if !strings.HasPrefix(s, "formae://") {
+		return ""
+	}
+
+	remainder := s[9:]
+	parts := strings.SplitN(remainder, "#", 2)
+	if len(parts) != 2 {
+		return ""
+	}
+
+	fragment := parts[1]
+	if fragment == "" || fragment == "/" {
+		return ""
+	}
+
+	if strings.HasPrefix(fragment, "/") {
+		return fragment[1:]
+	}
+
+	return fragment
+}
+
+func (f FormaeURI) Stripped() FormaeURI {
+	return NewFormaeURI(f.KSUID(), "")
+}
+
+func (f FormaeURI) ToTripletURI(triplet TripletKey) string {
+	if !f.IsValid() {
+		return ""
+	}
+
+	typeParts := strings.Split(triplet.Type, "::")
+	slices.Reverse(typeParts)
+	reversedType := strings.ToLower(strings.Join(typeParts, "."))
+
+	return fmt.Sprintf("formae://%s/%s/%s#/%s", reversedType, triplet.Stack, triplet.Label, f.PropertyPath())
+}
+
+// ResolvableObject represents a resolvable object found in JSON with $res: true
+type ResolvableObject struct {
+	Path     string
+	Label    string
+	Type     string
+	Stack    string
+	Property string
+	JSONPath string // gjson dotted path from $json, applied post-resolution
+}
+
+// FindResolvablesFromProperties traverses json properties and finds all objects with $res: true
+func FindResolvablesFromProperties(jsonStr string) []ResolvableObject {
+	var resolvables []ResolvableObject
+	result := gjson.Parse(jsonStr)
+	findResolvablesRecursive("", result, &resolvables)
+
+	return resolvables
+}
+
+// escapePathKey renders a literal JSON map key as a single gjson/sjson path
+// segment. Resource properties are arbitrary JSON, so a map key may contain the
+// dots, wildcards and modifiers the two engines read as path syntax: a
+// Kubernetes annotation key used raw as a path addresses a nested object tree,
+// so a read misses it and a write explodes the key into that tree.
+//
+// The rule is the union of the two engines' grammars: gjson.Escape covers
+// gjson's, and a colon is escaped on top of it because sjson reads a colon at
+// the start of a path segment as its force marker. formae core applies the same
+// rule and cannot be imported here — this is a separately versioned module — so
+// it carries its own implementation; a test pins the rule so the two cannot
+// drift.
+func escapePathKey(key string) string {
+	escaped := gjson.Escape(key)
+	if strings.IndexByte(escaped, ':') < 0 {
+		return escaped
+	}
+	return strings.ReplaceAll(escaped, ":", `\:`)
+}
+
+// appendPathSegment appends one literal map key or array index to a property
+// path, escaping it as it is appended.
+func appendPathSegment(basePath, key string) string {
+	escaped := escapePathKey(key)
+	if basePath == "" {
+		return escaped
+	}
+	return basePath + "." + escaped
+}
+
+// findResolvablesRecursive recursively searches for resolvable objects
+func findResolvablesRecursive(basePath string, value gjson.Result, resolvables *[]ResolvableObject) {
+	if value.IsObject() {
+		// Check if this object is a resolvable ($res: true)
+		if IsResolvableObject(value) {
+			resolvable := ResolvableObject{
+				Path:     basePath,
+				Label:    value.Get("$label").String(),
+				Type:     value.Get("$type").String(),
+				Stack:    value.Get("$stack").String(),
+				Property: value.Get("$property").String(),
+				JSONPath: value.Get("$json").String(),
+			}
+			*resolvables = append(*resolvables, resolvable)
+			return
+		}
+
+		// Recurse into object properties
+		value.ForEach(func(key, val gjson.Result) bool {
+			findResolvablesRecursive(appendPathSegment(basePath, key.String()), val, resolvables)
+			return true
+		})
+	} else if value.IsArray() {
+		// Recurse into array elements
+		value.ForEach(func(key, val gjson.Result) bool {
+			findResolvablesRecursive(appendPathSegment(basePath, key.String()), val, resolvables)
+			return true
+		})
+	}
+}
+
+// IsResolvableObject checks if a JSON object is a resolvable ($res: true)
+func IsResolvableObject(value gjson.Result) bool {
+	if !value.IsObject() {
+		return false
+	}
+
+	resField := value.Get("$res")
+	return resField.Exists() && resField.Bool()
+}
+
+// ResolvedReference is the persisted/post-apply shape of a resolved
+// Resolvable: an object of the form {"$ref": "formae://...", "$value": ...}.
+// The unresolved source-time shape (carrying $res/$type/$label/$stack/$property)
+// is handled by IsResolvableObject and FindResolvablesFromProperties — see
+// those for the inverse case.
+//
+// Ref is always set when constructed via AsResolvedReference. Value may be
+// gjson.Null when the reference has not yet been resolved by the executor
+// (the post-resolver state at apply time keeps $ref but adds $value).
+type ResolvedReference struct {
+	Ref   FormaeURI
+	Value gjson.Result
+}
+
+// IsResolvedReference reports whether value is the resolved-reference shape
+// ({"$ref": "...", ...}). Mirror of IsResolvableObject for the post-apply
+// shape; the two shapes are disjoint by construction (source-time objects
+// carry $res, post-apply objects carry $ref).
+func IsResolvedReference(value gjson.Result) bool {
+	if !value.IsObject() {
+		return false
+	}
+	return value.Get("$ref").Exists()
+}
+
+// AsResolvedReference unwraps value to a ResolvedReference when it carries
+// the resolved-reference shape. Returns false for scalars, arrays,
+// non-object values, and objects without a $ref field.
+func AsResolvedReference(value gjson.Result) (ResolvedReference, bool) {
+	if !IsResolvedReference(value) {
+		return ResolvedReference{}, false
+	}
+	return ResolvedReference{
+		Ref:   FormaeURI(value.Get("$ref").String()),
+		Value: value.Get("$value"),
+	}, true
+}
+
+// CollectReferencedKSUIDs parses data as JSON, recurses through all objects
+// and arrays, and collects every outbound reference KSUID it carries: the
+// KSUID authority of any object whose "$ref" field holds a formae:// URI, and
+// the "$generator" KSUID of any translated $gen envelope. Returns a
+// deduplicated, sorted slice. Returns a non-nil empty slice when data is
+// empty, invalid, or carries no outbound references.
+func CollectReferencedKSUIDs(data []byte) []string {
+	if len(data) == 0 {
+		return []string{}
+	}
+
+	root := gjson.ParseBytes(data)
+	if !root.IsObject() && !root.IsArray() {
+		return []string{}
+	}
+
+	seen := make(map[string]struct{})
+	collectKSUIDsRecursive(root, seen)
+
+	result := make([]string, 0, len(seen))
+	for k := range seen {
+		result = append(result, k)
+	}
+	sort.Strings(result)
+	return result
+}
+
+// collectKSUIDsRecursive descends into all objects and arrays, collecting
+// KSUIDs from any object whose "$ref" field is a formae:// URI string, and the
+// generator KSUID of any translated $gen envelope. Unlike
+// findResolvablesRecursive and findGenObjectsRecursive, it does NOT return
+// early at a recognized envelope — it continues descending into all children
+// to catch nested references.
+func collectKSUIDsRecursive(value gjson.Result, seen map[string]struct{}) {
+	if value.IsObject() {
+		refField := value.Get("$ref")
+		if refField.Exists() && refField.Type == gjson.String {
+			if ksuid := FormaeURI(refField.String()).KSUID(); ksuid != "" {
+				seen[ksuid] = struct{}{}
+			}
+		}
+
+		// An authored $gen envelope names its generator by label and stack, so
+		// GenGeneratorKSUID is empty for it and it contributes nothing.
+		if generator := GenGeneratorKSUID(value); generator != "" {
+			seen[generator] = struct{}{}
+		}
+
+		// Always recurse into all children (including $value of a resolved ref).
+		value.ForEach(func(_, val gjson.Result) bool {
+			collectKSUIDsRecursive(val, seen)
+			return true
+		})
+	} else if value.IsArray() {
+		value.ForEach(func(_, val gjson.Result) bool {
+			collectKSUIDsRecursive(val, seen)
+			return true
+		})
+	}
+}
+
+// ToTripletKey converts a resolvable object to a TripletKey
+func (r ResolvableObject) ToTripletKey() TripletKey {
+	return TripletKey{
+		Stack: r.Stack,
+		Label: r.Label,
+		Type:  r.Type,
+	}
+}
+
+// ToFormaeURI converts a resolvable object to FormaeURI format using the provided KSUID
+func (r ResolvableObject) ToFormaeURI(ksuid string) FormaeURI {
+	if r.Property == "" {
+		return NewFormaeURI(ksuid, "")
+	}
+	return NewFormaeURI(ksuid, r.Property)
+}

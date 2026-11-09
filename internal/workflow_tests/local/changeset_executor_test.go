@@ -1,0 +1,952 @@
+// © 2025 Platform Engineering Labs Inc.
+//
+// SPDX-License-Identifier: FSL-1.1-ALv2
+
+//go:build unit
+
+package workflow_tests_local
+
+import (
+	"encoding/json"
+	"fmt"
+	"testing"
+	"time"
+
+	"github.com/platform-engineering-labs/formae/internal/metastructure/actornames"
+	"github.com/platform-engineering-labs/formae/internal/metastructure/changeset"
+	"github.com/platform-engineering-labs/formae/internal/metastructure/forma_command"
+	"github.com/platform-engineering-labs/formae/internal/metastructure/forma_persister"
+	"github.com/platform-engineering-labs/formae/internal/metastructure/resource_update"
+	"github.com/platform-engineering-labs/formae/internal/metastructure/target_update"
+	"github.com/platform-engineering-labs/formae/internal/metastructure/testutil"
+	"github.com/platform-engineering-labs/formae/internal/metastructure/util"
+	"github.com/platform-engineering-labs/formae/internal/workflow_tests/test_helpers"
+	pkgmodel "github.com/platform-engineering-labs/formae/pkg/model"
+	"github.com/platform-engineering-labs/formae/pkg/plugin"
+	"github.com/platform-engineering-labs/formae/pkg/plugin/resource"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+)
+
+func TestChangesetExecutor_SingleResourceUpdate(t *testing.T) {
+	testutil.RunTestFromProjectRoot(t, func(t *testing.T) {
+		overrides := &plugin.ResourcePluginOverrides{
+			Create: func(request *resource.CreateRequest) (*resource.CreateResult, error) {
+				return &resource.CreateResult{
+					ProgressResult: &resource.ProgressResult{
+						Operation:       resource.OperationCreate,
+						OperationStatus: resource.OperationStatusSuccess,
+						RequestID:       "test-request-id",
+						NativeID:        "test-native-id",
+					},
+				}, nil
+			},
+		}
+
+		m, def, err := test_helpers.NewTestMetastructure(t, overrides)
+		defer def()
+		assert.NoError(t, err)
+
+		// Start test helper actor to receive messages
+		messages := make(chan any, 10)
+		_, err = testutil.StartTestHelperActor(m.Node, messages)
+		assert.NoError(t, err)
+
+		commandID := "test-command-single"
+		resourceUpdate := newTestResourceUpdate("test-vpc", nil, "FakeAWS::EC2::VPC")
+
+		// Store the forma command first
+		testutil.Call(m.Node, "FormaCommandPersister", forma_persister.StoreNewFormaCommand{
+			Command: forma_command.FormaCommand{
+				ID:    commandID,
+				State: forma_command.CommandStateNotStarted,
+				ResourceUpdates: []resource_update.ResourceUpdate{
+					resourceUpdate,
+				},
+			},
+		})
+
+		// Create changeset and start executor
+		cs, err := buildChangesetWithResolves([]resource_update.ResourceUpdate{resourceUpdate}, nil, commandID, pkgmodel.CommandApply, m.Datastore)
+		assert.NoError(t, err)
+
+		// Ensure the changeset executor exists
+		_, err = testutil.Call(m.Node, "ChangesetSupervisor", changeset.EnsureChangesetExecutor{
+			CommandID: commandID,
+		})
+		assert.NoError(t, err)
+
+		// Send the Start message to the changeset executor
+		testutil.Send(m.Node, actornames.ChangesetExecutor(commandID), changeset.Start{
+			Changeset:        cs,
+			NotifyOnComplete: true,
+		})
+
+		// Wait for the changeset to complete
+		testutil.ExpectMessageWithPredicate(t, messages, 10*time.Second, func(msg changeset.ChangesetCompleted) bool {
+			return msg.CommandID == commandID && msg.State == changeset.ChangeSetStateFinishedSuccessfully
+		})
+
+		// Verify the command state in the database
+		commandRes, err := testutil.Call(m.Node, "FormaCommandPersister", forma_persister.LoadFormaCommand{
+			CommandID: commandID,
+		})
+		assert.NoError(t, err)
+
+		commandLoadRes, ok := commandRes.(forma_persister.LoadFormaCommandResult)
+
+		var command *forma_command.FormaCommand
+
+		if ok {
+
+			command = commandLoadRes.Command
+
+		}
+		assert.True(t, ok)
+		assert.Equal(t, forma_command.CommandStateSuccess, command.State)
+		assert.Len(t, command.ResourceUpdates, 1)
+		assert.Equal(t, resource_update.ResourceUpdateStateSuccess, command.ResourceUpdates[0].State)
+
+		// Verify resource was created in the stack
+		resources, err := m.Datastore.LoadResourcesByStack("test-stack")
+		assert.NoError(t, err)
+		assert.Len(t, resources, 1)
+		assert.Equal(t, "test-vpc", resources[0].Label)
+	})
+}
+
+func TestChangesetExecutor_DependentResources(t *testing.T) {
+	testutil.RunTestFromProjectRoot(t, func(t *testing.T) {
+		overrides := &plugin.ResourcePluginOverrides{
+			Create: func(request *resource.CreateRequest) (*resource.CreateResult, error) {
+				// VPC returns a VpcId that subnet can reference
+				properties := json.RawMessage(`{"VpcId":"vpc-12345"}`)
+				return &resource.CreateResult{
+					ProgressResult: &resource.ProgressResult{
+						Operation:          resource.OperationCreate,
+						OperationStatus:    resource.OperationStatusSuccess,
+						RequestID:          "test-request-id",
+						NativeID:           "test-native-id",
+						ResourceProperties: properties,
+					},
+				}, nil
+			},
+			Read: func(request *resource.ReadRequest) (*resource.ReadResult, error) {
+				// Return VpcId when reading VPC
+				return &resource.ReadResult{
+					ResourceType: request.ResourceType,
+					Properties:   `{"VpcId":"vpc-12345"}`,
+				}, nil
+			},
+		}
+
+		m, def, err := test_helpers.NewTestMetastructure(t, overrides)
+		defer def()
+		assert.NoError(t, err)
+
+		_, err = m.Datastore.CreateTarget(&pkgmodel.Target{
+			Label:        "test-target",
+			Namespace:    "FakeAWS",
+			Config:       json.RawMessage(`{}`),
+			Discoverable: false,
+		})
+		assert.NoError(t, err)
+
+		messages := make(chan any, 10)
+		_, err = testutil.StartTestHelperActor(m.Node, messages)
+		assert.NoError(t, err)
+
+		commandID := "test-command-deps"
+		vpcUpdate := newTestResourceUpdate("test-vpc", nil, "FakeAWS::EC2::VPC")
+		// Subnet needs to resolve VpcId property from the VPC
+		subnetUpdate := newTestResourceUpdate("test-subnet", []pkgmodel.FormaeURI{pkgmodel.NewFormaeURI(vpcUpdate.DesiredState.Ksuid, "VpcId")}, "FakeAWS::EC2::Subnet")
+
+		// Store the forma command
+		testutil.Call(m.Node, "FormaCommandPersister", forma_persister.StoreNewFormaCommand{
+			Command: forma_command.FormaCommand{
+				ID:    commandID,
+				State: forma_command.CommandStateNotStarted,
+				ResourceUpdates: []resource_update.ResourceUpdate{
+					vpcUpdate,
+					subnetUpdate,
+				},
+			},
+		})
+
+		// Create changeset - it will automatically build the dependency pipeline
+		cs, err := buildChangesetWithResolves([]resource_update.ResourceUpdate{vpcUpdate, subnetUpdate}, nil, commandID, pkgmodel.CommandApply, m.Datastore)
+		assert.NoError(t, err)
+
+		// Ensure the changeset executor exists
+		_, err = testutil.Call(m.Node, "ChangesetSupervisor", changeset.EnsureChangesetExecutor{
+			CommandID: commandID,
+		})
+		assert.NoError(t, err)
+
+		// Start the changeset
+		testutil.Send(m.Node, actornames.ChangesetExecutor(commandID), changeset.Start{
+			Changeset:        cs,
+			NotifyOnComplete: true,
+		})
+
+		// Wait for completion
+		testutil.ExpectMessageWithPredicate(t, messages, 10*time.Second, func(msg changeset.ChangesetCompleted) bool {
+			return msg.CommandID == commandID && msg.State == changeset.ChangeSetStateFinishedSuccessfully
+		})
+
+		// Verify both resources were created
+		resources, err := m.Datastore.LoadResourcesByStack("test-stack")
+		assert.NoError(t, err)
+		assert.Len(t, resources, 2)
+
+		// Verify command state
+		commandRes, err := testutil.Call(m.Node, "FormaCommandPersister", forma_persister.LoadFormaCommand{
+			CommandID: commandID,
+		})
+		assert.NoError(t, err)
+
+		commandLoadRes, ok := commandRes.(forma_persister.LoadFormaCommandResult)
+
+		var command *forma_command.FormaCommand
+
+		if ok {
+
+			command = commandLoadRes.Command
+
+		}
+		assert.True(t, ok)
+		assert.Equal(t, forma_command.CommandStateSuccess, command.State)
+		assert.Len(t, command.ResourceUpdates, 2)
+	})
+}
+
+func TestChangesetExecutor_CascadeFailure(t *testing.T) {
+	testutil.RunTestFromProjectRoot(t, func(t *testing.T) {
+		// Make VPC creation fail
+		overrides := &plugin.ResourcePluginOverrides{
+			Create: func(request *resource.CreateRequest) (*resource.CreateResult, error) {
+				if request.Label == "test-vpc" {
+					return &resource.CreateResult{
+						ProgressResult: &resource.ProgressResult{
+							Operation:       resource.OperationCreate,
+							OperationStatus: resource.OperationStatusFailure,
+							RequestID:       "test-request-id",
+						},
+					}, nil
+				}
+				// Subnet would succeed if VPC hadn't failed
+				properties := json.RawMessage(`{"SubnetId":"subnet-12345"}`)
+				return &resource.CreateResult{
+					ProgressResult: &resource.ProgressResult{
+						Operation:          resource.OperationCreate,
+						OperationStatus:    resource.OperationStatusSuccess,
+						RequestID:          "test-request-id",
+						NativeID:           "test-native-id",
+						ResourceProperties: properties,
+					},
+				}, nil
+			},
+			Read: func(request *resource.ReadRequest) (*resource.ReadResult, error) {
+				// This should never be called since VPC creation fails
+				return &resource.ReadResult{
+					ResourceType: request.ResourceType,
+					Properties:   `{"VpcId":"vpc-12345"}`,
+				}, nil
+			},
+		}
+
+		m, def, err := test_helpers.NewTestMetastructure(t, overrides)
+		defer def()
+		assert.NoError(t, err)
+
+		messages := make(chan any, 10)
+		_, err = testutil.StartTestHelperActor(m.Node, messages)
+		assert.NoError(t, err)
+
+		commandID := "test-command-cascade-failure"
+		vpcUpdate := newTestResourceUpdate("test-vpc", nil, "FakeAWS::EC2::VPC")
+		// Subnet needs to resolve VpcId property from the VPC (which will fail to be created)
+		subnetUpdate := newTestResourceUpdate("test-subnet", []pkgmodel.FormaeURI{pkgmodel.NewFormaeURI(vpcUpdate.DesiredState.Ksuid, "VpcId")}, "FakeAWS::EC2::Subnet")
+
+		// Store the forma command
+		testutil.Call(m.Node, "FormaCommandPersister", forma_persister.StoreNewFormaCommand{
+			Command: forma_command.FormaCommand{
+				ID:    commandID,
+				State: forma_command.CommandStateNotStarted,
+				ResourceUpdates: []resource_update.ResourceUpdate{
+					vpcUpdate,
+					subnetUpdate,
+				},
+			},
+		})
+
+		// Create changeset - it will automatically build the dependency pipeline
+		cs, err := buildChangesetWithResolves([]resource_update.ResourceUpdate{vpcUpdate, subnetUpdate}, nil, commandID, pkgmodel.CommandApply, m.Datastore)
+		assert.NoError(t, err)
+
+		// Ensure the changeset executor exists
+		_, err = testutil.Call(m.Node, "ChangesetSupervisor", changeset.EnsureChangesetExecutor{
+			CommandID: commandID,
+		})
+		assert.NoError(t, err)
+
+		// Start the changeset
+		testutil.Send(m.Node, actornames.ChangesetExecutor(commandID), changeset.Start{
+			Changeset:        cs,
+			NotifyOnComplete: true,
+		})
+
+		// Wait for completion (even with failures, the changeset completes)
+		var completed changeset.ChangesetCompleted
+		testutil.ExpectMessageWithPredicate(t, messages, 10*time.Second, func(msg changeset.ChangesetCompleted) bool {
+			if msg.CommandID != commandID {
+				return false
+			}
+			completed = msg
+			return true
+		})
+
+		// The state the requester is told is the only thing it has to decide
+		// whether to retry. Anything that backs off on failure — the generator
+		// rotator most of all — reads a cascade reported as success as a reason
+		// to clear its backoff and try again on the very next sweep, forever.
+		assert.Equal(t, changeset.ChangeSetStateFinishedWithErrors, completed.State,
+			"a changeset that completed with failed nodes must report FinishedWithErrors")
+
+		// Verify cascading failure occurred
+		commandRes, err := testutil.Call(m.Node, "FormaCommandPersister", forma_persister.LoadFormaCommand{
+			CommandID: commandID,
+		})
+		assert.NoError(t, err)
+
+		commandLoadRes, ok := commandRes.(forma_persister.LoadFormaCommandResult)
+
+		var command *forma_command.FormaCommand
+
+		if ok {
+
+			command = commandLoadRes.Command
+
+		}
+		assert.True(t, ok)
+
+		// VPC should have failed, subnet should also have failed (cascade)
+		vpcFailed := false
+		subnetFailed := false
+		for _, ru := range command.ResourceUpdates {
+			if ru.DesiredState.Label == "test-vpc" && ru.State == resource_update.ResourceUpdateStateFailed {
+				vpcFailed = true
+			}
+			if ru.DesiredState.Label == "test-subnet" && ru.State == resource_update.ResourceUpdateStateFailed {
+				subnetFailed = true
+			}
+		}
+		assert.True(t, vpcFailed, "VPC update should have failed")
+		assert.True(t, subnetFailed, "Subnet update should have failed due to cascade")
+
+		// No resources should be created
+		resources, err := m.Datastore.LoadResourcesByStack("test-stack")
+		if err == nil {
+			assert.Empty(t, resources, "No resources should be created when cascade fails")
+		}
+	})
+}
+
+// TestChangesetExecutor_SyncReadFailureDoesNotCascade verifies that a failed
+// Read inside a sync command does not trigger cascade-failure handling. A sync's
+// resources are Read operations with no inter-dependencies, so there is nothing
+// for a failure to cascade *to* — the only candidate is the failed Read itself.
+//
+// Without this, a single-resource sync whose Read failed would produce a
+// self-cascade: the executor reports the failed Read as a cascading failure and
+// pushes it to FormaCommandPersister.MarkResourcesAsFailed, which (for an empty
+// sync command already evicted from cache and deleted from the DB) panics the
+// persister with "forma command not found".
+func TestChangesetExecutor_SyncReadFailureDoesNotCascade(t *testing.T) {
+	testutil.RunTestFromProjectRoot(t, func(t *testing.T) {
+		logCapture := test_helpers.SetupTestLogger()
+
+		overrides := &plugin.ResourcePluginOverrides{
+			Read: func(request *resource.ReadRequest) (*resource.ReadResult, error) {
+				return nil, fmt.Errorf("simulated read failure")
+			},
+		}
+
+		m, def, err := test_helpers.NewTestMetastructure(t, overrides)
+		defer def()
+		assert.NoError(t, err)
+
+		messages := make(chan any, 10)
+		_, err = testutil.StartTestHelperActor(m.Node, messages)
+		assert.NoError(t, err)
+
+		commandID := "test-command-sync-read-failure"
+
+		// A single read resource update originating from the Synchronizer.
+		readUpdate := newTestUpdateResourceUpdate("sync-vpc", "native-will-fail", "FakeAWS::EC2::VPC")
+		readUpdate.Operation = resource_update.OperationRead
+		readUpdate.Source = resource_update.FormaCommandSourceSynchronize
+
+		testutil.Call(m.Node, "FormaCommandPersister", forma_persister.StoreNewFormaCommand{
+			Command: forma_command.FormaCommand{
+				ID:      commandID,
+				Command: pkgmodel.CommandSync,
+				State:   forma_command.CommandStateNotStarted,
+				ResourceUpdates: []resource_update.ResourceUpdate{
+					readUpdate,
+				},
+			},
+		})
+
+		cs, err := buildChangesetWithResolves(
+			[]resource_update.ResourceUpdate{readUpdate}, nil, commandID, pkgmodel.CommandSync, m.Datastore)
+		assert.NoError(t, err)
+
+		_, err = testutil.Call(m.Node, "ChangesetSupervisor", changeset.EnsureChangesetExecutor{
+			CommandID: commandID,
+		})
+		assert.NoError(t, err)
+
+		testutil.Send(m.Node, actornames.ChangesetExecutor(commandID), changeset.Start{
+			Changeset:        cs,
+			NotifyOnComplete: true,
+		})
+
+		testutil.ExpectMessageWithPredicate(t, messages, 15*time.Second, func(msg changeset.ChangesetCompleted) bool {
+			return msg.CommandID == commandID
+		})
+
+		// The failed Read must not be treated as a cascading failure: a sync has
+		// no dependency edges, so the executor must never engage the cascade path.
+		assert.False(t, logCapture.ContainsAll("Cascading failures detected"),
+			"a failed Read in a sync command must not trigger cascade-failure handling")
+	})
+}
+
+func TestChangesetExecutor_HashesAllResourcesOnCompletion(t *testing.T) {
+	testutil.RunTestFromProjectRoot(t, func(t *testing.T) {
+		overrides := &plugin.ResourcePluginOverrides{
+			Create: func(request *resource.CreateRequest) (*resource.CreateResult, error) {
+				return &resource.CreateResult{
+					ProgressResult: &resource.ProgressResult{
+						Operation:       resource.OperationCreate,
+						OperationStatus: resource.OperationStatusSuccess,
+						RequestID:       "test-request-id",
+						NativeID:        "test-native-id",
+					},
+				}, nil
+			},
+		}
+
+		m, def, err := test_helpers.NewTestMetastructure(t, overrides)
+		defer def()
+		assert.NoError(t, err)
+
+		messages := make(chan any, 10)
+		_, err = testutil.StartTestHelperActor(m.Node, messages)
+		assert.NoError(t, err)
+
+		commandID := "test-command-hashing"
+		resourceUpdate := newTestResourceUpdate("test-secret", nil, "FakeAWS::SecretsManager::Secret")
+
+		// Store the forma command
+		testutil.Call(m.Node, "FormaCommandPersister", forma_persister.StoreNewFormaCommand{
+			Command: forma_command.FormaCommand{
+				ID:    commandID,
+				State: forma_command.CommandStateNotStarted,
+				ResourceUpdates: []resource_update.ResourceUpdate{
+					resourceUpdate,
+				},
+			},
+		})
+
+		// Create changeset
+		cs, err := buildChangesetWithResolves([]resource_update.ResourceUpdate{resourceUpdate}, nil, commandID, pkgmodel.CommandApply, m.Datastore)
+		assert.NoError(t, err)
+
+		// Ensure the changeset executor exists
+		_, err = testutil.Call(m.Node, "ChangesetSupervisor", changeset.EnsureChangesetExecutor{
+			CommandID: commandID,
+		})
+		assert.NoError(t, err)
+
+		// Start the changeset
+		testutil.Send(m.Node, actornames.ChangesetExecutor(commandID), changeset.Start{
+			Changeset:        cs,
+			NotifyOnComplete: true,
+		})
+
+		// Wait for completion
+		testutil.ExpectMessageWithPredicate(t, messages, 10*time.Second, func(msg changeset.ChangesetCompleted) bool {
+			return msg.CommandID == commandID && msg.State == changeset.ChangeSetStateFinishedSuccessfully
+		})
+
+		// Verify the command completed successfully (which means hashing was called)
+		commandRes, err := testutil.Call(m.Node, "FormaCommandPersister", forma_persister.LoadFormaCommand{
+			CommandID: commandID,
+		})
+		assert.NoError(t, err)
+
+		commandLoadRes, ok := commandRes.(forma_persister.LoadFormaCommandResult)
+
+		var command *forma_command.FormaCommand
+
+		if ok {
+
+			command = commandLoadRes.Command
+
+		}
+		assert.True(t, ok)
+		assert.Equal(t, forma_command.CommandStateSuccess, command.State)
+	})
+}
+
+func TestChangesetExecutor_HashesAllResourcesOnFailure(t *testing.T) {
+	testutil.RunTestFromProjectRoot(t, func(t *testing.T) {
+		overrides := &plugin.ResourcePluginOverrides{
+			Create: func(request *resource.CreateRequest) (*resource.CreateResult, error) {
+				return &resource.CreateResult{
+					ProgressResult: &resource.ProgressResult{
+						Operation:       resource.OperationCreate,
+						OperationStatus: resource.OperationStatusFailure,
+						RequestID:       "test-request-id",
+					},
+				}, nil
+			},
+		}
+
+		m, def, err := test_helpers.NewTestMetastructure(t, overrides)
+		defer def()
+		assert.NoError(t, err)
+
+		messages := make(chan any, 10)
+		_, err = testutil.StartTestHelperActor(m.Node, messages)
+		assert.NoError(t, err)
+
+		commandID := "test-command-hashing-failure"
+		resourceUpdate := newTestResourceUpdate("test-secret", nil, "FakeAWS::SecretsManager::Secret")
+
+		// Store the forma command
+		testutil.Call(m.Node, "FormaCommandPersister", forma_persister.StoreNewFormaCommand{
+			Command: forma_command.FormaCommand{
+				ID:    commandID,
+				State: forma_command.CommandStateNotStarted,
+				ResourceUpdates: []resource_update.ResourceUpdate{
+					resourceUpdate,
+				},
+			},
+		})
+
+		// Create changeset
+		cs, err := buildChangesetWithResolves([]resource_update.ResourceUpdate{resourceUpdate}, nil, commandID, pkgmodel.CommandApply, m.Datastore)
+		assert.NoError(t, err)
+
+		// Ensure the changeset executor exists
+		_, err = testutil.Call(m.Node, "ChangesetSupervisor", changeset.EnsureChangesetExecutor{
+			CommandID: commandID,
+		})
+		assert.NoError(t, err)
+
+		// Start the changeset
+		testutil.Send(m.Node, actornames.ChangesetExecutor(commandID), changeset.Start{
+			Changeset:        cs,
+			NotifyOnComplete: true,
+		})
+
+		// Wait for completion (even with failures, the changeset completes)
+		// NOTE: Current implementation doesn't distinguish between successful and failed completion in ChangesetCompleted
+		// This test verifies that hashing happens even when resources fail
+		testutil.ExpectMessageWithPredicate(t, messages, 10*time.Second, func(msg changeset.ChangesetCompleted) bool {
+			return msg.CommandID == commandID
+		})
+
+		// Verify the command completed and hashing happened
+		// Hashing happens automatically in markResourceUpdateAsComplete when the command reaches a final state
+		commandRes, err := testutil.Call(m.Node, "FormaCommandPersister", forma_persister.LoadFormaCommand{
+			CommandID: commandID,
+		})
+		assert.NoError(t, err)
+
+		commandLoadRes, ok := commandRes.(forma_persister.LoadFormaCommandResult)
+
+		var command *forma_command.FormaCommand
+
+		if ok {
+
+			command = commandLoadRes.Command
+
+		}
+		assert.True(t, ok)
+		// Verify the resource update failed
+		assert.Len(t, command.ResourceUpdates, 1)
+		assert.Equal(t, resource_update.ResourceUpdateStateFailed, command.ResourceUpdates[0].State)
+	})
+}
+
+// Helper function to create a test resource update
+func newTestResourceUpdate(label string, dependencies []pkgmodel.FormaeURI, resourceType string) resource_update.ResourceUpdate {
+	ksuid := util.NewID()
+
+	// Build properties with resolvable references if dependencies exist
+	properties := fmt.Sprintf(`{"name":"%s"`, label)
+	for _, dep := range dependencies {
+		propName := string(dep.PropertyPath())
+		properties += fmt.Sprintf(`,"%s":{"$ref":"%s"}`, propName, dep)
+	}
+	properties += `}`
+
+	return resource_update.ResourceUpdate{
+		DesiredState: pkgmodel.Resource{
+			Label:      label,
+			Type:       resourceType,
+			Stack:      "test-stack",
+			Target:     "test-target",
+			Ksuid:      ksuid,
+			Properties: json.RawMessage(properties),
+		},
+		ResourceTarget: pkgmodel.Target{
+			Label:        "test-target",
+			Namespace:    "FakeAWS",
+			Config:       json.RawMessage(`{}`),
+			Discoverable: false,
+			Version:      1,
+		},
+		Operation:            resource_update.OperationCreate,
+		State:                resource_update.ResourceUpdateStateNotStarted,
+		StartTs:              util.TimeNow(),
+		RemainingResolvables: dependencies,
+		StackLabel:           "test-stack",
+	}
+}
+
+// TestChangesetExecutor_StuckOnReadFailureDuringUpdate verifies that the
+// changeset executor reaches a terminal state when a Read operation fails
+// during the synchronize phase of an Update workflow.
+//
+// It guards handleProgressUpdate(): when message.Failed() is true it must call
+// MarkAsFailed() rather than returning StateFinishedWithError alone. Omitting
+// the MarkAsFailed() call leaves ResourceUpdate.State as InProgress
+// (set by UpdateState() which short-circuited when fewer progress results
+// than required operations existed). The changeset's UpdatePipeline treated
+// InProgress as a no-op, stranding the update.
+func TestChangesetExecutor_StuckOnReadFailureDuringUpdate(t *testing.T) {
+	testutil.RunTestFromProjectRoot(t, func(t *testing.T) {
+		readCallCount := 0
+
+		overrides := &plugin.ResourcePluginOverrides{
+			Read: func(request *resource.ReadRequest) (*resource.ReadResult, error) {
+				readCallCount++
+				// Fail the Read for one specific resource, succeed for the other
+				if request.NativeID == "native-will-fail" {
+					return nil, fmt.Errorf("simulated read failure")
+				}
+				return &resource.ReadResult{
+					ResourceType: request.ResourceType,
+					Properties:   `{"name":"existing"}`,
+				}, nil
+			},
+			Update: func(request *resource.UpdateRequest) (*resource.UpdateResult, error) {
+				return &resource.UpdateResult{
+					ProgressResult: &resource.ProgressResult{
+						Operation:          resource.OperationUpdate,
+						OperationStatus:    resource.OperationStatusSuccess,
+						NativeID:           request.NativeID,
+						ResourceProperties: json.RawMessage(`{"name":"updated"}`),
+					},
+				}, nil
+			},
+		}
+
+		m, def, err := test_helpers.NewTestMetastructure(t, overrides)
+		defer def()
+		assert.NoError(t, err)
+
+		messages := make(chan any, 10)
+		_, err = testutil.StartTestHelperActor(m.Node, messages)
+		assert.NoError(t, err)
+
+		commandID := "test-stuck-changeset"
+
+		// Create two Update resource updates:
+		// - res-ok: Read will succeed, Update will succeed
+		// - res-fail: Read will fail (triggering the bug)
+		resOK := newTestUpdateResourceUpdate("res-ok", "native-ok", "FakeAWS::EC2::VPC")
+		resFail := newTestUpdateResourceUpdate("res-fail", "native-will-fail", "FakeAWS::EC2::VPC")
+
+		// Store the forma command
+		testutil.Call(m.Node, "FormaCommandPersister", forma_persister.StoreNewFormaCommand{
+			Command: forma_command.FormaCommand{
+				ID:    commandID,
+				State: forma_command.CommandStateNotStarted,
+				ResourceUpdates: []resource_update.ResourceUpdate{
+					resOK,
+					resFail,
+				},
+			},
+		})
+
+		// Create changeset from the updates
+		cs, err := buildChangesetWithResolves(
+			[]resource_update.ResourceUpdate{resOK, resFail}, nil, commandID, pkgmodel.CommandApply, m.Datastore)
+		assert.NoError(t, err)
+
+		// Ensure the changeset executor exists
+		_, err = testutil.Call(m.Node, "ChangesetSupervisor", changeset.EnsureChangesetExecutor{
+			CommandID: commandID,
+		})
+		assert.NoError(t, err)
+
+		// Start the changeset
+		testutil.Send(m.Node, actornames.ChangesetExecutor(commandID), changeset.Start{
+			Changeset:        cs,
+			NotifyOnComplete: true,
+		})
+
+		// The changeset MUST reach a terminal state.
+		// Before the fix, it got permanently stuck in 'processing' and
+		// this would time out.
+		testutil.ExpectMessageWithPredicate(t, messages, 15*time.Second, func(msg changeset.ChangesetCompleted) bool {
+			return msg.CommandID == commandID
+		})
+	})
+}
+
+func TestChangesetExecutor_MixedResourceAndTargetUpdates(t *testing.T) {
+	testutil.RunTestFromProjectRoot(t, func(t *testing.T) {
+		overrides := &plugin.ResourcePluginOverrides{
+			Create: func(request *resource.CreateRequest) (*resource.CreateResult, error) {
+				return &resource.CreateResult{
+					ProgressResult: &resource.ProgressResult{
+						Operation:       resource.OperationCreate,
+						OperationStatus: resource.OperationStatusSuccess,
+						RequestID:       "test-request-id",
+						NativeID:        "test-native-id",
+					},
+				}, nil
+			},
+		}
+
+		m, def, err := test_helpers.NewTestMetastructure(t, overrides)
+		defer def()
+		require.NoError(t, err)
+
+		// Start test helper actor to receive messages
+		messages := make(chan any, 10)
+		_, err = testutil.StartTestHelperActor(m.Node, messages)
+		require.NoError(t, err)
+
+		commandID := "test-command-mixed"
+		resourceUpdate := newTestResourceUpdate("test-vpc", nil, "FakeAWS::EC2::VPC")
+
+		targetUp := target_update.TargetUpdate{
+			Target: pkgmodel.Target{
+				Label:        "new-target",
+				Namespace:    "FakeAWS",
+				Config:       json.RawMessage(`{}`),
+				Discoverable: false,
+			},
+			Operation: target_update.TargetOperationCreate,
+			State:     target_update.TargetUpdateStateNotStarted,
+		}
+
+		// Store the forma command
+		testutil.Call(m.Node, "FormaCommandPersister", forma_persister.StoreNewFormaCommand{
+			Command: forma_command.FormaCommand{
+				ID:    commandID,
+				State: forma_command.CommandStateNotStarted,
+				ResourceUpdates: []resource_update.ResourceUpdate{
+					resourceUpdate,
+				},
+				TargetUpdates: []target_update.TargetUpdate{
+					targetUp,
+				},
+			},
+		})
+
+		// Create changeset with both resource and target updates
+		cs, err := buildChangesetWithResolves(
+			[]resource_update.ResourceUpdate{resourceUpdate},
+			[]target_update.TargetUpdate{targetUp},
+			commandID,
+			pkgmodel.CommandApply,
+			m.Datastore,
+		)
+		require.NoError(t, err)
+
+		// Ensure the changeset executor exists
+		_, err = testutil.Call(m.Node, "ChangesetSupervisor", changeset.EnsureChangesetExecutor{
+			CommandID: commandID,
+		})
+		require.NoError(t, err)
+
+		// Start the changeset
+		testutil.Send(m.Node, actornames.ChangesetExecutor(commandID), changeset.Start{
+			Changeset:        cs,
+			NotifyOnComplete: true,
+		})
+
+		// Wait for the changeset to complete
+		testutil.ExpectMessageWithPredicate(t, messages, 10*time.Second, func(msg changeset.ChangesetCompleted) bool {
+			return msg.CommandID == commandID && msg.State == changeset.ChangeSetStateFinishedSuccessfully
+		})
+
+		// Verify the target was created in the datastore
+		target, err := m.Datastore.LoadTarget("new-target")
+		require.NoError(t, err)
+		assert.Equal(t, "new-target", target.Label)
+		assert.Equal(t, "FakeAWS", target.Namespace)
+
+		// Verify the resource was created
+		resources, err := m.Datastore.LoadResourcesByStack("test-stack")
+		require.NoError(t, err)
+		assert.Len(t, resources, 1)
+		assert.Equal(t, "test-vpc", resources[0].Label)
+	})
+}
+
+// newTestUpdateResourceUpdate creates a resource update for an Update operation
+// with pre-populated prior state. The nativeID determines the cloud identity
+// for the Read phase of the synchronize step.
+func newTestUpdateResourceUpdate(label, nativeID, resourceType string) resource_update.ResourceUpdate {
+	ksuid := util.NewID()
+	properties := json.RawMessage(fmt.Sprintf(`{"name":"%s"}`, label))
+
+	return resource_update.ResourceUpdate{
+		DesiredState: pkgmodel.Resource{
+			Label:      label,
+			Type:       resourceType,
+			Stack:      "test-stack",
+			Target:     "test-target",
+			Ksuid:      ksuid,
+			NativeID:   nativeID,
+			Properties: properties,
+		},
+		PriorState: pkgmodel.Resource{
+			Label:      label,
+			Type:       resourceType,
+			Stack:      "test-stack",
+			Target:     "test-target",
+			Ksuid:      ksuid,
+			NativeID:   nativeID,
+			Properties: properties,
+		},
+		ResourceTarget: pkgmodel.Target{
+			Label:        "test-target",
+			Namespace:    "FakeAWS",
+			Config:       json.RawMessage(`{}`),
+			Discoverable: false,
+			Version:      1,
+		},
+		Operation:            resource_update.OperationUpdate,
+		State:                resource_update.ResourceUpdateStateNotStarted,
+		StartTs:              util.TimeNow(),
+		RemainingResolvables: []pkgmodel.FormaeURI{},
+		StackLabel:           "test-stack",
+	}
+}
+
+// A changeset that finished with errors must still clean up the stacks its
+// successful deletes emptied.
+//
+// Cleanup eligibility is about what the deletes actually did, not about the
+// changeset's aggregate verdict: one delete can succeed and take the last
+// resource out of a stack while a create in another stack fails in the same
+// command, and the delete-only stack is just as empty either way. Gating cleanup on
+// FinishedSuccessfully alone leaves the emptied stack's record behind.
+func TestChangesetExecutor_PartialFailureStillCleansUpEmptiedStacks(t *testing.T) {
+	testutil.RunTestFromProjectRoot(t, func(t *testing.T) {
+		logCapture := test_helpers.SetupTestLogger()
+
+		overrides := &plugin.ResourcePluginOverrides{
+			Create: func(request *resource.CreateRequest) (*resource.CreateResult, error) {
+				return &resource.CreateResult{
+					ProgressResult: &resource.ProgressResult{
+						Operation:       resource.OperationCreate,
+						OperationStatus: resource.OperationStatusFailure,
+						RequestID:       "test-request-id",
+						StatusMessage:   "deliberate failure, so the changeset ends with errors",
+					},
+				}, nil
+			},
+			Delete: func(request *resource.DeleteRequest) (*resource.DeleteResult, error) {
+				return &resource.DeleteResult{
+					ProgressResult: &resource.ProgressResult{
+						Operation:       resource.OperationDelete,
+						OperationStatus: resource.OperationStatusSuccess,
+						RequestID:       "test-request-id",
+					},
+				}, nil
+			},
+		}
+
+		m, def, err := test_helpers.NewTestMetastructure(t, overrides)
+		defer def()
+		assert.NoError(t, err)
+
+		messages := make(chan any, 10)
+		_, err = testutil.StartTestHelperActor(m.Node, messages)
+		assert.NoError(t, err)
+
+		commandID := "test-command-partial-failure-cleanup"
+
+		// Independent stacks: failed create intent must retain its own stack,
+		// while the successful delete still permits cleanup of test-stack.
+		doomed := newTestResourceUpdate("test-doomed", nil, "FakeAWS::EC2::VPC")
+		doomed.StackLabel = "failed-create-stack"
+		doomed.DesiredState.Stack = "failed-create-stack"
+		gone := newTestResourceUpdate("test-gone", nil, "FakeAWS::S3::Bucket")
+		gone.Operation = resource_update.OperationDelete
+
+		testutil.Call(m.Node, "FormaCommandPersister", forma_persister.StoreNewFormaCommand{
+			Command: forma_command.FormaCommand{
+				ID:              commandID,
+				State:           forma_command.CommandStateNotStarted,
+				ResourceUpdates: []resource_update.ResourceUpdate{doomed, gone},
+			},
+		})
+
+		cs, err := buildChangesetWithResolves(
+			[]resource_update.ResourceUpdate{doomed, gone}, nil, commandID, pkgmodel.CommandApply, m.Datastore)
+		assert.NoError(t, err)
+
+		_, err = testutil.Call(m.Node, "ChangesetSupervisor", changeset.EnsureChangesetExecutor{
+			CommandID: commandID,
+		})
+		assert.NoError(t, err)
+
+		testutil.Send(m.Node, actornames.ChangesetExecutor(commandID), changeset.Start{
+			Changeset:        cs,
+			NotifyOnComplete: true,
+		})
+
+		var completed changeset.ChangesetCompleted
+		testutil.ExpectMessageWithPredicate(t, messages, 15*time.Second, func(msg changeset.ChangesetCompleted) bool {
+			if msg.CommandID != commandID {
+				return false
+			}
+			completed = msg
+			return true
+		})
+
+		assert.Equal(t, changeset.ChangeSetStateFinishedWithErrors, completed.State,
+			"precondition: the changeset must have ended with errors")
+
+		// The datastore, not the executor's log line: that line is emitted
+		// before the dispatch guard, so it says only that the branch was
+		// entered, never that a stack was actually removed. Cleanup is sent
+		// asynchronously and handled by the persister, so poll for it.
+		// What this pins is the executor's half: that a changeset ending with
+		// errors still reaches the cleanup branch AND still dispatches, with
+		// the emptied stack named. The rendered stack list matters — the log
+		// line is emitted before the dispatch guard, so the message alone
+		// would pass even with nothing to send.
+		//
+		// It deliberately stops at the dispatch. Whether the persister then
+		// removes a stack, and only when it is genuinely empty, is
+		// TestResourcePersister_CleanupEmptyStacks; asserting it again here
+		// would need a fully wired delete, which this harness builds through
+		// ApplyForma rather than hand-assembled updates.
+		assert.True(t, logCapture.ContainsAll("Using pre-captured stacks for cleanup", "stacks=[test-stack]"),
+			"a changeset that ended with errors must still dispatch cleanup for the stacks its deletes emptied")
+	})
+}

@@ -1,0 +1,460 @@
+// © 2025 Platform Engineering Labs Inc.
+//
+// SPDX-License-Identifier: FSL-1.1-ALv2
+
+package querier
+
+import (
+	"fmt"
+	"strconv"
+	"strings"
+
+	"github.com/blugelabs/bluge"
+	querystr "github.com/blugelabs/query_string"
+	"github.com/google/uuid"
+	"github.com/segmentio/ksuid"
+
+	"github.com/platform-engineering-labs/formae/internal/datastore"
+	apimodel "github.com/platform-engineering-labs/formae/pkg/api/model"
+	pkgmodel "github.com/platform-engineering-labs/formae/pkg/model"
+)
+
+type BlugeQuerier struct {
+	datastore datastore.Datastore
+}
+
+func NewBlugeQuerier(datastore datastore.Datastore) *BlugeQuerier {
+	return &BlugeQuerier{
+		datastore: datastore,
+	}
+}
+
+// Caller identifies who asked a query to be run: the client that issued the
+// request (from the Client-ID header) and, when an auth plugin verified one,
+// the authenticated subject from the request's token. `client:me` resolves
+// against ClientID; `user:me` resolves against Subject. An empty Subject
+// means the request carried no authenticated identity (no auth plugin
+// configured, or classic mode) — `user:me` must refuse in that case rather
+// than silently matching nothing, since a query that quietly returns zero
+// rows reads as "you have no matching commands," not "you asked for an
+// identity that was never established."
+type Caller struct {
+	ClientID string
+	Subject  string
+}
+
+// BuildStatusQuery parses queryString into a *datastore.StatusQuery without
+// executing it, so its caller (ListFormaCommandStatus) can add filters of its
+// own — restricting Source to user-initiated commands — before running the
+// query. An empty queryString returns an unconstrained query: every command
+// the caller's own filters allow, newest first, bounded by n.
+func (b *BlugeQuerier) BuildStatusQuery(queryString string, caller Caller, n int) (*datastore.StatusQuery, error) {
+	if queryString == "" {
+		return &datastore.StatusQuery{N: n}, nil
+	}
+
+	return b.statusQuery(queryString, caller, n)
+}
+
+func (b *BlugeQuerier) statusQuery(queryString string, caller Caller, n int) (*datastore.StatusQuery, error) {
+	q, err := querystr.ParseQueryString(queryString, querystr.QueryStringOptions{})
+	if err != nil {
+		return nil, apimodel.InvalidQueryError{Reason: err.Error()}
+	}
+	statusQuery, err := b.translateToStatusQuery(q, caller)
+	if err != nil {
+		return nil, apimodel.InvalidQueryError{Reason: err.Error()}
+	}
+	statusQuery.N = n
+
+	return statusQuery, nil
+}
+
+func (b *BlugeQuerier) translateToStatusQuery(blugeQuery bluge.Query, caller Caller) (*datastore.StatusQuery, error) {
+	statusQuery := &datastore.StatusQuery{}
+	err := b.processStatusQueryNode(blugeQuery, statusQuery, caller, datastore.Required)
+	if err != nil {
+		return nil, err
+	}
+
+	return statusQuery, nil
+}
+
+func (b *BlugeQuerier) processStatusQueryNode(q bluge.Query, sq *datastore.StatusQuery, caller Caller, constraint datastore.QueryItemConstraint) error {
+	switch v := q.(type) {
+	case *bluge.BooleanQuery:
+		for _, mustQuery := range v.Musts() {
+			if err := b.processStatusQueryNode(mustQuery, sq, caller, datastore.Required); err != nil {
+				return err
+			}
+		}
+		for _, shouldQuery := range v.Shoulds() {
+			if err := b.processStatusQueryNode(shouldQuery, sq, caller, datastore.Optional); err != nil {
+				return err
+			}
+		}
+		for _, mustNotQuery := range v.MustNots() {
+			if err := b.processStatusQueryNode(mustNotQuery, sq, caller, datastore.Excluded); err != nil {
+				return err
+			}
+		}
+		return nil
+	case *bluge.MatchQuery:
+		return b.assignTermToStatusQuery(v.Field(), v.Match(), sq, caller, constraint)
+	case *bluge.WildcardQuery:
+		field, value, err := unwrapWildcard(v)
+		if err != nil {
+			return err
+		}
+		return b.assignTermToStatusQuery(field, value, sq, caller, constraint)
+	default:
+		return apimodel.InvalidQueryError{Reason: fmt.Sprintf("unsupported query type: %T", q)}
+	}
+}
+
+// unwrapWildcard validates a Bluge WildcardQuery and returns the field plus
+// the wildcard string with `*` preserved. The SQL renderer translates every
+// `*` into a `%` for LIKE matching, so any pattern of stars works:
+// `foo*`, `*foo`, `*foo*` (substring), and `foo*bar` (middle).
+//
+// Rejected:
+//   - `?` — no clean LIKE equivalent (`_` matches one char but conflicts
+//     with our literal-character escape).
+//   - bare `*` — matches every row, almost always user error.
+func unwrapWildcard(w *bluge.WildcardQuery) (string, string, error) {
+	value := w.Wildcard()
+	if strings.Contains(value, "?") {
+		return "", "", apimodel.InvalidQueryError{Reason: fmt.Sprintf("'?' wildcard is not yet supported: %q", value)}
+	}
+	if value == "*" {
+		return "", "", apimodel.InvalidQueryError{Reason: "bare '*' matches every row; provide at least one non-wildcard character"}
+	}
+	return w.Field(), value, nil
+}
+
+func (b *BlugeQuerier) assignTermToStatusQuery(field string, value any, sq *datastore.StatusQuery, caller Caller, constraint datastore.QueryItemConstraint) error {
+	if field == "" {
+		return apimodel.InvalidQueryError{Reason: fmt.Sprintf("query term '%s' must have an explicit field", value)}
+	}
+
+	switch strings.ToLower(field) {
+	case "id":
+		sq.CommandID = appendStringValue(sq.CommandID, value.(string), constraint)
+	case "client":
+		if value == "me" {
+			value = caller.ClientID
+		}
+		sq.ClientID = appendStringValue(sq.ClientID, value.(string), constraint)
+	case "user":
+		userValue := value.(string)
+		if userValue == "me" {
+			if caller.Subject == "" {
+				return apimodel.InvalidQueryError{Reason: "'user:me' requires an authenticated identity, but this request has no authenticated identity"}
+			}
+			sq.Subject = appendStringValue(sq.Subject, caller.Subject, constraint)
+			return nil
+		}
+		if isSubjectID(userValue) {
+			sq.Subject = appendStringValue(sq.Subject, userValue, constraint)
+		} else {
+			sq.SubjectName = appendStringValue(sq.SubjectName, userValue, constraint)
+		}
+	case "command":
+		sq.Command = appendStringValue(sq.Command, value.(string), constraint)
+	case "status":
+		sq.Status = appendStringValue(sq.Status, value.(string), constraint)
+	case "stack":
+		sq.Stack = appendStringValue(sq.Stack, value.(string), constraint)
+	default:
+		return apimodel.InvalidQueryError{Reason: fmt.Sprintf("unknown field for StatusQuery: '%s'", field)}
+	}
+	return nil
+}
+
+// isSubjectID reports whether value is shaped like an identity platform
+// subject id, which routes a `user:` term to StatusQuery.Subject rather than
+// SubjectName. Subject ids are KSUIDs today: a KSUID is recognized by
+// length (exactly 27), the base62 alphabet, and a successful ksuid.Parse
+// (which itself only checks length and the 160-bit numeric bound —
+// ksuid.Parse does not validate the alphabet, so the explicit alphabet
+// check here is required, not redundant. A non-alphanumeric byte maps to
+// an out-of-range base62 digit that ksuid.Parse only rejects if it pushes
+// the decoded 160-bit value over the KSUID bound; whether that happens
+// depends on the byte's position and the magnitude of the surrounding
+// characters, not on position alone, so a fixed "safe" position range does
+// not exist — the alphabet must be checked explicitly rather than relied
+// on to fail parsing). UUIDs are recognized too, since subject ids were
+// UUIDs before the KSUID migration and other deployments may still mint
+// them.
+//
+// This leaves one accepted ambiguity: an exactly-27-character, strictly
+// alphanumeric display name (e.g. a GitHub username with no hyphen, padded
+// to 27 chars) is indistinguishable from a KSUID and routes to Subject,
+// where it matches nothing. A shorter or hyphenated name is unaffected.
+func isSubjectID(value string) bool {
+	if uuid.Validate(value) == nil {
+		return true
+	}
+	if !isBase62(value) {
+		return false
+	}
+	_, err := ksuid.Parse(value)
+	return err == nil
+}
+
+// isBase62 reports whether every byte of s is in [0-9A-Za-z].
+func isBase62(s string) bool {
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if (c < '0' || c > '9') && (c < 'A' || c > 'Z') && (c < 'a' || c > 'z') {
+			return false
+		}
+	}
+	return true
+}
+
+func queryItem[T any](value T, constraint datastore.QueryItemConstraint) *datastore.QueryItem[T] {
+	return &datastore.QueryItem[T]{
+		Item:       value,
+		Constraint: constraint,
+	}
+}
+
+func (b *BlugeQuerier) QueryResources(queryString string) ([]*pkgmodel.Resource, error) {
+	rq, err := b.toResourceQuery(queryString)
+	if err != nil {
+		return nil, err
+	}
+	if rq == nil {
+		return []*pkgmodel.Resource{}, nil
+	}
+	return b.datastore.QueryResources(rq)
+}
+
+func (b *BlugeQuerier) QueryResourceSummaries(queryString string) ([]pkgmodel.ResourceSummary, error) {
+	rq, err := b.toResourceQuery(queryString)
+	if err != nil {
+		return nil, err
+	}
+	if rq == nil {
+		return []pkgmodel.ResourceSummary{}, nil
+	}
+	return b.datastore.ListResourceSummaries(rq)
+}
+
+// toResourceQuery translates a query string (with optional :: escaping) into a
+// *datastore.ResourceQuery. An empty string returns &ResourceQuery{} (match all).
+// A nil return means the parsed query produced no constraints (callers return empty).
+func (b *BlugeQuerier) toResourceQuery(queryString string) (*datastore.ResourceQuery, error) {
+	// colons are used in resource types and bluge query string syntax
+	if strings.Contains(queryString, "::") {
+		queryString = strings.ReplaceAll(queryString, "::", "\\:\\:")
+	}
+
+	if queryString == "" {
+		return &datastore.ResourceQuery{}, nil
+	}
+
+	rq, err := b.resourceQuery(queryString)
+	if err != nil {
+		return nil, err
+	}
+	return rq, nil
+}
+
+func (b *BlugeQuerier) resourceQuery(queryString string) (*datastore.ResourceQuery, error) {
+	q, err := querystr.ParseQueryString(queryString, querystr.QueryStringOptions{})
+	if err != nil {
+		return nil, apimodel.InvalidQueryError{Reason: err.Error()}
+	}
+
+	resourceQuery, err := b.translateToResourceQuery(q)
+	if err != nil {
+		return nil, apimodel.InvalidQueryError{Reason: err.Error()}
+	}
+
+	return resourceQuery, nil
+}
+
+func (b *BlugeQuerier) translateToResourceQuery(blugeQuery bluge.Query) (*datastore.ResourceQuery, error) {
+	resourceQuery := &datastore.ResourceQuery{}
+	err := b.processResourceQueryNode(blugeQuery, resourceQuery, datastore.Required)
+	if err != nil {
+		return nil, err
+	}
+
+	return resourceQuery, nil
+}
+
+func (b *BlugeQuerier) processResourceQueryNode(q bluge.Query, rq *datastore.ResourceQuery, constraint datastore.QueryItemConstraint) error {
+	switch v := q.(type) {
+	case *bluge.BooleanQuery:
+		for _, mustQuery := range v.Musts() {
+			if err := b.processResourceQueryNode(mustQuery, rq, datastore.Required); err != nil {
+				return err
+			}
+		}
+		for _, shouldQuery := range v.Shoulds() {
+			if err := b.processResourceQueryNode(shouldQuery, rq, datastore.Optional); err != nil {
+				return err
+			}
+		}
+		for _, mustNotQuery := range v.MustNots() {
+			if err := b.processResourceQueryNode(mustNotQuery, rq, datastore.Excluded); err != nil {
+				return err
+			}
+		}
+		return nil
+	case *bluge.MatchQuery:
+		return b.assignTermToResourceQuery(v.Field(), v.Match(), rq, constraint)
+	case *bluge.WildcardQuery:
+		field, value, err := unwrapWildcard(v)
+		if err != nil {
+			return err
+		}
+		return b.assignTermToResourceQuery(field, value, rq, constraint)
+	default:
+		return apimodel.InvalidQueryError{Reason: fmt.Sprintf("unsupported query type: %T", q)}
+	}
+}
+
+func (b *BlugeQuerier) assignTermToResourceQuery(field string, value any, rq *datastore.ResourceQuery, constraint datastore.QueryItemConstraint) error {
+	if field == "" {
+		return apimodel.InvalidQueryError{Reason: fmt.Sprintf("query term '%s' must have an explicit field", value)}
+	}
+
+	switch strings.ToLower(field) {
+	case "stack":
+		rq.Stack = appendStringValue(rq.Stack, value.(string), constraint)
+	case "type":
+		rq.Type = appendStringValue(rq.Type, value.(string), constraint)
+	case "label":
+		rq.Label = appendStringValue(rq.Label, value.(string), constraint)
+	case "target":
+		rq.Target = appendStringValue(rq.Target, value.(string), constraint)
+	case "managed":
+		boolVal, err := strconv.ParseBool(fmt.Sprintf("%v", value))
+		if err != nil {
+			return apimodel.InvalidQueryError{Reason: fmt.Sprintf("invalid boolean value for 'managed': %v", err)}
+		}
+		rq.Managed = queryItem(boolVal, constraint)
+	default:
+		return apimodel.InvalidQueryError{Reason: fmt.Sprintf("unknown field for ResourceQuery: '%s'", field)}
+	}
+	return nil
+}
+
+// appendStringValue accumulates string values for a single field. The first
+// occurrence sets Item; subsequent occurrences with the same constraint
+// append to ExtraItems. This is how multi-value queries like
+// `target:eu target:us` (target IN ('eu','us')) are captured.
+//
+// A new constraint replaces the prior QueryItem entirely — `stack:a +stack:b`
+// is treated as the user replacing their previous filter, not mixing them.
+func appendStringValue(existing *datastore.QueryItem[string], value string, constraint datastore.QueryItemConstraint) *datastore.QueryItem[string] {
+	if existing == nil || existing.Constraint != constraint {
+		return queryItem(value, constraint)
+	}
+	existing.ExtraItems = append(existing.ExtraItems, value)
+	return existing
+}
+
+func (b *BlugeQuerier) QueryResourcesForDestroy(queryString string) ([]*pkgmodel.Resource, error) {
+	if queryString == "" {
+		return b.datastore.QueryResources(&datastore.ResourceQuery{})
+	}
+
+	destroyQuery, err := b.destroyResourcesQuery(queryString)
+	if err != nil {
+		return nil, err
+	}
+
+	resourceQuery := &datastore.ResourceQuery{
+		Stack:    destroyQuery.Stack,
+		Type:     destroyQuery.Type,
+		Label:    destroyQuery.Label,
+		Target:   destroyQuery.Target,
+		NativeID: destroyQuery.NativeID,
+	}
+
+	return b.datastore.QueryResources(resourceQuery)
+}
+
+func (b *BlugeQuerier) destroyResourcesQuery(queryString string) (*datastore.DestroyResourcesQuery, error) {
+	q, err := querystr.ParseQueryString(queryString, querystr.QueryStringOptions{})
+	if err != nil {
+		return nil, apimodel.InvalidQueryError{Reason: err.Error()}
+	}
+
+	destroyQuery, err := b.translateToDestroyResourcesQuery(q)
+	if err != nil {
+		return nil, err
+	}
+
+	return destroyQuery, nil
+}
+
+func (b *BlugeQuerier) translateToDestroyResourcesQuery(blugeQuery bluge.Query) (*datastore.DestroyResourcesQuery, error) {
+	destroyQuery := &datastore.DestroyResourcesQuery{}
+	err := b.processDestroyResourcesQueryNode(blugeQuery, destroyQuery, datastore.Required)
+	if err != nil {
+		return nil, err
+	}
+	return destroyQuery, nil
+}
+
+func (b *BlugeQuerier) processDestroyResourcesQueryNode(q bluge.Query, dq *datastore.DestroyResourcesQuery, constraint datastore.QueryItemConstraint) error {
+	switch v := q.(type) {
+	case *bluge.BooleanQuery:
+		for _, m := range v.Musts() {
+			if err := b.processDestroyResourcesQueryNode(m, dq, datastore.Required); err != nil {
+				return err
+			}
+		}
+		for _, s := range v.Shoulds() {
+			if err := b.processDestroyResourcesQueryNode(s, dq, datastore.Optional); err != nil {
+				return err
+			}
+		}
+		for _, n := range v.MustNots() {
+			if err := b.processDestroyResourcesQueryNode(n, dq, datastore.Excluded); err != nil {
+				return err
+			}
+		}
+		return nil
+	case *bluge.MatchQuery:
+		return b.assignTermToDestroyResourcesQuery(v.Field(), v.Match(), dq, constraint)
+	case *bluge.WildcardQuery:
+		field, value, err := unwrapWildcard(v)
+		if err != nil {
+			return err
+		}
+		return b.assignTermToDestroyResourcesQuery(field, value, dq, constraint)
+	default:
+		return apimodel.InvalidQueryError{Reason: fmt.Sprintf("unsupported query type: %T", q)}
+	}
+}
+
+func (b *BlugeQuerier) assignTermToDestroyResourcesQuery(field string, value any, dq *datastore.DestroyResourcesQuery, constraint datastore.QueryItemConstraint) error {
+	if field == "" {
+		return apimodel.InvalidQueryError{Reason: fmt.Sprintf("query term '%s' must have an explicit field", value)}
+	}
+
+	switch strings.ToLower(field) {
+	case "stack":
+		dq.Stack = appendStringValue(dq.Stack, value.(string), constraint)
+	case "type":
+		dq.Type = appendStringValue(dq.Type, value.(string), constraint)
+	case "label":
+		dq.Label = appendStringValue(dq.Label, value.(string), constraint)
+	case "target":
+		dq.Target = appendStringValue(dq.Target, value.(string), constraint)
+	case "native_id":
+		dq.NativeID = appendStringValue(dq.NativeID, value.(string), constraint)
+	case "managed":
+		return apimodel.InvalidQueryError{Reason: "managed field cannot be used in destroy queries"}
+	default:
+		return apimodel.InvalidQueryError{Reason: fmt.Sprintf("unknown field for destroy query: '%s'", field)}
+	}
+	return nil
+}

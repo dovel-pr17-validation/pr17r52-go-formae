@@ -1,0 +1,192 @@
+// © 2025 Platform Engineering Labs Inc.
+//
+// SPDX-License-Identifier: FSL-1.1-ALv2
+
+package discovery
+
+import (
+	"maps"
+	"testing"
+
+	"github.com/stretchr/testify/assert"
+
+	"github.com/platform-engineering-labs/formae/internal/metastructure/util"
+	"github.com/platform-engineering-labs/formae/pkg/plugin"
+)
+
+// newDiscoverableDescriptor creates a ResourceDescriptor with Schema.Discoverable set
+func newDiscoverableDescriptor(resourceType string, discoverable bool, parentMappings map[string][]plugin.ListParameter) plugin.ResourceDescriptor {
+	return plugin.ResourceDescriptor{
+		Type:                                     resourceType,
+		Discoverable:                             discoverable,
+		ParentResourceTypesWithMappingProperties: parentMappings,
+	}
+}
+
+func TestBuildResourceHierarchy(t *testing.T) {
+	supportedResources := []plugin.ResourceDescriptor{
+		newDiscoverableDescriptor("FakeAWS::S3::Bucket", true, nil),
+		newDiscoverableDescriptor("FakeAWS::EC2::VPC", true, nil),
+		newDiscoverableDescriptor("FakeAWS::EC2::VPCCidrBlock", true, map[string][]plugin.ListParameter{
+			"FakeAWS::EC2::VPC": {{ParentProperty: "Id", ListProperty: "VpcId", QueryPath: "$.Id"}},
+		}),
+		newDiscoverableDescriptor("FakeAWS::EC2::LegacyVPCCidrBlock", false, map[string][]plugin.ListParameter{
+			"FakeAWS::EC2::VPC": {{ParentProperty: "Id", ListProperty: "VpcId", QueryPath: "$.Id"}},
+		}),
+		newDiscoverableDescriptor("FakeAWS::EC2::Instance", false, nil),
+	}
+
+	hierarchy := buildResourceHierarchy(supportedResources)
+
+	assert.Len(t, hierarchy, 3)
+	assert.Contains(t, hierarchy, "FakeAWS::EC2::VPC")
+	assert.Contains(t, hierarchy, "FakeAWS::S3::Bucket")
+	assert.Contains(t, hierarchy, "FakeAWS::EC2::VPCCidrBlock")
+
+	assert.Len(t, hierarchy["FakeAWS::EC2::VPC"].children, 1)
+	var mappingProperties []plugin.ListParameter
+	var resourceType string
+	for childNode, props := range hierarchy["FakeAWS::EC2::VPC"].children {
+		mappingProperties = props
+		resourceType = childNode.resourceType
+	}
+	assert.Equal(t, "FakeAWS::EC2::VPCCidrBlock", resourceType)
+	assert.Equal(t, []plugin.ListParameter{{ParentProperty: "Id", ListProperty: "VpcId", QueryPath: "$.Id"}}, mappingProperties)
+}
+
+func TestBuildResourceHierarchyMultiLevel(t *testing.T) {
+	supportedResources := []plugin.ResourceDescriptor{
+		// VPC is a root (no parents)
+		newDiscoverableDescriptor("FakeAWS::EC2::VPC", true, nil),
+		// Subnet is both a child (of VPC) AND a parent (of NetworkInterface)
+		newDiscoverableDescriptor("FakeAWS::EC2::Subnet", true, map[string][]plugin.ListParameter{
+			"FakeAWS::EC2::VPC": {{ParentProperty: "VpcId", ListProperty: "VpcId", QueryPath: "$.VpcId"}},
+		}),
+		// NetworkInterface is a child of subnet
+		newDiscoverableDescriptor("FakeAWS::EC2::NetworkInterface", true, map[string][]plugin.ListParameter{
+			"FakeAWS::EC2::Subnet": {{ParentProperty: "SubnetId", ListProperty: "SubnetId", QueryPath: "$.SubnetId"}},
+		}),
+		// Bucket is a separate root (no parents)
+		newDiscoverableDescriptor("FakeAWS::S3::Bucket", true, nil),
+	}
+
+	hierarchy := buildResourceHierarchy(supportedResources)
+
+	assert.Len(t, hierarchy, 4)
+	assert.Contains(t, hierarchy, "FakeAWS::EC2::VPC")
+	assert.Contains(t, hierarchy, "FakeAWS::EC2::Subnet")
+	assert.Contains(t, hierarchy, "FakeAWS::EC2::NetworkInterface")
+	assert.Contains(t, hierarchy, "FakeAWS::S3::Bucket")
+
+	vpcNode := hierarchy["FakeAWS::EC2::VPC"]
+	assert.Len(t, vpcNode.children, 1)
+
+	var subnetNode *hierarchyNode
+	for node := range vpcNode.children {
+		assert.Equal(t, "FakeAWS::EC2::Subnet", node.resourceType)
+		subnetNode = node
+	}
+	assert.NotNil(t, subnetNode)
+	assert.Equal(t, []plugin.ListParameter{{ParentProperty: "VpcId", ListProperty: "VpcId", QueryPath: "$.VpcId"}},
+		vpcNode.children[subnetNode])
+
+	subnetHierarchyNode := hierarchy["FakeAWS::EC2::Subnet"]
+	assert.Len(t, subnetHierarchyNode.children, 1)
+
+	var networkInterfaceNode *hierarchyNode
+	for node := range subnetHierarchyNode.children {
+		assert.Equal(t, "FakeAWS::EC2::NetworkInterface", node.resourceType)
+		networkInterfaceNode = node
+	}
+	assert.NotNil(t, networkInterfaceNode)
+	assert.Equal(t, []plugin.ListParameter{{ParentProperty: "SubnetId", ListProperty: "SubnetId", QueryPath: "$.SubnetId"}},
+		subnetHierarchyNode.children[networkInterfaceNode])
+
+	networkInterfaceHierarchyNode := hierarchy["FakeAWS::EC2::NetworkInterface"]
+	assert.Len(t, networkInterfaceHierarchyNode.children, 0)
+
+	bucketNode := hierarchy["FakeAWS::S3::Bucket"]
+	assert.Len(t, bucketNode.children, 0)
+}
+
+func TestMultipleNamespacesMerge(t *testing.T) {
+	awsResources := []plugin.ResourceDescriptor{
+		newDiscoverableDescriptor("AWS::EC2::VPC", true, nil),
+		newDiscoverableDescriptor("AWS::EC2::Subnet", true, map[string][]plugin.ListParameter{
+			"AWS::EC2::VPC": {{ParentProperty: "VpcId", ListProperty: "VpcId", QueryPath: "$.VpcId"}},
+		}),
+	}
+
+	ociResources := []plugin.ResourceDescriptor{
+		newDiscoverableDescriptor("OCI::VCN::VCN", true, nil),
+		newDiscoverableDescriptor("OCI::VCN::Subnet", true, map[string][]plugin.ListParameter{
+			"OCI::VCN::VCN": {{ParentProperty: "Id", ListProperty: "VcnId", QueryPath: "$.Id"}},
+		}),
+	}
+
+	hierarchy := make(map[string]*hierarchyNode)
+
+	awsHierarchy := buildResourceHierarchy(awsResources)
+	maps.Copy(hierarchy, awsHierarchy)
+
+	ociHierarchy := buildResourceHierarchy(ociResources)
+	maps.Copy(hierarchy, ociHierarchy)
+
+	assert.Len(t, hierarchy, 4, "Should have descriptors from both AWS and OCI namespaces")
+	assert.Contains(t, hierarchy, "AWS::EC2::VPC")
+	assert.Contains(t, hierarchy, "AWS::EC2::Subnet")
+	assert.Contains(t, hierarchy, "OCI::VCN::VCN")
+	assert.Contains(t, hierarchy, "OCI::VCN::Subnet")
+
+	awsVpc := hierarchy["AWS::EC2::VPC"]
+	assert.Len(t, awsVpc.children, 1)
+
+	ociVcn := hierarchy["OCI::VCN::VCN"]
+	assert.Len(t, ociVcn.children, 1)
+}
+
+func TestInjectResolvables(t *testing.T) {
+	t.Run("should not inject anything if no parent is set", func(t *testing.T) {
+		op := ListOperation{
+			ResourceType: "AWS::EC2::VPC",
+			TargetLabel:  "test-target",
+		}
+		props := injectResolvables(`{"VpcId":"123"}`, op)
+		assert.JSONEq(t, `{"VpcId":"123"}`, string(props))
+	})
+
+	t.Run("should inject a ref for every list parameter", func(t *testing.T) {
+		op := ListOperation{
+			ResourceType: "AWS::ECS::TaskSet",
+			TargetLabel:  "test-target",
+			ParentKSUID:  "35R2vyf6mT5wEs0mTWT5bp1Lf0E",
+			ListParams: util.MapToString(map[string]plugin.ListParam{
+				"Service": {
+					ParentProperty: "Service",
+					ListParam:      "ServiceName",
+					ListValue:      "my-service",
+				},
+				"Cluster": {
+					ParentProperty: "Cluster",
+					ListParam:      "ClusterName",
+					ListValue:      "my-cluster",
+				},
+			}),
+		}
+		props := injectResolvables(`{"Id":"123"}`, op)
+		assert.JSONEq(t, `
+		{
+			"Id":"123",
+			"ServiceName":
+			{
+				"$ref":"formae://35R2vyf6mT5wEs0mTWT5bp1Lf0E#/Service",
+				"$value":"my-service"
+			},
+			"ClusterName":
+			{
+				"$ref":"formae://35R2vyf6mT5wEs0mTWT5bp1Lf0E#/Cluster",
+				"$value":"my-cluster"
+			}
+		}`, string(props))
+	})
+}

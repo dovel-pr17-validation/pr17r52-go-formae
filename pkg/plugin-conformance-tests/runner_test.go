@@ -1,0 +1,1581 @@
+// © 2025 Platform Engineering Labs Inc.
+//
+// SPDX-License-Identifier: FSL-1.1-ALv2
+
+package conformance
+
+import (
+	"errors"
+	"slices"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/platform-engineering-labs/formae/pkg/api/model"
+	pkgmodel "github.com/platform-engineering-labs/formae/pkg/model"
+)
+
+func TestFilterTestCases(t *testing.T) {
+	testCases := []TestCase{
+		{
+			Name:         "AWS::s3-bucket",
+			PKLFile:      "/path/to/testdata/s3-bucket.pkl",
+			ResourceType: "s3-bucket",
+			PluginName:   "aws",
+		},
+		{
+			Name:         "AWS::ec2-instance",
+			PKLFile:      "/path/to/testdata/compute/ec2-instance.pkl",
+			ResourceType: "ec2-instance",
+			PluginName:   "aws",
+		},
+		{
+			Name:         "AWS::vpc",
+			PKLFile:      "/path/to/testdata/network/vpc.pkl",
+			ResourceType: "vpc",
+			PluginName:   "aws",
+		},
+		{
+			Name:         "GCP::storage-bucket",
+			PKLFile:      "/path/to/testdata/storage-bucket.pkl",
+			ResourceType: "storage-bucket",
+			PluginName:   "gcp",
+		},
+	}
+
+	tests := []struct {
+		name          string
+		filter        string
+		expectedNames []string
+	}{
+		{
+			name:          "no filter returns all",
+			filter:        "",
+			expectedNames: []string{"AWS::s3-bucket", "AWS::ec2-instance", "AWS::vpc", "GCP::storage-bucket"},
+		},
+		{
+			name:          "filter by resource type",
+			filter:        "s3-bucket",
+			expectedNames: []string{"AWS::s3-bucket"},
+		},
+		{
+			name:          "filter by resource type case insensitive",
+			filter:        "S3-BUCKET",
+			expectedNames: []string{"AWS::s3-bucket"},
+		},
+		{
+			name:          "filter by partial name",
+			filter:        "AWS",
+			expectedNames: []string{"AWS::s3-bucket", "AWS::ec2-instance", "AWS::vpc"},
+		},
+		{
+			name:          "filter by path segment",
+			filter:        "network",
+			expectedNames: []string{"AWS::vpc"},
+		},
+		{
+			name:          "filter by compute path",
+			filter:        "compute",
+			expectedNames: []string{"AWS::ec2-instance"},
+		},
+		{
+			name:          "multiple filters comma separated",
+			filter:        "s3-bucket,vpc",
+			expectedNames: []string{"AWS::s3-bucket", "AWS::vpc"},
+		},
+		{
+			name:          "multiple filters with spaces",
+			filter:        "s3-bucket , vpc , ec2-instance",
+			expectedNames: []string{"AWS::s3-bucket", "AWS::ec2-instance", "AWS::vpc"},
+		},
+		{
+			name:          "filter matches multiple via partial",
+			filter:        "bucket",
+			expectedNames: []string{"AWS::s3-bucket", "GCP::storage-bucket"},
+		},
+		{
+			name:          "filter by plugin name in path",
+			filter:        "GCP",
+			expectedNames: []string{"GCP::storage-bucket"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// Set environment variable (empty value reads the same as
+			// unset via os.Getenv, which is what filterTestCases uses).
+			t.Setenv("FORMAE_TEST_FILTER", tt.filter)
+
+			// Run filter
+			filtered := filterTestCases(t, testCases)
+
+			// Check count
+			if len(filtered) != len(tt.expectedNames) {
+				t.Errorf("expected %d test cases, got %d", len(tt.expectedNames), len(filtered))
+				t.Logf("expected: %v", tt.expectedNames)
+				t.Logf("got: %v", testCaseNames(filtered))
+				return
+			}
+
+			// Check names match (order may differ for multi-filter cases)
+			gotNames := make(map[string]bool)
+			for _, tc := range filtered {
+				gotNames[tc.Name] = true
+			}
+			for _, expected := range tt.expectedNames {
+				if !gotNames[expected] {
+					t.Errorf("expected test case %q not found in filtered results", expected)
+				}
+			}
+		})
+	}
+}
+
+// TestFilterTestCases_Regex verifies /…/ delimited regex matching
+// against test case name and resource type.
+func TestFilterTestCases_Regex(t *testing.T) {
+	testCases := []TestCase{
+		{Name: "AWS::s3-bucket", ResourceType: "s3-bucket", PKLFile: "/path/s3-bucket.pkl", PluginName: "aws"},
+		{Name: "AWS::ec2-instance", ResourceType: "ec2-instance", PKLFile: "/path/ec2-instance.pkl", PluginName: "aws"},
+		{Name: "AWS::vpc", ResourceType: "vpc", PKLFile: "/path/vpc.pkl", PluginName: "aws"},
+		{Name: "GCP::storage-bucket", ResourceType: "storage-bucket", PKLFile: "/path/storage-bucket.pkl", PluginName: "gcp"},
+		{Name: "K8S::nginx-chart", ResourceType: "nginx-chart", PKLFile: "/path/nginx-chart.pkl", PluginName: "k8s"},
+		{Name: "K8S::redis-chart", ResourceType: "redis-chart", PKLFile: "/path/redis-chart.pkl", PluginName: "k8s"},
+		{Name: "K8S::clusterrole", ResourceType: "clusterrole", PKLFile: "/path/clusterrole.pkl", PluginName: "k8s"},
+		{Name: "K8S::clusterrolebinding", ResourceType: "clusterrolebinding", PKLFile: "/path/clusterrolebinding.pkl", PluginName: "k8s"},
+	}
+
+	tests := []struct {
+		name          string
+		filter        string
+		expectedNames []string
+	}{
+		{
+			name:          "regex matching chart tests",
+			filter:        "/.*-chart/",
+			expectedNames: []string{"K8S::nginx-chart", "K8S::redis-chart"},
+		},
+		{
+			name:          "anchored regex matching cluster-prefixed resources",
+			filter:        "/^cluster.*/",
+			expectedNames: []string{"K8S::clusterrole", "K8S::clusterrolebinding"},
+		},
+		{
+			name:          "regex matching by name prefix",
+			filter:        "/^AWS::.*/",
+			expectedNames: []string{"AWS::s3-bucket", "AWS::ec2-instance", "AWS::vpc"},
+		},
+		{
+			name:          "mixed regex and literal",
+			filter:        "/.*-chart/,vpc",
+			expectedNames: []string{"K8S::nginx-chart", "K8S::redis-chart", "AWS::vpc"},
+		},
+		{
+			name:          "empty regex matches all",
+			filter:        "//",
+			expectedNames: []string{"AWS::s3-bucket", "AWS::ec2-instance", "AWS::vpc", "GCP::storage-bucket", "K8S::nginx-chart", "K8S::redis-chart", "K8S::clusterrole", "K8S::clusterrolebinding"},
+		},
+		{
+			name:          "regex with alternation",
+			filter:        "/s3-bucket|vpc/",
+			expectedNames: []string{"AWS::s3-bucket", "AWS::vpc"},
+		},
+		{
+			name:          "regex matches resource type only",
+			filter:        "/^ec2-instance$/",
+			expectedNames: []string{"AWS::ec2-instance"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Setenv("FORMAE_TEST_FILTER", tt.filter)
+
+			filtered := filterTestCases(t, testCases)
+
+			if len(filtered) != len(tt.expectedNames) {
+				t.Errorf("expected %d test cases, got %d", len(tt.expectedNames), len(filtered))
+				t.Logf("expected: %v", tt.expectedNames)
+				t.Logf("got: %v", testCaseNames(filtered))
+				return
+			}
+
+			gotNames := make(map[string]bool)
+			for _, tc := range filtered {
+				gotNames[tc.Name] = true
+			}
+			for _, expected := range tt.expectedNames {
+				if !gotNames[expected] {
+					t.Errorf("expected test case %q not found in filtered results", expected)
+				}
+			}
+		})
+	}
+}
+
+// TestFilterTestCases_InvalidRegex verifies that an invalid regex
+// pattern causes the test run to fail immediately.
+func TestFilterTestCases_InvalidRegex(t *testing.T) {
+	testCases := []TestCase{
+		{Name: "AWS::s3-bucket", ResourceType: "s3-bucket", PKLFile: "/path/s3-bucket.pkl", PluginName: "aws"},
+	}
+
+	t.Setenv("FORMAE_TEST_FILTER", "/[invalid/")
+
+	// filterTestCases calls t.Fatalf on invalid regex — we can't easily
+	// capture that in a unit test without a subprocess, so we document
+	// the expected behavior here and test the regex compilation path
+	// indirectly through the passing tests above.
+	t.Log("Note: filterTestCases calls t.Fatalf on invalid regex /[invalid/ — cannot unit test fatal behavior directly")
+	_ = testCases
+}
+
+// TestFilterTestCases_ExactMatchPriority verifies that when a filter pattern
+// exactly matches a ResourceType, only that exact match is returned — not
+// substring matches. This prevents CI cross-contamination where e.g.
+// "s3-bucket" also matches "s3-bucketpolicy".
+func TestFilterTestCases_ExactMatchPriority(t *testing.T) {
+	testCases := []TestCase{
+		{
+			Name:         "AWS::s3-bucket",
+			PKLFile:      "/path/to/testdata/s3-bucket.pkl",
+			ResourceType: "s3-bucket",
+			PluginName:   "aws",
+		},
+		{
+			Name:         "AWS::s3-bucketpolicy",
+			PKLFile:      "/path/to/testdata/s3-bucketpolicy.pkl",
+			ResourceType: "s3-bucketpolicy",
+			PluginName:   "aws",
+		},
+		{
+			Name:         "AWS::ec2-transitgateway",
+			PKLFile:      "/path/to/testdata/ec2-transitgateway.pkl",
+			ResourceType: "ec2-transitgateway",
+			PluginName:   "aws",
+		},
+		{
+			Name:         "AWS::ec2-transitgatewayroutetable",
+			PKLFile:      "/path/to/testdata/ec2-transitgatewayroutetable.pkl",
+			ResourceType: "ec2-transitgatewayroutetable",
+			PluginName:   "aws",
+		},
+		{
+			Name:         "AWS::iam-role",
+			PKLFile:      "/path/to/testdata/iam-role.pkl",
+			ResourceType: "iam-role",
+			PluginName:   "aws",
+		},
+		{
+			Name:         "AWS::iam-rolepolicy",
+			PKLFile:      "/path/to/testdata/iam-rolepolicy.pkl",
+			ResourceType: "iam-rolepolicy",
+			PluginName:   "aws",
+		},
+	}
+
+	tests := []struct {
+		name          string
+		filter        string
+		expectedNames []string
+	}{
+		{
+			name:          "exact match s3-bucket does not match s3-bucketpolicy",
+			filter:        "s3-bucket",
+			expectedNames: []string{"AWS::s3-bucket"},
+		},
+		{
+			name:          "exact match ec2-transitgateway does not match ec2-transitgatewayroutetable",
+			filter:        "ec2-transitgateway",
+			expectedNames: []string{"AWS::ec2-transitgateway"},
+		},
+		{
+			name:          "exact match iam-role does not match iam-rolepolicy",
+			filter:        "iam-role",
+			expectedNames: []string{"AWS::iam-role"},
+		},
+		{
+			name:          "exact match s3-bucketpolicy returns only s3-bucketpolicy",
+			filter:        "s3-bucketpolicy",
+			expectedNames: []string{"AWS::s3-bucketpolicy"},
+		},
+		{
+			name:          "non-exact filter still uses substring matching",
+			filter:        "transitgateway",
+			expectedNames: []string{"AWS::ec2-transitgateway", "AWS::ec2-transitgatewayroutetable"},
+		},
+		{
+			name:          "multiple exact filters",
+			filter:        "s3-bucket,iam-role",
+			expectedNames: []string{"AWS::s3-bucket", "AWS::iam-role"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// Set environment variable (empty value reads the same as
+			// unset via os.Getenv, which is what filterTestCases uses).
+			t.Setenv("FORMAE_TEST_FILTER", tt.filter)
+
+			// Run filter
+			filtered := filterTestCases(t, testCases)
+
+			// Check count
+			if len(filtered) != len(tt.expectedNames) {
+				t.Errorf("expected %d test cases, got %d", len(tt.expectedNames), len(filtered))
+				t.Logf("expected: %v", tt.expectedNames)
+				t.Logf("got: %v", testCaseNames(filtered))
+				return
+			}
+
+			// Check names match (order may differ for multi-filter cases)
+			gotNames := make(map[string]bool)
+			for _, tc := range filtered {
+				gotNames[tc.Name] = true
+			}
+			for _, expected := range tt.expectedNames {
+				if !gotNames[expected] {
+					t.Errorf("expected test case %q not found in filtered results", expected)
+				}
+			}
+		})
+	}
+}
+
+func TestFilterTestCases_NoMatch(t *testing.T) {
+	testCases := []TestCase{
+		{
+			Name:         "AWS::s3-bucket",
+			PKLFile:      "/path/to/testdata/s3-bucket.pkl",
+			ResourceType: "s3-bucket",
+			PluginName:   "aws",
+		},
+	}
+
+	t.Setenv("FORMAE_TEST_FILTER", "nonexistent")
+
+	// Create a sub-test to capture the fatal
+	subT := &testing.T{}
+
+	// This should call t.Fatalf, but since we're using a mock T, we can't easily test this
+	// In real usage, this would fail the test with a helpful message
+	// For now, we just document the expected behavior
+	t.Log("Note: filterTestCases calls t.Fatalf when no matches found - cannot easily unit test fatal behavior")
+
+	// We can at least verify the helper function works
+	names := testCaseNames(testCases)
+	if len(names) != 1 || names[0] != "AWS::s3-bucket" {
+		t.Errorf("testCaseNames returned unexpected result: %v", names)
+	}
+
+	_ = subT // silence unused variable warning
+}
+
+func TestTestCaseNames(t *testing.T) {
+	testCases := []TestCase{
+		{Name: "test1"},
+		{Name: "test2"},
+		{Name: "test3"},
+	}
+
+	names := testCaseNames(testCases)
+
+	if len(names) != 3 {
+		t.Fatalf("expected 3 names, got %d", len(names))
+	}
+
+	expected := []string{"test1", "test2", "test3"}
+	for i, name := range names {
+		if name != expected[i] {
+			t.Errorf("expected name[%d] = %q, got %q", i, expected[i], name)
+		}
+	}
+}
+
+func TestTestCaseNames_Empty(t *testing.T) {
+	names := testCaseNames([]TestCase{})
+	if len(names) != 0 {
+		t.Errorf("expected empty slice, got %v", names)
+	}
+}
+
+// TestCompareProperties_NestedResolvable verifies that compareProperties handles
+// Resolvable references nested inside SubResource maps. Case in point:
+// ResourceLifecycleConfig.ServiceRole is a Resolvable where Pkl eval produces
+// $visibility:Clear, but after Formae resolves the reference the inventory has
+// $value with the actual ARN. The two must still compare equal.
+func TestCompareProperties_NestedResolvable(t *testing.T) {
+	// Expected: from Pkl eval — Resolvable has $visibility but no $value
+	expectedProperties := map[string]any{
+		"ApplicationName": "my-app",
+		"ResourceLifecycleConfig": map[string]any{
+			"ServiceRole": map[string]any{
+				"$label":      "eb-service-role",
+				"$property":   "Arn",
+				"$res":        true,
+				"$stack":      "my-stack",
+				"$type":       "AWS::IAM::Role",
+				"$visibility": "Clear",
+			},
+			"VersionLifecycleConfig": map[string]any{
+				"MaxAgeRule": map[string]any{
+					"DeleteSourceFromS3": false,
+					"Enabled":            false,
+					"MaxAgeInDays":       float64(180),
+				},
+				"MaxCountRule": map[string]any{
+					"DeleteSourceFromS3": false,
+					"Enabled":            false,
+					"MaxCount":           float64(200),
+				},
+			},
+		},
+	}
+
+	// Actual: from inventory after resolution — Resolvable has $value instead of $visibility
+	actualResource := map[string]any{
+		"Properties": map[string]any{
+			"ApplicationName": "my-app",
+			"ResourceLifecycleConfig": map[string]any{
+				"ServiceRole": map[string]any{
+					"$label":    "eb-service-role",
+					"$property": "Arn",
+					"$res":      true,
+					"$stack":    "my-stack",
+					"$type":     "AWS::IAM::Role",
+					"$value":    "arn:aws:iam::123456789012:role/my-role",
+				},
+				"VersionLifecycleConfig": map[string]any{
+					"MaxAgeRule": map[string]any{
+						"DeleteSourceFromS3": false,
+						"Enabled":            false,
+						"MaxAgeInDays":       float64(180),
+					},
+					"MaxCountRule": map[string]any{
+						"DeleteSourceFromS3": false,
+						"Enabled":            false,
+						"MaxCount":           float64(200),
+					},
+				},
+			},
+		},
+	}
+
+	result := compareProperties(t, expectedProperties, actualResource, "after create", map[string]providerDefault{})
+	if !result {
+		t.Errorf("compareProperties should pass when SubResource contains a nested Resolvable with resolved $value")
+	}
+}
+
+// TestCompareProperties_Embed verifies that a $embed field whose stored
+// $template carries the resolved $value and Go sorted-key envelope encoding
+// compares equal to an authored expected $template that has neither.
+func TestCompareProperties_Embed(t *testing.T) {
+	// Expected (from Pkl eval): $res span, insertion-order keys, no $value.
+	expectedSpan := pkgmodel.FrameEnvelope(
+		`{"$res":true,"$label":"kvs","$type":"AWS::CloudFront::KeyValueStore","$stack":"s","$property":"Id","$visibility":"Clear"}`)
+	expectedProperties := map[string]any{
+		"FunctionCode": map[string]any{
+			"$embed":    true,
+			"$template": "const kvsId = '" + expectedSpan + "';",
+		},
+	}
+
+	// Actual (from inventory after resolution): same span with sorted keys + $value.
+	actualSpan := pkgmodel.FrameEnvelope(
+		`{"$label":"kvs","$property":"Id","$res":true,"$stack":"s","$type":"AWS::CloudFront::KeyValueStore","$value":"21775858-76bb"}`)
+	actualResource := map[string]any{
+		"Properties": map[string]any{
+			"FunctionCode": map[string]any{
+				"$embed":    true,
+				"$template": "const kvsId = '" + actualSpan + "';",
+			},
+		},
+	}
+
+	if !compareProperties(t, expectedProperties, actualResource, "after create", map[string]providerDefault{}) {
+		t.Errorf("compareProperties should pass for an embedded resolvable whose stored $template carries the resolved $value and sorted-key encoding")
+	}
+}
+
+// A literal segment difference in a $embed $template MUST be detected (negative).
+func TestCompareEmbed_DifferentLiteralFails(t *testing.T) {
+	span := pkgmodel.FrameEnvelope(`{"$res":true,"$label":"kvs","$type":"T","$stack":"s","$property":"Id"}`)
+	expected := map[string]any{"$embed": true, "$template": "A-" + span + "-B"}
+	actual := map[string]any{"$embed": true, "$template": "A-" + span + "-DIFFERENT"}
+	rec := &recordingReporter{}
+	if compareEmbed(rec, "FunctionCode", expected, actual) {
+		t.Errorf("compareEmbed should fail when the literal template text differs")
+	}
+}
+
+// An opaque secret field is hashed at rest, so inventory returns an opaque
+// envelope rather than the authored plaintext. compareProperties must verify it
+// by digest (positive: correct SHA-256 of the authored plaintext).
+func TestCompareProperties_OpaqueSecret_VerifiedByDigest(t *testing.T) {
+	expectedProperties := map[string]any{
+		"MasterUserPassword": "TestPassword123!",
+	}
+	actualResource := map[string]any{
+		"Properties": map[string]any{
+			"MasterUserPassword": map[string]any{
+				"$visibility": pkgmodel.VisibilityOpaque,
+				"$hashed":     true,
+				"$value":      pkgmodel.ComputeValueHash("TestPassword123!"),
+			},
+		},
+	}
+	if !compareProperties(t, expectedProperties, actualResource, "after create", map[string]providerDefault{}) {
+		t.Errorf("compareProperties should pass when the opaque value's digest matches the authored secret")
+	}
+}
+
+// A digest that does not match the authored plaintext MUST be flagged (negative).
+func TestCompareProperties_OpaqueSecret_WrongDigestFails(t *testing.T) {
+	expected := map[string]any{"MasterUserPassword": "TestPassword123!"}
+	actual := map[string]any{
+		"Properties": map[string]any{
+			"MasterUserPassword": map[string]any{
+				"$visibility": pkgmodel.VisibilityOpaque,
+				"$hashed":     true,
+				"$value":      pkgmodel.ComputeValueHash("a-different-password"),
+			},
+		},
+	}
+	rec := &recordingReporter{}
+	if compareProperties(rec, expected, actual, "after create", map[string]providerDefault{}) || rec.errors == 0 {
+		t.Errorf("compareProperties should fail when the opaque digest does not match the authored secret")
+	}
+}
+
+// After extraction the digest may be omitted; the opaque envelope is then
+// accepted as-is (no plaintext to leak), mirroring resolvable handling.
+func TestCompareOpaqueValue_NoDigestAccepted(t *testing.T) {
+	actual := map[string]any{"$visibility": pkgmodel.VisibilityOpaque}
+	if !compareOpaqueValue(t, "MasterUserPassword", "TestPassword123!", actual, "after extract") {
+		t.Errorf("compareOpaqueValue should accept an opaque envelope with no verifiable digest")
+	}
+}
+
+func TestContainsOpaqueValue(t *testing.T) {
+	tests := []struct {
+		name     string
+		value    any
+		expected bool
+	}{
+		{
+			name:     "no opaque values",
+			value:    map[string]any{"Name": "my-bucket", "Tags": map[string]any{"env": "test"}},
+			expected: false,
+		},
+		{
+			name:     "envelope at the top level",
+			value:    map[string]any{"$visibility": pkgmodel.VisibilityOpaque, "$hashed": true, "$value": "abc123"},
+			expected: true,
+		},
+		{
+			name: "envelope nested in a map",
+			value: map[string]any{
+				"Name": "my-db",
+				"Credentials": map[string]any{
+					"MasterUserPassword": map[string]any{"$visibility": pkgmodel.VisibilityOpaque, "$hashed": true, "$value": "abc123"},
+				},
+			},
+			expected: true,
+		},
+		{
+			name: "envelope nested inside an array",
+			value: map[string]any{
+				"Receivers": []any{
+					map[string]any{"Type": "webhook"},
+					map[string]any{"Token": map[string]any{"$hashed": true, "$value": "abc123"}},
+				},
+			},
+			expected: true,
+		},
+		{
+			name: "envelope with $visibility only",
+			value: map[string]any{
+				"Secret": map[string]any{"$visibility": pkgmodel.VisibilityOpaque},
+			},
+			expected: true,
+		},
+		{
+			name:     "resolvable is not opaque",
+			value:    map[string]any{"VpcId": map[string]any{"$ref": "vpc", "$type": "AWS::EC2::VPC"}},
+			expected: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := containsOpaqueValue(tt.value); got != tt.expected {
+				t.Errorf("containsOpaqueValue() = %v, want %v", got, tt.expected)
+			}
+		})
+	}
+}
+
+// fakeReapplyHarness records the calls the extract re-apply sub-step makes, so a
+// test can pin exactly where a guarded check returned.
+type fakeReapplyHarness struct {
+	calls []string
+
+	simulation  *model.Simulation
+	simulateErr error
+}
+
+func (f *fakeReapplyHarness) SimulateApply(pklFile string, mode string) (*model.Simulation, error) {
+	f.calls = append(f.calls, "SimulateApply:"+mode)
+	return f.simulation, f.simulateErr
+}
+
+// reapplyResource builds an inventory-shaped resource with the given identity.
+func reapplyResource(label, stack, nativeID string, properties map[string]any) map[string]any {
+	return map[string]any{
+		"Label":      label,
+		"Stack":      stack,
+		"Type":       "NS::Storage::Bucket",
+		"NativeID":   nativeID,
+		"Properties": properties,
+	}
+}
+
+func TestVerifyExtractReapply(t *testing.T) {
+	properties := map[string]any{"BucketName": "my-bucket"}
+	created := reapplyResource("my-bucket", "default", "bucket-1", properties)
+	extracted := reapplyResource("my-bucket", "default", "bucket-1", properties)
+
+	tests := []struct {
+		name          string
+		harness       *fakeReapplyHarness
+		extracted     map[string]any
+		created       map[string]any
+		expectedPass  bool
+		expectedCalls []string
+		expectedError string
+	}{
+		{
+			name:          "faithful extract simulates to a zero-operation apply",
+			harness:       &fakeReapplyHarness{simulation: &model.Simulation{ChangesRequired: false}},
+			expectedPass:  true,
+			expectedCalls: []string{"SimulateApply:patch"},
+		},
+		{
+			name:          "simulate returns an error",
+			harness:       &fakeReapplyHarness{simulateErr: errors.New("agent unreachable")},
+			expectedPass:  false,
+			expectedCalls: []string{"SimulateApply:patch"},
+			expectedError: "agent unreachable",
+		},
+		{
+			name:          "simulate returns no simulation",
+			harness:       &fakeReapplyHarness{},
+			expectedPass:  false,
+			expectedCalls: []string{"SimulateApply:patch"},
+		},
+		{
+			name: "lossy extract plans a change",
+			harness: &fakeReapplyHarness{simulation: &model.Simulation{
+				ChangesRequired: true,
+				Command: model.Command{ResourceUpdates: []model.ResourceUpdate{{
+					Operation:     model.OperationUpdate,
+					ResourceLabel: "my-bucket",
+					ResourceType:  "NS::Storage::Bucket",
+				}}},
+			}},
+			expectedPass:  false,
+			expectedCalls: []string{"SimulateApply:patch"},
+			expectedError: "update my-bucket (NS::Storage::Bucket)",
+		},
+		{
+			name: "lossy extract failure names the diffing properties",
+			harness: &fakeReapplyHarness{simulation: &model.Simulation{
+				ChangesRequired: true,
+				Command: model.Command{ResourceUpdates: []model.ResourceUpdate{{
+					Operation:     model.OperationUpdate,
+					ResourceLabel: "my-alias",
+					ResourceType:  "NS::KMS::Alias",
+					PatchDocument: []byte(`[{"op":"replace","path":"/TargetKeyId","value":"abc123"}]`),
+				}}},
+			}},
+			expectedPass:  false,
+			expectedCalls: []string{"SimulateApply:patch"},
+			expectedError: `update my-alias (NS::KMS::Alias) patch: [{"op":"replace","path":"/TargetKeyId","value":"abc123"}]`,
+		},
+		{
+			name:          "skipped when the extracted properties carry an opaque secret",
+			harness:       &fakeReapplyHarness{},
+			extracted:     reapplyResource("my-db", "default", "db-1", map[string]any{"Password": map[string]any{"$visibility": pkgmodel.VisibilityOpaque}}),
+			expectedPass:  true,
+			expectedCalls: nil,
+		},
+		{
+			name:          "skipped when the created properties carry an opaque secret",
+			harness:       &fakeReapplyHarness{},
+			created:       reapplyResource("my-db", "default", "db-1", map[string]any{"Password": map[string]any{"$hashed": true, "$value": "abc123"}}),
+			expectedPass:  true,
+			expectedCalls: nil,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			extractedResource := extracted
+			if tt.extracted != nil {
+				extractedResource = tt.extracted
+			}
+			createdResource := created
+			if tt.created != nil {
+				createdResource = tt.created
+			}
+
+			rc := NewResultCollector()
+			idx := rc.NewCRUDResult("NS::Storage::Bucket")
+			fakeT := &testing.T{}
+
+			passed := rc.verifyExtractReapply(fakeT, idx, tt.harness, "/tmp/extracted.pkl",
+				extractedResource, createdResource)
+
+			if passed != tt.expectedPass {
+				t.Errorf("verifyExtractReapply() = %v, want %v", passed, tt.expectedPass)
+			}
+			if !slices.Equal(tt.harness.calls, tt.expectedCalls) {
+				t.Errorf("harness calls = %v, want %v", tt.harness.calls, tt.expectedCalls)
+			}
+
+			rc.mu.Lock()
+			defer rc.mu.Unlock()
+			phase := rc.crudResults[idx].Phases[int(PhaseExtract)]
+			errCount := len(rc.crudResults[idx].Errors)
+			if tt.expectedError != "" {
+				found := false
+				for _, e := range rc.crudResults[idx].Errors {
+					if strings.Contains(e.Msg, tt.expectedError) {
+						found = true
+					}
+				}
+				if !found {
+					t.Errorf("recorded errors %v should contain %q", rc.crudResults[idx].Errors, tt.expectedError)
+				}
+			}
+			if tt.expectedPass {
+				if phase == StepFailed {
+					t.Error("Extract phase should not be failed when the re-apply passes")
+				}
+				if errCount != 0 {
+					t.Errorf("expected no recorded errors, got %d", errCount)
+				}
+				return
+			}
+			if phase != StepFailed {
+				t.Errorf("Extract phase should be StepFailed, got %v", phase)
+			}
+			if errCount == 0 {
+				t.Error("a failing re-apply should record at least one error")
+			}
+		})
+	}
+}
+
+// recordingReporter captures errors without failing the test (for negative cases).
+type recordingReporter struct{ errors int }
+
+func (r *recordingReporter) Errorf(string, ...any) { r.errors++ }
+func (r *recordingReporter) Logf(string, ...any)   {}
+
+func TestCompareMap(t *testing.T) {
+	t.Run("nested resolvable passes", func(t *testing.T) {
+		expected := map[string]any{
+			"ServiceRole": map[string]any{
+				"$label":      "eb-service-role",
+				"$property":   "Arn",
+				"$res":        true,
+				"$stack":      "my-stack",
+				"$type":       "AWS::IAM::Role",
+				"$visibility": "Clear",
+			},
+		}
+		actual := map[string]any{
+			"ServiceRole": map[string]any{
+				"$label":    "eb-service-role",
+				"$property": "Arn",
+				"$res":      true,
+				"$stack":    "my-stack",
+				"$type":     "AWS::IAM::Role",
+				"$value":    "arn:aws:iam::123456789012:role/my-role",
+			},
+		}
+		if !compareMap(t, "Config", expected, actual, "test", map[string]providerDefault{}) {
+			t.Error("compareMap should pass for nested resolvable")
+		}
+	})
+
+	t.Run("scalar mismatch fails", func(t *testing.T) {
+		fakeT := &testing.T{}
+		expected := map[string]any{
+			"Name": "expected-value",
+		}
+		actual := map[string]any{
+			"Name": "different-value",
+		}
+		if compareMap(fakeT, "Config", expected, actual, "test", map[string]providerDefault{}) {
+			t.Error("compareMap should fail for scalar mismatch")
+		}
+	})
+
+	t.Run("extra keys in actual flagged when not provider default", func(t *testing.T) {
+		fakeT := &testing.T{}
+		expected := map[string]any{
+			"Name": "my-app",
+		}
+		actual := map[string]any{
+			"Name":    "my-app",
+			"ExtraID": "extra-value",
+		}
+		if compareMap(fakeT, "Config", expected, actual, "test", map[string]providerDefault{}) {
+			t.Error("compareMap should fail when actual has extra keys not marked as provider default")
+		}
+	})
+
+	t.Run("extra keys in actual allowed when provider default", func(t *testing.T) {
+		expected := map[string]any{
+			"Name": "my-app",
+		}
+		actual := map[string]any{
+			"Name":    "my-app",
+			"ExtraID": "extra-value",
+		}
+		providerDefaults := map[string]providerDefault{
+			"Config.ExtraID": {},
+		}
+		if !compareMap(t, "Config", expected, actual, "test", providerDefaults) {
+			t.Error("compareMap should pass when extra key is a provider default")
+		}
+	})
+
+	t.Run("deeply nested resolvable passes", func(t *testing.T) {
+		expected := map[string]any{
+			"Outer": map[string]any{
+				"Inner": map[string]any{
+					"Ref": map[string]any{
+						"$label":      "my-ref",
+						"$property":   "Id",
+						"$res":        true,
+						"$stack":      "stack",
+						"$type":       "AWS::EC2::VPC",
+						"$visibility": "Clear",
+					},
+				},
+			},
+		}
+		actual := map[string]any{
+			"Outer": map[string]any{
+				"Inner": map[string]any{
+					"Ref": map[string]any{
+						"$label":    "my-ref",
+						"$property": "Id",
+						"$res":      true,
+						"$stack":    "stack",
+						"$type":     "AWS::EC2::VPC",
+						"$value":    "vpc-12345",
+					},
+				},
+			},
+		}
+		if !compareMap(t, "Config", expected, actual, "test", map[string]providerDefault{}) {
+			t.Error("compareMap should pass for deeply nested resolvable")
+		}
+	})
+
+	t.Run("missing key in actual fails", func(t *testing.T) {
+		fakeT := &testing.T{}
+		expected := map[string]any{
+			"Name":    "my-app",
+			"Missing": "value",
+		}
+		actual := map[string]any{
+			"Name": "my-app",
+		}
+		if compareMap(fakeT, "Config", expected, actual, "test", map[string]providerDefault{}) {
+			t.Error("compareMap should fail when expected key is missing from actual")
+		}
+	})
+
+	// Cloud providers commonly return [] / {} for fields the user didn't
+	// set; that's semantically equivalent to the key being omitted and
+	// must NOT be flagged as drift. The forward loop already has this
+	// forgiveness — these cases verify the reverse loop matches it.
+	t.Run("extra empty array in actual passes", func(t *testing.T) {
+		expected := map[string]any{"Name": "my-app"}
+		actual := map[string]any{"Name": "my-app", "Tags": []any{}}
+		if !compareMap(t, "Config", expected, actual, "test", map[string]providerDefault{}) {
+			t.Error("compareMap should pass when actual has an extra key with an empty array value")
+		}
+	})
+
+	t.Run("extra empty map in actual passes", func(t *testing.T) {
+		expected := map[string]any{"Name": "my-app"}
+		actual := map[string]any{"Name": "my-app", "Labels": map[string]any{}}
+		if !compareMap(t, "Config", expected, actual, "test", map[string]providerDefault{}) {
+			t.Error("compareMap should pass when actual has an extra key with an empty map value")
+		}
+	})
+
+	t.Run("extra nil value in actual passes", func(t *testing.T) {
+		expected := map[string]any{"Name": "my-app"}
+		actual := map[string]any{"Name": "my-app", "Optional": nil}
+		if !compareMap(t, "Config", expected, actual, "test", map[string]providerDefault{}) {
+			t.Error("compareMap should pass when actual has an extra key with a nil value")
+		}
+	})
+
+	t.Run("extra non-empty array in actual still fails", func(t *testing.T) {
+		fakeT := &testing.T{}
+		expected := map[string]any{"Name": "my-app"}
+		actual := map[string]any{"Name": "my-app", "Tags": []any{"prod"}}
+		if compareMap(fakeT, "Config", expected, actual, "test", map[string]providerDefault{}) {
+			t.Error("compareMap should still fail when actual has an extra key with a non-empty value (real drift)")
+		}
+	})
+
+	t.Run("extra non-empty map in actual still fails", func(t *testing.T) {
+		fakeT := &testing.T{}
+		expected := map[string]any{"Name": "my-app"}
+		actual := map[string]any{"Name": "my-app", "Labels": map[string]any{"env": "prod"}}
+		if compareMap(fakeT, "Config", expected, actual, "test", map[string]providerDefault{}) {
+			t.Error("compareMap should still fail when actual has an extra key with a non-empty map value (real drift)")
+		}
+	})
+}
+
+// TestCompareProperties_ResolvableNestedInArray verifies that compareProperties
+// handles resolvable refs nested inside array elements. The array element itself
+// is NOT a resolvable — it's a map that contains a resolvable field.
+// Currently compareArrayUnordered only checks if the element itself is resolvable
+// and falls through to JSON string comparison, which fails because expected has
+// $visibility while actual has $value.
+func TestCompareProperties_ResolvableNestedInArray(t *testing.T) {
+	expectedProperties := map[string]any{
+		"items": []any{
+			map[string]any{
+				"name": "default",
+				"ref": map[string]any{
+					"$label":      "my-ref",
+					"$property":   "name",
+					"$res":        true,
+					"$stack":      "my-stack",
+					"$type":       "TEST::Core::Namespace",
+					"$visibility": "Clear",
+				},
+			},
+		},
+	}
+
+	actualResource := map[string]any{
+		"Properties": map[string]any{
+			"items": []any{
+				map[string]any{
+					"name": "default",
+					"ref": map[string]any{
+						"$label":    "my-ref",
+						"$property": "name",
+						"$res":      true,
+						"$stack":    "my-stack",
+						"$type":     "TEST::Core::Namespace",
+						"$value":    "resolved-value",
+					},
+				},
+			},
+		},
+	}
+
+	result := compareProperties(t, expectedProperties, actualResource, "after create", map[string]providerDefault{})
+	if !result {
+		t.Errorf("compareProperties should pass when an array element contains a nested resolvable with resolved $value")
+	}
+}
+
+func TestCompareArrayUnordered_ProviderDefaultsAllowed(t *testing.T) {
+	// Mimics K8S service ports: expected has {name, port}, actual has {name, port, protocol, targetPort}
+	// protocol and targetPort are hasProviderDefault — should be allowed
+	expected := []any{
+		map[string]any{"name": "http", "port": float64(80)},
+	}
+	actual := []any{
+		map[string]any{"name": "http", "port": float64(80), "protocol": "TCP", "targetPort": float64(80)},
+	}
+	providerDefaults := map[string]providerDefault{
+		"spec.ports.protocol":   {},
+		"spec.ports.targetPort": {},
+	}
+	result := compareArrayUnordered(t, "spec.ports", expected, actual, "after create", providerDefaults)
+	if !result {
+		t.Error("should pass when extra keys are provider defaults")
+	}
+}
+
+func TestCompareArrayUnordered_NonProviderDefaultFlagged(t *testing.T) {
+	// Extra key "bogus" is NOT a provider default — should fail
+	expected := []any{
+		map[string]any{"name": "http", "port": float64(80)},
+	}
+	actual := []any{
+		map[string]any{"name": "http", "port": float64(80), "bogus": "bad"},
+	}
+	providerDefaults := map[string]providerDefault{
+		"spec.ports.protocol": {},
+	}
+	// Use a sub-test so the failure doesn't abort the parent
+	inner := &testing.T{}
+	result := compareArrayUnordered(inner, "spec.ports", expected, actual, "after create", providerDefaults)
+	if result {
+		t.Error("should fail when extra key is not a provider default")
+	}
+}
+
+func TestCompareArrayUnordered_MultipleElementsDifferentOrder(t *testing.T) {
+	// Two ports, both with provider-default extra keys, different order
+	expected := []any{
+		map[string]any{"name": "https", "port": float64(443)},
+		map[string]any{"name": "http", "port": float64(80)},
+	}
+	actual := []any{
+		map[string]any{"name": "http", "port": float64(80), "protocol": "TCP", "targetPort": float64(80)},
+		map[string]any{"name": "https", "port": float64(443), "protocol": "TCP", "targetPort": float64(443)},
+	}
+	providerDefaults := map[string]providerDefault{
+		"spec.ports.protocol":   {},
+		"spec.ports.targetPort": {},
+	}
+	result := compareArrayUnordered(t, "spec.ports", expected, actual, "after create", providerDefaults)
+	if !result {
+		t.Error("should pass with multiple elements in different order when extra keys are provider defaults")
+	}
+}
+
+func TestCompareArrayUnordered_NestedProviderDefaults(t *testing.T) {
+	// Mimics K8S webhooks: expected has {name, clientConfig}, actual has extra nested fields
+	expected := []any{
+		map[string]any{
+			"name": "my-webhook",
+			"clientConfig": map[string]any{
+				"service": map[string]any{"name": "webhook-svc", "namespace": "default"},
+			},
+		},
+	}
+	actual := []any{
+		map[string]any{
+			"name": "my-webhook",
+			"clientConfig": map[string]any{
+				"service": map[string]any{"name": "webhook-svc", "namespace": "default", "port": float64(443)},
+			},
+			"matchPolicy":    "Equivalent",
+			"timeoutSeconds": float64(10),
+			"failurePolicy":  "Fail",
+			"sideEffects":    "None",
+		},
+	}
+	providerDefaults := map[string]providerDefault{
+		"webhooks.matchPolicy":               {},
+		"webhooks.timeoutSeconds":            {},
+		"webhooks.failurePolicy":             {},
+		"webhooks.sideEffects":               {},
+		"webhooks.clientConfig.service.port": {},
+	}
+	result := compareArrayUnordered(t, "webhooks", expected, actual, "after create", providerDefaults)
+	if !result {
+		t.Error("should pass for nested maps when extra keys are provider defaults")
+	}
+}
+
+func TestCompareProperties_ProviderDefaultsAllowed(t *testing.T) {
+	// Full-path test: extra fields in array map elements allowed when hasProviderDefault
+	expectedProperties := map[string]any{
+		"metadata": map[string]any{"name": "my-service"},
+		"spec": map[string]any{
+			"ports": []any{
+				map[string]any{"name": "http", "port": float64(80)},
+			},
+		},
+	}
+	actualResource := map[string]any{
+		"Properties": map[string]any{
+			"metadata": map[string]any{"name": "my-service"},
+			"spec": map[string]any{
+				"ports": []any{
+					map[string]any{"name": "http", "port": float64(80), "protocol": "TCP", "targetPort": float64(80)},
+				},
+			},
+		},
+	}
+	providerDefaults := map[string]providerDefault{
+		"spec.ports.protocol":   {},
+		"spec.ports.targetPort": {},
+	}
+	result := compareProperties(t, expectedProperties, actualResource, "after create", providerDefaults)
+	if !result {
+		t.Error("should pass when extra array element keys are provider defaults")
+	}
+}
+
+func TestCompareProperties_ExtraTopLevelProviderDefault(t *testing.T) {
+	// Actual has an extra top-level key that is a provider default
+	expectedProperties := map[string]any{
+		"metadata": map[string]any{"name": "my-svc"},
+	}
+	actualResource := map[string]any{
+		"Properties": map[string]any{
+			"metadata":  map[string]any{"name": "my-svc"},
+			"clusterIP": "10.96.0.1",
+		},
+	}
+	providerDefaults := map[string]providerDefault{
+		"clusterIP": {},
+	}
+	result := compareProperties(t, expectedProperties, actualResource, "after create", providerDefaults)
+	if !result {
+		t.Error("should pass when extra top-level key is a provider default")
+	}
+}
+
+func TestCompareProperties_ExtraTopLevelNonProviderDefault(t *testing.T) {
+	// Actual has an extra top-level key that is NOT a provider default — should fail
+	expectedProperties := map[string]any{
+		"metadata": map[string]any{"name": "my-svc"},
+	}
+	actualResource := map[string]any{
+		"Properties": map[string]any{
+			"metadata": map[string]any{"name": "my-svc"},
+			"bogus":    "unexpected",
+		},
+	}
+	providerDefaults := map[string]providerDefault{}
+	inner := &testing.T{}
+	result := compareProperties(inner, expectedProperties, actualResource, "after create", providerDefaults)
+	if result {
+		t.Error("should fail when extra top-level key is not a provider default")
+	}
+}
+
+// Cloud providers commonly return [] / {} at the top level for fields the
+// user didn't set; that's semantically equivalent to the key being omitted
+// and must NOT be flagged as drift. Real drift (non-empty extras) still flagged.
+func TestCompareProperties_ExtraTopLevelEmptyValuesAllowed(t *testing.T) {
+	expectedProperties := map[string]any{"Name": "my-app"}
+	actualResource := map[string]any{
+		"Properties": map[string]any{
+			"Name":           "my-app",
+			"Tags":           []any{},
+			"DockerLabels":   map[string]any{},
+			"OptionalScalar": nil,
+		},
+	}
+	providerDefaults := map[string]providerDefault{}
+	if !compareProperties(t, expectedProperties, actualResource, "after create", providerDefaults) {
+		t.Error("compareProperties should pass when extra top-level keys hold structurally-absent values (nil / [] / {})")
+	}
+}
+
+func TestCompareProperties_ExtraTopLevelNonEmptyStillFails(t *testing.T) {
+	expectedProperties := map[string]any{"Name": "my-app"}
+	actualResource := map[string]any{
+		"Properties": map[string]any{
+			"Name": "my-app",
+			"Tags": []any{"prod"},
+		},
+	}
+	providerDefaults := map[string]providerDefault{}
+	inner := &testing.T{}
+	if compareProperties(inner, expectedProperties, actualResource, "after create", providerDefaults) {
+		t.Error("compareProperties should still fail when extra top-level key has a non-empty value")
+	}
+}
+
+func TestCompareMap_ExtraNestedProviderDefault(t *testing.T) {
+	// Extra nested key in a map that is a provider default
+	expected := map[string]any{"name": "my-svc"}
+	actual := map[string]any{"name": "my-svc", "sessionAffinity": "None"}
+	providerDefaults := map[string]providerDefault{
+		"spec.sessionAffinity": {},
+	}
+	result := compareMap(t, "spec", expected, actual, "after create", providerDefaults)
+	if !result {
+		t.Error("should pass when extra nested key is a provider default")
+	}
+}
+
+func TestCompareMap_ExtraNestedNonProviderDefault(t *testing.T) {
+	// Extra nested key that is NOT a provider default — should fail
+	expected := map[string]any{"name": "my-svc"}
+	actual := map[string]any{"name": "my-svc", "unknown": "bad"}
+	providerDefaults := map[string]providerDefault{}
+	inner := &testing.T{}
+	result := compareMap(inner, "spec", expected, actual, "after create", providerDefaults)
+	if result {
+		t.Error("should fail when extra nested key is not a provider default")
+	}
+}
+
+func TestIsProviderDefault(t *testing.T) {
+	t.Run("scalar provider defaults", func(t *testing.T) {
+		providerDefaults := map[string]providerDefault{
+			"spec.ports.protocol":  {},
+			"spec.sessionAffinity": {},
+			"webhooks.matchPolicy": {},
+		}
+
+		tests := []struct {
+			path     string
+			expected bool
+		}{
+			{"spec.ports.protocol", true},
+			{"spec.ports[0].protocol", true},
+			{"spec.ports[12].protocol", true},
+			{"spec.sessionAffinity", true},
+			{"webhooks[0].matchPolicy", true},
+			{"spec.ports.bogus", false},
+			{"spec.unknown", false},
+			{"bogus", false},
+		}
+		for _, tc := range tests {
+			got := isProviderDefault(tc.path, providerDefaults)
+			if got != tc.expected {
+				t.Errorf("isProviderDefault(%q) = %v, want %v", tc.path, got, tc.expected)
+			}
+		}
+	})
+
+	t.Run("collection provider defaults - broad tolerance", func(t *testing.T) {
+		providerDefaults := map[string]providerDefault{
+			"metadata.labels":      {IsCollection: true},
+			"spec.selector":        {IsCollection: true},
+			"spec.revisionHistory": {}, // scalar, not collection
+		}
+
+		tests := []struct {
+			path     string
+			expected bool
+		}{
+			// Collection: any child key tolerated
+			{"metadata.labels", true},
+			{"metadata.labels.app", true},
+			{"metadata.labels.env", true},
+			{"metadata.labels.app.kubernetes.io/name", true},
+			{"spec.selector.app", true},
+			{"spec.selector.matchLabels", true},
+			// Scalar: only exact match
+			{"spec.revisionHistory", true},
+			{"spec.revisionHistory.limit", false},
+			// Non-defaults: still flagged
+			{"metadata.annotations", false},
+			{"spec.unknown", false},
+		}
+		for _, tc := range tests {
+			got := isProviderDefault(tc.path, providerDefaults)
+			if got != tc.expected {
+				t.Errorf("isProviderDefault(%q) = %v, want %v", tc.path, got, tc.expected)
+			}
+		}
+	})
+
+	t.Run("collection provider defaults with array indices", func(t *testing.T) {
+		providerDefaults := map[string]providerDefault{
+			"spec.template.metadata.labels": {IsCollection: true},
+		}
+
+		tests := []struct {
+			path     string
+			expected bool
+		}{
+			{"spec.template.metadata.labels.app", true},
+			{"spec.template.metadata.labels", true},
+		}
+		for _, tc := range tests {
+			got := isProviderDefault(tc.path, providerDefaults)
+			if got != tc.expected {
+				t.Errorf("isProviderDefault(%q) = %v, want %v", tc.path, got, tc.expected)
+			}
+		}
+	})
+}
+
+func TestGetTestType(t *testing.T) {
+	tests := []struct {
+		name     string
+		envValue string
+		expected TestType
+	}{
+		{
+			name:     "empty returns all",
+			envValue: "",
+			expected: TestTypeAll,
+		},
+		{
+			name:     "crud returns crud",
+			envValue: "crud",
+			expected: TestTypeCRUD,
+		},
+		{
+			name:     "CRUD uppercase returns crud",
+			envValue: "CRUD",
+			expected: TestTypeCRUD,
+		},
+		{
+			name:     "discovery returns discovery",
+			envValue: "discovery",
+			expected: TestTypeDiscovery,
+		},
+		{
+			name:     "DISCOVERY uppercase returns discovery",
+			envValue: "DISCOVERY",
+			expected: TestTypeDiscovery,
+		},
+		{
+			name:     "all returns all",
+			envValue: "all",
+			expected: TestTypeAll,
+		},
+		{
+			name:     "ALL uppercase returns all",
+			envValue: "ALL",
+			expected: TestTypeAll,
+		},
+		{
+			name:     "invalid value returns all",
+			envValue: "invalid",
+			expected: TestTypeAll,
+		},
+		{
+			name:     "mixed case returns correct type",
+			envValue: "CrUd",
+			expected: TestTypeCRUD,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// Empty value reads the same as unset via os.Getenv, which
+			// is what getTestType uses.
+			t.Setenv("FORMAE_TEST_TYPE", tt.envValue)
+
+			result := getTestType()
+			if result != tt.expected {
+				t.Errorf("expected %q, got %q", tt.expected, result)
+			}
+		})
+	}
+}
+func TestCompareArrayOfMaps_EmptyArraysInExpectedMissingInActual(t *testing.T) {
+	// PKL renders nullable Listing fields as empty arrays [].
+	// When matching array elements, an expected element with empty arrays
+	// in some fields should match an actual element that omits those fields.
+	expected := []any{
+		map[string]any{
+			"apiGroups":       []any{""},
+			"resources":       []any{"nodes"},
+			"verbs":           []any{"get", "list"},
+			"nonResourceURLs": []any{},
+			"resourceNames":   []any{},
+		},
+	}
+	actual := []any{
+		map[string]any{
+			"apiGroups": []any{""},
+			"resources": []any{"nodes"},
+			"verbs":     []any{"get", "list"},
+		},
+	}
+	providerDefaults := map[string]providerDefault{}
+	result := compareArrayUnordered(t, "rules", expected, actual, "after create", providerDefaults)
+	if !result {
+		t.Error("should pass when expected element has empty arrays that actual omits")
+	}
+}
+
+func TestCompareProperties_EmptyMapInExpectedMissingInActual(t *testing.T) {
+	// PKL renders nullable Mapping fields as empty maps {}.
+	// When the provider omits these entirely, the test should pass
+	// since an empty map and absent are semantically equivalent.
+	expectedProperties := map[string]any{
+		"metadata": map[string]any{
+			"name":        "my-resource",
+			"labels":      map[string]any{},
+			"annotations": map[string]any{},
+		},
+	}
+	actualResource := map[string]any{
+		"Properties": map[string]any{
+			"metadata": map[string]any{
+				"name": "my-resource",
+			},
+		},
+	}
+	providerDefaults := map[string]providerDefault{}
+	result := compareProperties(t, expectedProperties, actualResource, "after create", providerDefaults)
+	if !result {
+		t.Error("should pass when expected has empty map but actual omits the key")
+	}
+}
+
+func TestCompareMap_EmptyMapInExpectedMissingInActual(t *testing.T) {
+	// Same scenario at the nested compareMap level: expected has empty labels/annotations
+	// maps but actual omits them entirely.
+	expected := map[string]any{
+		"name":        "my-resource",
+		"labels":      map[string]any{},
+		"annotations": map[string]any{},
+	}
+	actual := map[string]any{
+		"name": "my-resource",
+	}
+	providerDefaults := map[string]providerDefault{}
+	result := compareMap(t, "metadata", expected, actual, "after create", providerDefaults)
+	if !result {
+		t.Error("should pass when expected has empty map but actual omits the key")
+	}
+}
+
+func TestCompareMap_NonEmptyMapInExpectedMissingInActual(t *testing.T) {
+	// When expected has a non-empty map but actual omits it, that's a real failure.
+	expected := map[string]any{
+		"name":   "my-resource",
+		"labels": map[string]any{"env": "prod"},
+	}
+	actual := map[string]any{
+		"name": "my-resource",
+	}
+	providerDefaults := map[string]providerDefault{}
+	inner := &testing.T{}
+	result := compareMap(inner, "metadata", expected, actual, "after create", providerDefaults)
+	if result {
+		t.Error("should fail when expected has non-empty map but actual omits the key")
+	}
+}
+
+func TestCompareProperties_NullInExpectedMissingInActual(t *testing.T) {
+	// Existing behavior: null expected values are tolerated when missing in actual.
+	expectedProperties := map[string]any{
+		"metadata": map[string]any{"name": "my-resource"},
+		"tags":     nil,
+	}
+	actualResource := map[string]any{
+		"Properties": map[string]any{
+			"metadata": map[string]any{"name": "my-resource"},
+		},
+	}
+	providerDefaults := map[string]providerDefault{}
+	result := compareProperties(t, expectedProperties, actualResource, "after create", providerDefaults)
+	if !result {
+		t.Error("should pass when expected has null but actual omits the key")
+	}
+}
+
+func TestFindMainResourceNativeID(t *testing.T) {
+	tests := []struct {
+		name             string
+		createdResources []CreatedResourceInfo
+		resourceType     string
+		expectedNativeID string
+	}{
+		{
+			name: "single resource matches type",
+			createdResources: []CreatedResourceInfo{
+				{ResourceType: "NS::Compute::Instance", NativeID: "inst-123"},
+			},
+			resourceType:     "NS::Compute::Instance",
+			expectedNativeID: "inst-123",
+		},
+		{
+			name: "last resource matches type",
+			createdResources: []CreatedResourceInfo{
+				{ResourceType: "NS::Network::VPC", NativeID: "vpc-1"},
+				{ResourceType: "NS::Network::Subnet", NativeID: "subnet-1"},
+			},
+			resourceType:     "NS::Network::Subnet",
+			expectedNativeID: "subnet-1",
+		},
+		{
+			name: "chart with mixed types - type match is not last created",
+			createdResources: []CreatedResourceInfo{
+				{ResourceType: "NS::Core::Group", NativeID: "test-group"},
+				{ResourceType: "NS::IAM::Role", NativeID: "test-role"},
+				{ResourceType: "NS::IAM::Account", NativeID: "test-account"},
+				{ResourceType: "NS::Network::LB", NativeID: "test-lb"},
+				{ResourceType: "NS::Compute::Instance", NativeID: "test-controller"},
+				{ResourceType: "NS::Compute::Instance", NativeID: "test-worker-1"},
+				{ResourceType: "NS::Compute::Instance", NativeID: "test-worker-2"},
+			},
+			resourceType:     "NS::Network::LB",
+			expectedNativeID: "test-lb",
+		},
+		{
+			name: "multiple resources of target type - picks last",
+			createdResources: []CreatedResourceInfo{
+				{ResourceType: "NS::Core::Group", NativeID: "test-group"},
+				{ResourceType: "NS::Compute::Instance", NativeID: "inst-1"},
+				{ResourceType: "NS::Compute::Instance", NativeID: "inst-2"},
+			},
+			resourceType:     "NS::Compute::Instance",
+			expectedNativeID: "inst-2",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := findMainResourceNativeID(tt.createdResources, tt.resourceType)
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if got != tt.expectedNativeID {
+				t.Errorf("findMainResourceNativeID() = %q, want %q", got, tt.expectedNativeID)
+			}
+		})
+	}
+
+	t.Run("returns error when no resource matches type", func(t *testing.T) {
+		resources := []CreatedResourceInfo{
+			{ResourceType: "NS::Core::Group", NativeID: "test-group"},
+			{ResourceType: "NS::Storage::Bucket", NativeID: "my-bucket"},
+		}
+		_, err := findMainResourceNativeID(resources, "NS::Network::LB")
+		if err == nil {
+			t.Fatal("expected error when no resource matches type")
+		}
+	})
+}
+
+func TestGetSyncTimeout(t *testing.T) {
+	tests := []struct {
+		name string
+		env  string
+		want time.Duration
+	}{
+		{"unset falls back to default", "", defaultSyncTimeout},
+		{"minutes are honoured", "7", 7 * time.Minute},
+		{"non-numeric falls back to default", "soon", defaultSyncTimeout},
+		{"zero falls back to default", "0", defaultSyncTimeout},
+		{"negative falls back to default", "-3", defaultSyncTimeout},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Setenv("FORMAE_TEST_SYNC_TIMEOUT", tt.env)
+			if got := getSyncTimeout(); got != tt.want {
+				t.Errorf("getSyncTimeout() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+// The plugin-side retry budget (exponential backoff over recoverable
+// CloudControl errors) can legitimately keep a single read in flight for
+// minutes. If the harness gives up first it reports a failure for a sync that
+// was still making progress, so the default must leave room for that budget.
+func TestSyncTimeoutDefaultExceedsPluginRetryBudget(t *testing.T) {
+	const observedPluginRetryBudget = 3 * time.Minute
+	if defaultSyncTimeout <= observedPluginRetryBudget {
+		t.Errorf("defaultSyncTimeout = %v, must exceed the plugin retry budget of %v",
+			defaultSyncTimeout, observedPluginRetryBudget)
+	}
+}

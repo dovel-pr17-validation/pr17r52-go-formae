@@ -1,0 +1,570 @@
+// © 2025 Platform Engineering Labs Inc.
+//
+// SPDX-License-Identifier: FSL-1.1-ALv2
+
+//go:build unit
+
+package pkl
+
+import (
+	"fmt"
+	"os"
+	"path/filepath"
+	"testing"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+)
+
+func TestPackage_FormatForPklTemplate_Remote(t *testing.T) {
+	pkg := Package{
+		Name:    "formae",
+		Plugin:  "pkl",
+		Version: "0.75.1",
+		IsLocal: false,
+	}
+	assert.Equal(t, "pkl.formae@0.75.1", pkg.FormatForPklTemplate())
+}
+
+func TestPackage_FormatForPklTemplate_Local(t *testing.T) {
+	pkg := Package{
+		Name:      "gcp",
+		IsLocal:   true,
+		LocalPath: "/Users/dev/gcp-plugin/PklProject",
+	}
+	assert.Equal(t, "local:gcp:/Users/dev/gcp-plugin/PklProject", pkg.FormatForPklTemplate())
+}
+
+func TestPackageResolver_Add_Remote(t *testing.T) {
+	resolver := NewPackageResolver()
+
+	resolver.Add("aws", "aws", "0.75.1")
+
+	packages := resolver.GetPackages()
+	assert.Len(t, packages, 1)
+	assert.Equal(t, "aws", packages[0].Name)
+	assert.Equal(t, "aws", packages[0].Plugin)
+	assert.Equal(t, "0.75.1", packages[0].Version)
+	assert.False(t, packages[0].IsLocal)
+}
+
+func TestPackageResolver_AddFormae(t *testing.T) {
+	resolver := NewPackageResolver()
+
+	// formae uses pkl as plugin name
+	resolver.Add("formae", "pkl", "0.75.1")
+
+	packages := resolver.GetPackages()
+	assert.Len(t, packages, 1)
+	assert.Equal(t, "formae", packages[0].Name)
+	assert.Equal(t, "pkl", packages[0].Plugin)
+	assert.Equal(t, "0.75.1", packages[0].Version)
+	assert.False(t, packages[0].IsLocal)
+}
+
+func TestPackageResolver_AddLocal(t *testing.T) {
+	resolver := NewPackageResolver()
+
+	resolver.AddLocal("gcp", "/path/to/gcp/PklProject")
+
+	packages := resolver.GetPackages()
+	assert.Len(t, packages, 1)
+	assert.Equal(t, "gcp", packages[0].Name)
+	assert.True(t, packages[0].IsLocal)
+	assert.Equal(t, "/path/to/gcp/PklProject", packages[0].LocalPath)
+}
+
+func TestPackageResolver_WithLocalSchemas(t *testing.T) {
+	// Create temp directory structure for testing
+	tmpDir := t.TempDir()
+	versionDir := filepath.Join(tmpDir, "gcp", "v0.75.1")
+	pluginDir := filepath.Join(versionDir, "schema", "pkl")
+	require.NoError(t, os.MkdirAll(pluginDir, 0755))
+
+	// Create manifest with namespace
+	manifestPath := filepath.Join(versionDir, "formae-plugin.pkl")
+	require.NoError(t, os.WriteFile(manifestPath, []byte(`namespace = "GCP"`), 0644))
+
+	// Create PklProject with package name
+	pklProjectPath := filepath.Join(pluginDir, "PklProject")
+	pklProjectContent := `amends "pkl:Project"
+
+package {
+  name = "gcp"
+}
+`
+	require.NoError(t, os.WriteFile(pklProjectPath, []byte(pklProjectContent), 0644))
+
+	resolver := NewPackageResolver().WithLocalSchemas(tmpDir)
+
+	// Add gcp - should use local schema since it exists
+	resolver.Add("gcp", "gcp", "0.75.1")
+
+	packages := resolver.GetPackages()
+	assert.Len(t, packages, 1)
+	assert.Equal(t, "gcp", packages[0].Name)
+	assert.True(t, packages[0].IsLocal)
+	assert.Equal(t, pklProjectPath, packages[0].LocalPath)
+}
+
+func TestPackageResolver_WithLocalSchemas_FallsBackToRemote(t *testing.T) {
+	// Create temp directory without the required plugin
+	tmpDir := t.TempDir()
+
+	resolver := NewPackageResolver().WithLocalSchemas(tmpDir)
+
+	// Add aws - should fall back to remote since it's not installed locally
+	resolver.Add("aws", "aws", "0.75.1")
+
+	packages := resolver.GetPackages()
+	assert.Len(t, packages, 1)
+	assert.Equal(t, "aws", packages[0].Name)
+	assert.False(t, packages[0].IsLocal)
+	assert.Equal(t, "aws", packages[0].Plugin)
+	assert.Equal(t, "0.75.1", packages[0].Version)
+}
+
+func TestPackageResolver_WithLocalSchemas_SelectsHighestVersion(t *testing.T) {
+	// Create temp directory structure with multiple versions
+	tmpDir := t.TempDir()
+
+	pklProjectContent := `amends "pkl:Project"
+
+package {
+  name = "ovh"
+}
+`
+	manifestContent := `namespace = "OVH"`
+
+	// Create v0.1.0
+	v010VersionDir := filepath.Join(tmpDir, "ovh", "v0.1.0")
+	v010Dir := filepath.Join(v010VersionDir, "schema", "pkl")
+	require.NoError(t, os.MkdirAll(v010Dir, 0755))
+	require.NoError(t, os.WriteFile(filepath.Join(v010VersionDir, "formae-plugin.pkl"), []byte(manifestContent), 0644))
+	require.NoError(t, os.WriteFile(filepath.Join(v010Dir, "PklProject"), []byte(pklProjectContent), 0644))
+
+	// Create v0.2.0 (higher)
+	v020VersionDir := filepath.Join(tmpDir, "ovh", "v0.2.0")
+	v020Dir := filepath.Join(v020VersionDir, "schema", "pkl")
+	require.NoError(t, os.MkdirAll(v020Dir, 0755))
+	require.NoError(t, os.WriteFile(filepath.Join(v020VersionDir, "formae-plugin.pkl"), []byte(manifestContent), 0644))
+	require.NoError(t, os.WriteFile(filepath.Join(v020Dir, "PklProject"), []byte(pklProjectContent), 0644))
+
+	// Create v0.1.5 (between)
+	v015VersionDir := filepath.Join(tmpDir, "ovh", "v0.1.5")
+	v015Dir := filepath.Join(v015VersionDir, "schema", "pkl")
+	require.NoError(t, os.MkdirAll(v015Dir, 0755))
+	require.NoError(t, os.WriteFile(filepath.Join(v015VersionDir, "formae-plugin.pkl"), []byte(manifestContent), 0644))
+	require.NoError(t, os.WriteFile(filepath.Join(v015Dir, "PklProject"), []byte(pklProjectContent), 0644))
+
+	resolver := NewPackageResolver().WithLocalSchemas(tmpDir)
+
+	resolver.Add("ovh", "ovh", "0.1.0")
+
+	packages := resolver.GetPackages()
+	assert.Len(t, packages, 1)
+	assert.True(t, packages[0].IsLocal)
+	// Should select v0.2.0 (highest version)
+	assert.Contains(t, packages[0].LocalPath, "v0.2.0")
+}
+
+func TestPackageResolver_MixedPackages(t *testing.T) {
+	// Create temp directory with local GCP schema
+	tmpDir := t.TempDir()
+	gcpVersionDir := filepath.Join(tmpDir, "gcp", "v0.75.1")
+	gcpDir := filepath.Join(gcpVersionDir, "schema", "pkl")
+	require.NoError(t, os.MkdirAll(gcpDir, 0755))
+	require.NoError(t, os.WriteFile(filepath.Join(gcpVersionDir, "formae-plugin.pkl"), []byte(`namespace = "GCP"`), 0644))
+	pklProjectContent := `amends "pkl:Project"
+
+package {
+  name = "gcp"
+}
+`
+	require.NoError(t, os.WriteFile(filepath.Join(gcpDir, "PklProject"), []byte(pklProjectContent), 0644))
+
+	resolver := NewPackageResolver().WithLocalSchemas(tmpDir)
+	resolver.Add("formae", "pkl", "0.75.1") // No local schema, should be remote
+	resolver.Add("aws", "aws", "0.75.1")    // No local schema, should be remote
+	resolver.Add("gcp", "gcp", "0.75.1")    // Has local schema
+
+	packages := resolver.GetPackages()
+	assert.Len(t, packages, 3)
+
+	// Check we have the right mix
+	var hasLocalGcp, hasRemoteAws, hasRemoteFormae bool
+	for _, pkg := range packages {
+		switch pkg.Name {
+		case "gcp":
+			hasLocalGcp = pkg.IsLocal && pkg.LocalPath != ""
+		case "aws":
+			hasRemoteAws = !pkg.IsLocal && pkg.Plugin == "aws" && pkg.Version == "0.75.1"
+		case "formae":
+			hasRemoteFormae = !pkg.IsLocal && pkg.Plugin == "pkl" && pkg.Version == "0.75.1"
+		}
+	}
+	assert.True(t, hasLocalGcp, "gcp should be local")
+	assert.True(t, hasRemoteAws, "aws should be remote")
+	assert.True(t, hasRemoteFormae, "formae should be remote")
+}
+
+func TestPackageResolver_GetPackageStrings(t *testing.T) {
+	tmpDir := t.TempDir()
+	gcpVersionDir := filepath.Join(tmpDir, "gcp", "v0.75.1")
+	gcpDir := filepath.Join(gcpVersionDir, "schema", "pkl")
+	require.NoError(t, os.MkdirAll(gcpDir, 0755))
+	require.NoError(t, os.WriteFile(filepath.Join(gcpVersionDir, "formae-plugin.pkl"), []byte(`namespace = "GCP"`), 0644))
+	pklProjectPath := filepath.Join(gcpDir, "PklProject")
+	pklProjectContent := `amends "pkl:Project"
+
+package {
+  name = "gcp"
+}
+`
+	require.NoError(t, os.WriteFile(pklProjectPath, []byte(pklProjectContent), 0644))
+
+	resolver := NewPackageResolver().WithLocalSchemas(tmpDir)
+	resolver.Add("formae", "pkl", "0.75.1")
+	resolver.Add("gcp", "gcp", "0.75.1") // Local
+
+	strings := resolver.GetPackageStrings()
+	assert.Len(t, strings, 2)
+
+	// Check the formatted strings
+	hasFormae := false
+	hasGcp := false
+	for _, s := range strings {
+		if s == "pkl.formae@0.75.1" {
+			hasFormae = true
+		}
+		if s == "local:gcp:"+pklProjectPath {
+			hasGcp = true
+		}
+	}
+	assert.True(t, hasFormae, "should have pkl.formae@0.75.1")
+	assert.True(t, hasGcp, "should have local:gcp:/path/to/PklProject")
+}
+
+func TestPackageResolver_IsUsingLocalSchemas(t *testing.T) {
+	resolver := NewPackageResolver()
+	assert.False(t, resolver.IsUsingLocalSchemas())
+
+	resolver.WithLocalSchemas("/tmp/plugins")
+	assert.True(t, resolver.IsUsingLocalSchemas())
+}
+
+func TestPackageResolver_DefaultRemote(t *testing.T) {
+	// Without WithLocalSchemas, everything should be remote
+	resolver := NewPackageResolver()
+	resolver.Add("gcp", "gcp", "0.75.1")
+
+	packages := resolver.GetPackages()
+	assert.Len(t, packages, 1)
+	assert.False(t, packages[0].IsLocal) // Should be remote when local schemas not enabled
+}
+
+func TestReadVersionFromManifest(t *testing.T) {
+	resolver := NewPackageResolver()
+
+	t.Run("reads version from valid manifest", func(t *testing.T) {
+		tmpDir := t.TempDir()
+		manifestPath := filepath.Join(tmpDir, "formae-plugin.pkl")
+		content := `namespace = "AWS"
+version = "0.1.2"
+name = "aws"
+`
+		require.NoError(t, os.WriteFile(manifestPath, []byte(content), 0644))
+
+		version := resolver.readVersionFromManifest(manifestPath)
+		assert.Equal(t, "0.1.2", version)
+	})
+
+	t.Run("returns empty for missing file", func(t *testing.T) {
+		version := resolver.readVersionFromManifest("/nonexistent/formae-plugin.pkl")
+		assert.Equal(t, "", version)
+	})
+
+	t.Run("returns empty when version field absent", func(t *testing.T) {
+		tmpDir := t.TempDir()
+		manifestPath := filepath.Join(tmpDir, "formae-plugin.pkl")
+		content := `namespace = "AWS"
+name = "aws"
+`
+		require.NoError(t, os.WriteFile(manifestPath, []byte(content), 0644))
+
+		version := resolver.readVersionFromManifest(manifestPath)
+		assert.Equal(t, "", version)
+	})
+}
+
+func TestInstalledVersion(t *testing.T) {
+	t.Run("returns version for installed plugin", func(t *testing.T) {
+		tmpDir := t.TempDir()
+		versionDir := filepath.Join(tmpDir, "aws-plugin", "v0.1.2")
+		require.NoError(t, os.MkdirAll(versionDir, 0755))
+
+		manifest := `namespace = "AWS"
+version = "0.1.2"
+`
+		require.NoError(t, os.WriteFile(filepath.Join(versionDir, "formae-plugin.pkl"), []byte(manifest), 0644))
+
+		resolver := NewPackageResolver().WithLocalSchemas(tmpDir)
+		version := resolver.InstalledVersion("aws")
+		assert.Equal(t, "0.1.2", version)
+	})
+
+	t.Run("returns empty for unknown namespace", func(t *testing.T) {
+		tmpDir := t.TempDir()
+		resolver := NewPackageResolver().WithLocalSchemas(tmpDir)
+
+		version := resolver.InstalledVersion("nonexistent")
+		assert.Equal(t, "", version)
+	})
+
+	t.Run("returns empty when local schemas not enabled", func(t *testing.T) {
+		resolver := NewPackageResolver()
+
+		version := resolver.InstalledVersion("aws")
+		assert.Equal(t, "", version)
+	})
+
+	t.Run("selects highest version manifest", func(t *testing.T) {
+		tmpDir := t.TempDir()
+		manifest := `namespace = "OVH"
+version = "%s"
+`
+		// Create v0.1.0
+		v010Dir := filepath.Join(tmpDir, "ovh", "v0.1.0")
+		require.NoError(t, os.MkdirAll(v010Dir, 0755))
+		require.NoError(t, os.WriteFile(filepath.Join(v010Dir, "formae-plugin.pkl"), []byte(fmt.Sprintf(manifest, "0.1.0")), 0644))
+
+		// Create v0.2.0
+		v020Dir := filepath.Join(tmpDir, "ovh", "v0.2.0")
+		require.NoError(t, os.MkdirAll(v020Dir, 0755))
+		require.NoError(t, os.WriteFile(filepath.Join(v020Dir, "formae-plugin.pkl"), []byte(fmt.Sprintf(manifest, "0.2.0")), 0644))
+
+		resolver := NewPackageResolver().WithLocalSchemas(tmpDir)
+		version := resolver.InstalledVersion("ovh")
+		assert.Equal(t, "0.2.0", version)
+	})
+}
+
+func TestPackageResolver_WithLocalSchemas_MissingPklProject(t *testing.T) {
+	// Create version directory with manifest but without PklProject file
+	tmpDir := t.TempDir()
+	versionDir := filepath.Join(tmpDir, "gcp", "v0.75.1")
+	pluginDir := filepath.Join(versionDir, "schema", "pkl")
+	require.NoError(t, os.MkdirAll(pluginDir, 0755))
+	// Create manifest so plugin is found
+	require.NoError(t, os.WriteFile(filepath.Join(versionDir, "formae-plugin.pkl"), []byte(`namespace = "GCP"`), 0644))
+	// Don't create PklProject file
+
+	resolver := NewPackageResolver().WithLocalSchemas(tmpDir)
+	resolver.Add("gcp", "gcp", "0.75.1")
+
+	packages := resolver.GetPackages()
+	assert.Len(t, packages, 1)
+	assert.False(t, packages[0].IsLocal) // Should fall back to remote
+}
+
+// installVersionedPlugin creates a fake versioned-schema install layout for
+// the given namespace, with the listed `v*/` subdirectories present (each as
+// an empty dir — sufficient for the resolver's filesystem scan). Returns the
+// plugins-dir base path the resolver should be pointed at.
+func installVersionedPlugin(t *testing.T, namespace, pkgName string, versionSubdirs []string) string {
+	t.Helper()
+	tmpDir := t.TempDir()
+	versionDir := filepath.Join(tmpDir, pkgName, "v0.1.1")
+	pklDir := filepath.Join(versionDir, "schema", "pkl")
+	require.NoError(t, os.MkdirAll(pklDir, 0755))
+	require.NoError(t, os.WriteFile(
+		filepath.Join(versionDir, "formae-plugin.pkl"),
+		[]byte(fmt.Sprintf("namespace = %q", namespace)), 0644))
+	require.NoError(t, os.WriteFile(
+		filepath.Join(pklDir, "PklProject"),
+		[]byte(fmt.Sprintf("amends \"pkl:Project\"\npackage { name = %q }\n", pkgName)), 0644))
+	for _, sub := range versionSubdirs {
+		require.NoError(t, os.MkdirAll(filepath.Join(pklDir, sub), 0755))
+	}
+	return tmpDir
+}
+
+func TestPackageResolver_SchemaManifest_ReadsVersionsFromSubdirs(t *testing.T) {
+	tmpDir := installVersionedPlugin(t, "K8S", "k8s", []string{"v1.21", "v1.30", "v1.34"})
+	resolver := NewPackageResolver().WithLocalSchemas(tmpDir)
+
+	m := resolver.SchemaManifestForNamespace("k8s")
+	require.NotNil(t, m)
+	assert.Equal(t, []string{"v1.21", "v1.30", "v1.34"}, m.Versions)
+	assert.Equal(t, "v1.34", m.Default,
+		"Default is the lexically-highest v* subdir")
+}
+
+func TestPackageResolver_SchemaManifest_NoVersionSubdirsReturnsNil(t *testing.T) {
+	tmpDir := installVersionedPlugin(t, "K8S", "k8s", nil)
+	resolver := NewPackageResolver().WithLocalSchemas(tmpDir)
+
+	assert.Nil(t, resolver.SchemaManifestForNamespace("k8s"),
+		"No v*/ subdirs means the plugin doesn't ship a versioned schema; resolver returns nil so legacy unrestricted glob fires")
+}
+
+func TestPackageResolver_SchemaManifest_RemoteOnlyReturnsNil(t *testing.T) {
+	resolver := NewPackageResolver()
+	assert.Nil(t, resolver.SchemaManifestForNamespace("k8s"),
+		"Remote-only resolver has no local install to scan")
+}
+
+func TestPackageResolver_SchemaManifest_UnknownNamespaceReturnsNil(t *testing.T) {
+	tmpDir := installVersionedPlugin(t, "K8S", "k8s", []string{"v1.30"})
+	resolver := NewPackageResolver().WithLocalSchemas(tmpDir)
+
+	assert.Nil(t, resolver.SchemaManifestForNamespace("aws"))
+}
+
+func TestPackageResolver_SchemaManifest_OpaqueVersionKeysSort(t *testing.T) {
+	tmpDir := installVersionedPlugin(t, "AWS", "aws",
+		[]string{"v2024-01-01", "v2024-09-15", "v2025-03-01"})
+	resolver := NewPackageResolver().WithLocalSchemas(tmpDir)
+
+	m := resolver.SchemaManifestForNamespace("aws")
+	require.NotNil(t, m)
+	assert.Equal(t, "v2025-03-01", m.Default,
+		"Lexical sort works for date-style version keys when zero-padded")
+}
+
+// Regression: lexical sort picks v1.9 as the default when v1.10 is also
+// present (because "v1.10" < "v1.9" lexically). Default selection must be
+// semver-aware when all keys parse as semver.
+func TestPackageResolver_SchemaManifest_SemverDefaultBeatsLexical(t *testing.T) {
+	tmpDir := installVersionedPlugin(t, "K8S", "k8s",
+		[]string{"v1.9", "v1.10", "v1.30"})
+	resolver := NewPackageResolver().WithLocalSchemas(tmpDir)
+
+	m := resolver.SchemaManifestForNamespace("k8s")
+	require.NotNil(t, m)
+	assert.Equal(t, "v1.30", m.Default,
+		"semver-aware sort: v1.30 > v1.10 > v1.9 (lexical would pick v1.9)")
+	assert.Equal(t, []string{"v1.9", "v1.10", "v1.30"}, m.Versions,
+		"Versions are returned in ascending semver order so callers see a stable shape")
+}
+
+func TestPackageResolver_SchemaManifest_NonVersionDirsIgnored(t *testing.T) {
+	tmpDir := installVersionedPlugin(t, "K8S", "k8s", []string{"v1.21", "v1.30", "v1.34"})
+	// Add some noise that should NOT be treated as a version subtree.
+	pklDir := filepath.Join(tmpDir, "k8s", "v0.1.1", "schema", "pkl")
+	require.NoError(t, os.MkdirAll(filepath.Join(pklDir, "core"), 0755))    // api-group dir under root, only present in non-versioned plugins
+	require.NoError(t, os.MkdirAll(filepath.Join(pklDir, "_backup"), 0755)) // editor backup
+	resolver := NewPackageResolver().WithLocalSchemas(tmpDir)
+
+	m := resolver.SchemaManifestForNamespace("k8s")
+	require.NotNil(t, m)
+	assert.Equal(t, []string{"v1.21", "v1.30", "v1.34"}, m.Versions,
+		"Only `v<digit>` prefixed subdirs are treated as schema versions")
+}
+
+// Regression: a flat, unversioned plugin (services directly under
+// schema/pkl/) that happens to have a service directory whose name starts
+// with "v" — e.g. GCP's "vpcaccess" — must NOT be mistaken for a versioned
+// schema. Version keys always have a digit after the "v" (v1.30,
+// v2024-01-01); service names have a letter. Treating "vpcaccess" as a
+// version collapses the extract import glob to @gcp/vpcaccess/** and makes
+// every other resource type fail with `Cannot find key`.
+func TestPackageResolver_SchemaManifest_VPrefixedServiceDirIsNotAVersion(t *testing.T) {
+	tmpDir := installVersionedPlugin(t, "GCP", "gcp",
+		[]string{"compute", "storage", "vpcaccess"})
+	resolver := NewPackageResolver().WithLocalSchemas(tmpDir)
+
+	assert.Nil(t, resolver.SchemaManifestForNamespace("gcp"),
+		"a plugin with no v<digit> subdirs ships an unversioned schema; the "+
+			"v-prefixed service dir 'vpcaccess' is not a version, so the resolver "+
+			"must report no versions and let the unrestricted import glob fire")
+}
+
+// Real version subdirs and a v-prefixed service dir can coexist in principle;
+// only the digit-prefixed ones count as versions.
+func TestPackageResolver_SchemaManifest_VLetterDirsExcludedFromVersions(t *testing.T) {
+	tmpDir := installVersionedPlugin(t, "K8S", "k8s",
+		[]string{"v1.30", "vpcaccess", "validators"})
+	resolver := NewPackageResolver().WithLocalSchemas(tmpDir)
+
+	m := resolver.SchemaManifestForNamespace("k8s")
+	require.NotNil(t, m)
+	assert.Equal(t, []string{"v1.30"}, m.Versions,
+		"only v<digit> dirs are versions; 'vpcaccess' and 'validators' are not")
+}
+
+// A versioned plugin may also ship version-independent resource subtrees
+// (e.g. k8s' helm/, whose fields don't depend on the apiserver minor). Those
+// dirs are not versions, but the narrowed extract import glob still has to
+// reach them, so the manifest reports them alongside the version list.
+func TestPackageResolver_SchemaManifest_ReportsNonVersionDirs(t *testing.T) {
+	tmpDir := installVersionedPlugin(t, "K8S", "k8s",
+		[]string{"v1.30", "v1.33", "helm", "crds"})
+	resolver := NewPackageResolver().WithLocalSchemas(tmpDir)
+
+	m := resolver.SchemaManifestForNamespace("k8s")
+	require.NotNil(t, m)
+	assert.Equal(t, []string{"v1.30", "v1.33"}, m.Versions)
+	assert.Equal(t, []string{"crds", "helm"}, m.NonVersionDirs,
+		"non-version top-level subdirs are reported sorted so the pinned "+
+			"import glob can include them next to the version subtree")
+}
+
+// A purely versioned layout has no extra subtrees to import.
+func TestPackageResolver_SchemaManifest_NoNonVersionDirsIsEmpty(t *testing.T) {
+	tmpDir := installVersionedPlugin(t, "K8S", "k8s", []string{"v1.30", "v1.33"})
+	resolver := NewPackageResolver().WithLocalSchemas(tmpDir)
+
+	m := resolver.SchemaManifestForNamespace("k8s")
+	require.NotNil(t, m)
+	assert.Empty(t, m.NonVersionDirs)
+}
+
+func TestPackageResolver_WithLocalSchemas_FollowsSymlinkedPluginDir(t *testing.T) {
+	wrapperDir := t.TempDir()
+	systemRoot := t.TempDir()
+
+	versionDir := filepath.Join(systemRoot, "aws", "v0.1.6")
+	pkldir := filepath.Join(versionDir, "schema", "pkl")
+	require.NoError(t, os.MkdirAll(pkldir, 0755))
+	require.NoError(t, os.WriteFile(
+		filepath.Join(versionDir, "formae-plugin.pkl"),
+		[]byte(`namespace = "AWS"`), 0644))
+	require.NoError(t, os.WriteFile(filepath.Join(pkldir, "PklProject"), []byte(`amends "pkl:Project"
+
+package {
+  name = "aws"
+}
+`), 0644))
+
+	require.NoError(t, os.Symlink(filepath.Join(systemRoot, "aws"), filepath.Join(wrapperDir, "aws")))
+
+	resolver := NewPackageResolver().WithLocalSchemas(wrapperDir)
+	resolver.Add("aws", "aws", "0.1.6")
+
+	packages := resolver.GetPackages()
+	require.Len(t, packages, 1)
+	assert.True(t, packages[0].IsLocal,
+		"plugin reachable via symlink in basePath must be resolved as a local schema")
+	assert.Equal(t, filepath.Join(wrapperDir, "aws", "v0.1.6", "schema", "pkl", "PklProject"),
+		packages[0].LocalPath)
+}
+
+func TestPackageResolver_InstalledVersion_FollowsSymlinkedPluginDir(t *testing.T) {
+	wrapperDir := t.TempDir()
+	systemRoot := t.TempDir()
+
+	versionDir := filepath.Join(systemRoot, "aws", "v0.1.6")
+	require.NoError(t, os.MkdirAll(versionDir, 0755))
+	require.NoError(t, os.WriteFile(
+		filepath.Join(versionDir, "formae-plugin.pkl"),
+		[]byte(`namespace = "AWS"
+version = "0.1.6"
+`), 0644))
+
+	require.NoError(t, os.Symlink(filepath.Join(systemRoot, "aws"), filepath.Join(wrapperDir, "aws")))
+
+	resolver := NewPackageResolver().WithLocalSchemas(wrapperDir)
+	assert.Equal(t, "0.1.6", resolver.InstalledVersion("aws"),
+		"InstalledVersion must follow symlinked plugin directories")
+}

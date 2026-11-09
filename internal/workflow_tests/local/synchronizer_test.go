@@ -1,0 +1,1701 @@
+// © 2025 Platform Engineering Labs Inc.
+//
+// SPDX-License-Identifier: FSL-1.1-ALv2
+
+//go:build unit
+
+package workflow_tests_local
+
+import (
+	"encoding/json"
+	"fmt"
+	"sync"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"github.com/google/uuid"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+
+	dssqlite "github.com/platform-engineering-labs/formae/internal/datastore/sqlite"
+	"github.com/platform-engineering-labs/formae/internal/metastructure/config"
+	"github.com/platform-engineering-labs/formae/internal/metastructure/discovery"
+	"github.com/platform-engineering-labs/formae/internal/metastructure/forma_command"
+	"github.com/platform-engineering-labs/formae/internal/metastructure/resource_update"
+	"github.com/platform-engineering-labs/formae/internal/metastructure/testutil"
+	"github.com/platform-engineering-labs/formae/internal/metastructure/util"
+	"github.com/platform-engineering-labs/formae/internal/workflow_tests/test_helpers"
+	pkgmodel "github.com/platform-engineering-labs/formae/pkg/model"
+	"github.com/platform-engineering-labs/formae/pkg/plugin"
+	"github.com/platform-engineering-labs/formae/pkg/plugin/resource"
+)
+
+func TestSynchronizer_ApplyThenChangeThenSyncStack(t *testing.T) {
+	testutil.RunTestFromProjectRoot(t, func(t *testing.T) {
+		overrides := &plugin.ResourcePluginOverrides{
+			Create: func(request *resource.CreateRequest) (*resource.CreateResult, error) {
+				if request.Label == "1" {
+					return &resource.CreateResult{
+						ProgressResult: &resource.ProgressResult{
+							Operation:       resource.OperationCreate,
+							OperationStatus: resource.OperationStatusSuccess,
+							RequestID:       "1",
+							NativeID:        "1",
+						},
+					}, nil
+				} else {
+					return &resource.CreateResult{
+						ProgressResult: &resource.ProgressResult{
+							Operation:       resource.OperationCreate,
+							OperationStatus: resource.OperationStatusSuccess,
+							RequestID:       "2",
+							NativeID:        "2",
+						},
+					}, nil
+				}
+			},
+			Read: func(request *resource.ReadRequest) (*resource.ReadResult, error) {
+				if request.NativeID == "1" {
+					return &resource.ReadResult{ResourceType: request.ResourceType,
+						Properties: `{"foo":"1","bar":"2","foobar":"3"}`,
+					}, nil
+				} else {
+					return &resource.ReadResult{ResourceType: request.ResourceType,
+						Properties: `{"foo":"11","bar":"22","foobar":"33"}`,
+					}, nil
+				}
+			},
+			Delete: func(request *resource.DeleteRequest) (*resource.DeleteResult, error) {
+				return &resource.DeleteResult{ProgressResult: &resource.ProgressResult{
+					Operation:       resource.OperationDelete,
+					OperationStatus: resource.OperationStatusSuccess,
+					RequestID:       "1",
+					NativeID:        "1",
+				}}, nil
+			},
+		}
+
+		cfg := test_helpers.NewTestMetastructureConfig()
+		cfg.Agent.Synchronization.Enabled = true
+		cfg.Agent.Synchronization.Interval = 2 * time.Second
+		m, def, err := test_helpers.NewTestMetastructureWithConfig(t, overrides, cfg)
+		defer def()
+		if err != nil {
+			t.Fatalf("Failed to create metastructure: %v", err)
+			return
+		}
+
+		f := &pkgmodel.Forma{
+			Stacks: []pkgmodel.Stack{
+				{
+					Label: "test-stack1",
+				},
+			},
+			Resources: []pkgmodel.Resource{
+				{
+					Label:      "1",
+					Type:       "FakeAWS::Resource",
+					Properties: json.RawMessage(`{"foo":"01","bar":"02","foobar":"03"}`),
+					Stack:      "test-stack1",
+					Schema: pkgmodel.Schema{
+						Fields: []string{"foo", "bar", "foobar"},
+					},
+					Target: "test-target",
+				},
+				{
+					Label:      "2",
+					Type:       "FakeAWS::Resource",
+					Properties: json.RawMessage(`{"foo":"011","bar":"022","foobar":"033"}`),
+					Stack:      "test-stack1",
+					Schema: pkgmodel.Schema{
+						Fields: []string{"foo", "bar", "foobar"},
+					},
+					Target: "test-target",
+				},
+			},
+			Targets: []pkgmodel.Target{
+				{
+					Label: "test-target",
+				},
+			},
+		}
+
+		m.ApplyForma(f, &config.FormaCommandConfig{
+			Mode: pkgmodel.FormaApplyModeReconcile,
+		}, "test", "", "")
+
+		require := require.New(t)
+		require.Eventually(
+			func() bool {
+				resourcesByStack, err := m.Datastore.LoadAllResourcesByStack()
+				if err != nil {
+					return false
+				}
+				resources := resourcesByStack["test-stack1"]
+				if len(resourcesByStack) != 1 || len(resources) != 2 {
+					return false
+				}
+				var resource1, resource2 *pkgmodel.Resource
+				if resources[0].Label == "1" {
+					resource1 = resources[0]
+					resource2 = resources[1]
+				} else {
+					resource1 = resources[1]
+					resource2 = resources[0]
+				}
+				return util.JsonEqual(`{"foo":"1","bar":"2","foobar":"3"}`, string(resource1.Properties)) && util.JsonEqual(`{"foo":"11","bar":"22","foobar":"33"}`, string(resource2.Properties))
+			},
+			10*time.Second,
+			200*time.Millisecond)
+	})
+}
+
+func TestSynchronizer_ApplyThenDestroyThenSyncStack(t *testing.T) {
+	testutil.RunTestFromProjectRoot(t, func(t *testing.T) {
+		overrides := &plugin.ResourcePluginOverrides{
+			Create: func(request *resource.CreateRequest) (*resource.CreateResult, error) {
+				if request.Label == "1" {
+					return &resource.CreateResult{
+						ProgressResult: &resource.ProgressResult{
+							Operation:       resource.OperationCreate,
+							OperationStatus: resource.OperationStatusSuccess,
+							RequestID:       "1",
+							NativeID:        "1",
+						},
+					}, nil
+				} else {
+					return &resource.CreateResult{
+						ProgressResult: &resource.ProgressResult{
+							Operation:       resource.OperationCreate,
+							OperationStatus: resource.OperationStatusSuccess,
+							RequestID:       "2",
+							NativeID:        "2",
+						},
+					}, nil
+				}
+			},
+			Read: func(request *resource.ReadRequest) (*resource.ReadResult, error) {
+				if request.NativeID == "1" {
+					return &resource.ReadResult{ResourceType: request.ResourceType,
+						Properties: `{"foo":"1","bar":"2","foobar":"3"}`,
+					}, nil
+				}
+
+				return nil, fmt.Errorf("resource not found")
+			},
+		}
+
+		cfg := test_helpers.NewTestMetastructureConfig()
+		cfg.Agent.Synchronization.Enabled = true
+		cfg.Agent.Synchronization.Interval = 2 * time.Second
+		cfg.Agent.Retry.MaxRetries = 0
+		m, def, err := test_helpers.NewTestMetastructureWithConfig(t, overrides, cfg)
+		defer def()
+		if err != nil {
+			t.Fatalf("Failed to create metastructure: %v", err)
+			return
+		}
+
+		stack := "test-stack-" + uuid.New().String()
+
+		f := &pkgmodel.Forma{
+			Stacks: []pkgmodel.Stack{
+				{
+					Label: stack,
+				},
+			},
+			Resources: []pkgmodel.Resource{
+				{
+					Label:      "1",
+					Type:       "FakeAWS::S3::Bucket",
+					Properties: json.RawMessage(`{"foo":"01","bar":"02","foobar":"03"}`),
+					Stack:      stack,
+					Schema: pkgmodel.Schema{
+						Fields: []string{"foo", "bar", "foobar"},
+					},
+					Target: "test-target",
+				},
+				{
+					Label:      "2",
+					Type:       "FakeAWS::S3::Bucket",
+					Properties: json.RawMessage(`{"foo":"011","bar":"022","foobar":"033"}`),
+					Stack:      stack,
+					Schema: pkgmodel.Schema{
+						Fields: []string{"foo", "bar", "foobar"},
+					},
+					Target: "test-target",
+				},
+			},
+			Targets: []pkgmodel.Target{
+				{
+					Label: "test-target",
+				},
+			},
+		}
+
+		m.ApplyForma(f, &config.FormaCommandConfig{
+			Mode: pkgmodel.FormaApplyModeReconcile,
+		}, "test", "", "")
+
+		require := require.New(t)
+		require.Eventually(
+			func() bool {
+				resourcesByStack, err := m.Datastore.LoadAllResourcesByStack()
+				if err != nil {
+					return false
+				}
+				return len(resourcesByStack) == 1 && len(resourcesByStack[stack]) == 2
+			},
+			4*time.Second,
+			200*time.Millisecond)
+	})
+}
+
+func TestSynchronizer_SynchronizeOnce(t *testing.T) {
+	testutil.RunTestFromProjectRoot(t, func(t *testing.T) {
+		var readCalled atomic.Bool
+		updated := map[string]string{"foo": "updated", "bar": "updated"}
+		updatedJson, _ := json.Marshal(updated)
+
+		overrides := &plugin.ResourcePluginOverrides{
+			Create: func(request *resource.CreateRequest) (*resource.CreateResult, error) {
+				return &resource.CreateResult{
+					ProgressResult: &resource.ProgressResult{
+						Operation:       resource.OperationCreate,
+						OperationStatus: resource.OperationStatusSuccess,
+						RequestID:       "1",
+						NativeID:        "1",
+					},
+				}, nil
+			},
+			Read: func(request *resource.ReadRequest) (*resource.ReadResult, error) {
+				readCalled.Store(true)
+
+				if request.NativeID == "1" {
+					return &resource.ReadResult{
+						ResourceType: request.ResourceType,
+						Properties:   string(updatedJson),
+					}, nil
+				}
+
+				return nil, fmt.Errorf("resource not found")
+			},
+		}
+
+		// Set synchronization interval to 0 to disable automatic sync
+		cfg := test_helpers.NewTestMetastructureConfig()
+		cfg.Agent.Synchronization.Enabled = false
+		m, def, err := test_helpers.NewTestMetastructureWithConfig(t, overrides, cfg)
+		defer def()
+		if err != nil {
+			t.Fatalf("Failed to create metastructure: %v", err)
+			return
+		}
+
+		stack := "test-stack-" + util.NewID()
+		f := &pkgmodel.Forma{
+			Stacks: []pkgmodel.Stack{
+				{
+					Label: stack,
+				},
+			},
+			Resources: []pkgmodel.Resource{
+				{
+					Label:      "1",
+					Type:       "FakeAWS::Resource",
+					Properties: json.RawMessage(`{"foo":"original","bar":"original"}`),
+					Stack:      stack,
+					Schema: pkgmodel.Schema{
+						Fields: []string{"foo", "bar", "foobar"},
+					},
+					Target: "test-target",
+				},
+			},
+			Targets: []pkgmodel.Target{
+				{
+					Label: "test-target",
+				},
+			},
+		}
+
+		_, err = m.ApplyForma(f, &config.FormaCommandConfig{Mode: pkgmodel.FormaApplyModeReconcile}, "test", "", "")
+		assert.NoError(t, err)
+		waitForApplyComplete(t, m)
+
+		// Manual one-time synchronization
+		waitForSync(t, m, readCalled.Load)
+		require.True(t, readCalled.Load(), "Read function should have been called during force sync")
+
+		// Verify synchronization happened
+		resourcesByStack, err := m.Datastore.LoadAllResourcesByStack()
+		assert.NoError(t, err)
+		assert.Equal(t, 1, len(resourcesByStack))
+		resources := resourcesByStack[stack]
+		assert.Equal(t, 1, len(resources))
+
+		var got map[string]string
+		err = json.Unmarshal(resources[0].Properties, &got)
+		assert.NoError(t, err)
+
+		assert.Equal(t, updated, got)
+
+		// Wait long enough to ensure no additional syncs would have occurred
+		// if the timer was incorrectly set
+		time.Sleep(2 * time.Second)
+		resourcesByStack, err = m.Datastore.LoadAllResourcesByStack()
+		assert.NoError(t, err)
+
+		initialProps := got
+		var laterProps map[string]string
+		err = json.Unmarshal(resourcesByStack[stack][0].Properties, &laterProps)
+		assert.NoError(t, err)
+		assert.Equal(t, initialProps, laterProps)
+	})
+}
+
+func TestSynchronizer_SyncHandlesResourceNotFound(t *testing.T) {
+	testutil.RunTestFromProjectRoot(t, func(t *testing.T) {
+		readCalled := false
+
+		overrides := &plugin.ResourcePluginOverrides{
+			Read: func(request *resource.ReadRequest) (*resource.ReadResult, error) {
+				readCalled = true
+				return &resource.ReadResult{
+					ResourceType: request.ResourceType,
+					ErrorCode:    resource.OperationErrorCodeNotFound,
+				}, nil
+			},
+		}
+
+		cfg := test_helpers.NewTestMetastructureConfig()
+		cfg.Agent.Synchronization.Enabled = false
+		m, def, err := test_helpers.NewTestMetastructureWithConfig(t, overrides, cfg)
+
+		defer def()
+		require.NoError(t, err)
+
+		db, ok := m.Datastore.(dssqlite.TestDatastoreSQLite)
+		require.True(t, ok)
+
+		db.ClearCommandsTable()
+
+		f := &pkgmodel.Forma{
+			Stacks: []pkgmodel.Stack{
+				{
+					Label: "test-stack-notfound",
+				},
+			},
+			Resources: []pkgmodel.Resource{
+				{
+					Label:      "notfound",
+					Type:       "FakeAWS::Resource",
+					Properties: json.RawMessage(`{"foo":"bar"}`),
+					Stack:      "test-stack-notfound",
+					Schema: pkgmodel.Schema{
+						Fields: []string{"foo"},
+					},
+					Target: "test-target",
+				},
+			},
+			Targets: []pkgmodel.Target{
+				{
+					Label: "test-target",
+				},
+			},
+		}
+
+		_, err = m.ApplyForma(f, &config.FormaCommandConfig{Mode: pkgmodel.FormaApplyModeReconcile}, "test", "", "")
+
+		assert.Eventually(t, func() bool {
+			fas, err := m.Datastore.LoadFormaCommands()
+			assert.NoError(t, err)
+			return len(fas) == 1 && fas[0].ResourceUpdates[0].State == resource_update.ResourceUpdateStateSuccess
+		}, 2*time.Second, 100*time.Millisecond)
+		resourcesByStack, err := m.Datastore.LoadAllResourcesByStack()
+		require.NoError(t, err)
+		require.Equal(t, 1, len(resourcesByStack))
+
+		// Manual one-time synchronization
+		err = m.ForceSync()
+		require.NoError(t, err)
+		assert.Eventually(t, func() bool {
+			fas, err := m.Datastore.LoadFormaCommands()
+			assert.NoError(t, err)
+			if len(fas) != 2 {
+				return false
+			}
+			// Find the sync command by type (don't rely on order)
+			for _, fc := range fas {
+				if fc.Command == pkgmodel.CommandSync && len(fc.ResourceUpdates) > 0 {
+					if fc.ResourceUpdates[0].State == resource_update.ResourceUpdateStateSuccess {
+						return true
+					}
+				}
+			}
+			return false
+		}, 2*time.Second, 100*time.Millisecond)
+		require.True(t, readCalled, "Read should have been called")
+
+		// Check that the resource is either removed or marked as not found
+		resourcesByStack, err = m.Datastore.LoadAllResourcesByStack()
+		require.NoError(t, err)
+		require.Equal(t, 0, len(resourcesByStack))
+
+		formaCommands, _ := m.Datastore.LoadFormaCommands()
+
+		assert.Equal(t, 2, len(formaCommands), "There should be two forma command recorded")
+
+		// Find apply and sync commands by type (don't rely on order)
+		var applyCmd, syncCmd *forma_command.FormaCommand
+		for _, fc := range formaCommands {
+			switch fc.Command {
+			case pkgmodel.CommandApply:
+				applyCmd = fc
+			case pkgmodel.CommandSync:
+				syncCmd = fc
+			}
+		}
+
+		assert.NotNil(t, syncCmd, "The sync command should exist")
+		assert.NotNil(t, applyCmd, "The apply command should exist")
+		assert.Equal(t, 1, len(syncCmd.ResourceUpdates), "There should be one resource update in the sync command")
+	})
+}
+
+func TestSynchronizer_OverlapProtection(t *testing.T) {
+	testutil.RunTestFromProjectRoot(t, func(t *testing.T) {
+		blockFirstSync := make(chan struct{})
+		firstSyncStarted := make(chan struct{})
+		syncCallCount := 0
+		var mu sync.Mutex
+
+		overrides := &plugin.ResourcePluginOverrides{
+			Create: func(request *resource.CreateRequest) (*resource.CreateResult, error) {
+				return &resource.CreateResult{
+					ProgressResult: &resource.ProgressResult{
+						Operation:       resource.OperationCreate,
+						OperationStatus: resource.OperationStatusSuccess,
+						RequestID:       request.Label,
+						NativeID:        request.Label,
+					},
+				}, nil
+			},
+			Read: func(request *resource.ReadRequest) (*resource.ReadResult, error) {
+				mu.Lock()
+				syncCallCount++
+				callNum := syncCallCount
+				mu.Unlock()
+
+				if callNum == 1 {
+					select {
+					case firstSyncStarted <- struct{}{}:
+					default:
+					}
+					// Block the first sync
+					<-blockFirstSync
+				}
+
+				return &resource.ReadResult{
+					ResourceType: request.ResourceType,
+					Properties:   `{"foo":"synced"}`,
+				}, nil
+			},
+		}
+
+		cfg := test_helpers.NewTestMetastructureConfig()
+		cfg.Agent.Synchronization.Enabled = false
+		m, def, err := test_helpers.NewTestMetastructureWithConfig(t, overrides, cfg)
+		defer def()
+		require.NoError(t, err)
+
+		stack := "test-stack-" + util.NewID()
+		f := &pkgmodel.Forma{
+			Stacks: []pkgmodel.Stack{{Label: stack}},
+			Resources: []pkgmodel.Resource{
+				{
+					Label:      "resource-1",
+					Type:       "FakeAWS::Resource",
+					Properties: json.RawMessage(`{"foo":"original"}`),
+					Stack:      stack,
+					Schema:     pkgmodel.Schema{Fields: []string{"foo"}},
+					Target:     "test-target",
+				},
+				{
+					Label:      "resource-2",
+					Type:       "FakeAWS::Resource",
+					Properties: json.RawMessage(`{"foo":"original"}`),
+					Stack:      stack,
+					Schema:     pkgmodel.Schema{Fields: []string{"foo"}},
+					Target:     "test-target",
+				},
+			},
+			Targets: []pkgmodel.Target{{Label: "test-target"}},
+		}
+
+		_, err = m.ApplyForma(f, &config.FormaCommandConfig{Mode: pkgmodel.FormaApplyModeReconcile}, "test", "", "")
+		require.NoError(t, err)
+
+		// Wait for resources to be created
+		require.Eventually(t, func() bool {
+			resourcesByStack, err := m.Datastore.LoadAllResourcesByStack()
+			return err == nil && len(resourcesByStack) == 1 && len(resourcesByStack[stack]) == 2
+		}, 5*time.Second, 100*time.Millisecond)
+
+		// Start first sync (will block)
+		go func() {
+			err := m.ForceSync()
+			assert.NoError(t, err)
+		}()
+
+		// Wait for first sync to start
+		<-firstSyncStarted
+
+		err = m.ForceSync()
+		assert.NoError(t, err)
+
+		// Start third sync (should be ignored)
+		err = m.ForceSync()
+		assert.NoError(t, err)
+
+		time.Sleep(100 * time.Millisecond)
+
+		// Unblock the first sync
+		close(blockFirstSync)
+
+		// Wait for syncs to complete, one per resource
+		require.Eventually(t, func() bool {
+			return syncCallCount >= 2
+		}, 10*time.Second, 100*time.Millisecond)
+
+		time.Sleep(500 * time.Millisecond)
+
+		// With 2 resources x 3 sync requests, expect minimal overlap due to fast mock operations
+		assert.GreaterOrEqual(t, syncCallCount, 2, "Should have at least 2 read calls (one per resource)")
+		assert.LessOrEqual(t, syncCallCount, 4, "Should not have more than 4 read calls (overlap protection should prevent excessive calls)")
+	})
+}
+func TestSynchronizer_ExcludesResourcesBeingUpdatedByApply(t *testing.T) {
+	testutil.RunTestFromProjectRoot(t, func(t *testing.T) {
+		// Set up test logger to capture log output for deterministic assertions
+		logCapture := test_helpers.SetupTestLogger()
+
+		// Channels to coordinate the test
+		updateStarted := make(chan struct{})
+		updateCanComplete := make(chan struct{})
+
+		var mu sync.Mutex
+		statusCallCount := 0
+
+		overrides := &plugin.ResourcePluginOverrides{
+			Create: func(request *resource.CreateRequest) (*resource.CreateResult, error) {
+				return &resource.CreateResult{
+					ProgressResult: &resource.ProgressResult{
+						Operation:       resource.OperationCreate,
+						OperationStatus: resource.OperationStatusSuccess,
+						RequestID:       "create-" + request.Label,
+						NativeID:        request.Label,
+					},
+				}, nil
+			},
+			Update: func(request *resource.UpdateRequest) (*resource.UpdateResult, error) {
+				// Signal that update has started
+				select {
+				case updateStarted <- struct{}{}:
+				default:
+				}
+
+				// Return InProgress status
+				return &resource.UpdateResult{
+					ProgressResult: &resource.ProgressResult{
+						Operation:       resource.OperationUpdate,
+						OperationStatus: resource.OperationStatusInProgress,
+						RequestID:       "update-" + request.Label,
+						NativeID:        request.Label,
+					},
+				}, nil
+			},
+			Status: func(request *resource.StatusRequest) (*resource.StatusResult, error) {
+				mu.Lock()
+				statusCallCount++
+				mu.Unlock()
+
+				// Keep returning InProgress until we get the signal to complete
+				// This simulates a long-running update operation
+				select {
+				case <-updateCanComplete:
+					// Signal received, return success
+					return &resource.StatusResult{
+						ProgressResult: &resource.ProgressResult{
+							Operation:       resource.OperationUpdate,
+							OperationStatus: resource.OperationStatusSuccess,
+							RequestID:       request.RequestID,
+						},
+					}, nil
+				default:
+					// Still in progress
+					return &resource.StatusResult{
+						ProgressResult: &resource.ProgressResult{
+							Operation:       resource.OperationUpdate,
+							OperationStatus: resource.OperationStatusInProgress,
+							RequestID:       request.RequestID,
+						},
+					}, nil
+				}
+			},
+			Read: func(request *resource.ReadRequest) (*resource.ReadResult, error) {
+				// Return original properties - we're not simulating an out-of-band change
+				// The update will change the properties via the Update operation
+				return &resource.ReadResult{
+					ResourceType: request.ResourceType,
+					Properties:   `{"foo":"original","bar":"original"}`,
+				}, nil
+			},
+		}
+
+		cfg := test_helpers.NewTestMetastructureConfig()
+		cfg.Agent.Synchronization.Enabled = false // Manual sync control
+		m, def, err := test_helpers.NewTestMetastructureWithConfig(t, overrides, cfg)
+		defer def()
+		require.NoError(t, err)
+
+		stack := "test-stack-" + util.NewID()
+
+		// Initial apply to create the resource
+		f := &pkgmodel.Forma{
+			Stacks: []pkgmodel.Stack{{Label: stack}},
+			Resources: []pkgmodel.Resource{
+				{
+					Label:      "test-resource",
+					Type:       "FakeAWS::Resource",
+					Properties: json.RawMessage(`{"foo":"original","bar":"original"}`),
+					Stack:      stack,
+					Schema:     pkgmodel.Schema{Fields: []string{"foo", "bar"}},
+					Target:     "test-target",
+				},
+			},
+			Targets: []pkgmodel.Target{{Label: "test-target"}},
+		}
+
+		_, err = m.ApplyForma(f, &config.FormaCommandConfig{Mode: pkgmodel.FormaApplyModeReconcile}, "test", "", "")
+		require.NoError(t, err)
+
+		// Wait for initial resource creation
+		require.Eventually(t, func() bool {
+			resourcesByStack, err := m.Datastore.LoadAllResourcesByStack()
+			return err == nil && len(resourcesByStack) == 1 && len(resourcesByStack[stack]) == 1
+		}, 5*time.Second, 100*time.Millisecond)
+
+		// Get the initial resource to check versions later
+		resourcesByStack, err := m.Datastore.LoadAllResourcesByStack()
+		require.NoError(t, err)
+		initialResource := resourcesByStack[stack][0]
+
+		// Start update in a goroutine using reconcile mode
+		// This is more realistic - a full reconcile that happens to update the resource
+		// Note: We don't include Targets since the target hasn't changed and reconcile
+		// would check if target config differs from what's already stored
+		go func() {
+			fUpdate := &pkgmodel.Forma{
+				Stacks: []pkgmodel.Stack{{Label: stack}},
+				Resources: []pkgmodel.Resource{
+					{
+						Label:      "test-resource",
+						Type:       "FakeAWS::Resource",
+						Properties: json.RawMessage(`{"foo":"updated","bar":"updated"}`),
+						Stack:      stack,
+						Schema:     pkgmodel.Schema{Fields: []string{"foo", "bar"}},
+						Target:     "test-target",
+					},
+				},
+				Targets: []pkgmodel.Target{}, // Empty - target already exists and hasn't changed
+			}
+			_, err := m.ApplyForma(fUpdate, &config.FormaCommandConfig{Mode: pkgmodel.FormaApplyModeReconcile}, "test", "", "")
+			assert.NoError(t, err)
+		}()
+
+		// Wait for update to start
+		<-updateStarted
+
+		// Trigger sync while update is in progress
+		err = m.ForceSync()
+		require.NoError(t, err)
+
+		// Wait for sync to FINISH processing (log-based, deterministic)
+		// When our fix works, sync will exclude the resource being updated and have no resources to sync
+		// This logs either "Synchronizer: no resources found to synchronize" or "Synchronization finished"
+		require.Eventually(t, func() bool {
+			return logCapture.ContainsAll("Starting resource synchronization") &&
+				(logCapture.ContainsAll("Synchronizer: no resources found to synchronize") ||
+					logCapture.ContainsAll("Synchronization finished"))
+		}, 10*time.Second, 100*time.Millisecond,
+			"Synchronizer should have processed (either finished or found no resources)")
+
+		// Check that sync command either wasn't created OR didn't include the resource being updated
+		// When our fix works, all resources are filtered out, so either:
+		// 1. No sync command is created (synchronizer returns early)
+		// 2. Sync command exists but has no resource updates
+		commands, err := m.Datastore.LoadFormaCommands()
+		require.NoError(t, err)
+
+		var syncCommand *forma_command.FormaCommand
+		for i := range commands {
+			if commands[i].Command == pkgmodel.CommandSync {
+				syncCommand = commands[i]
+				break
+			}
+		}
+
+		// If sync command was created, it should NOT include the resource being updated
+		if syncCommand != nil {
+			for _, ru := range syncCommand.ResourceUpdates {
+				assert.NotEqual(t, initialResource.URI(), ru.URI(), "Sync should not include resource being updated by apply")
+			}
+			// Verify the sync command is empty (all resources were filtered out)
+			assert.Empty(t, syncCommand.ResourceUpdates, "Sync command should have no resource updates (all filtered out)")
+		}
+		// If no sync command was created, that's also correct behavior (synchronizer filtered out all resources)
+
+		// Allow the update to complete
+		close(updateCanComplete)
+
+		// Wait for update to complete
+		require.Eventually(t, func() bool {
+			commands, err := m.Datastore.LoadFormaCommands()
+			if err != nil {
+				return false
+			}
+			// Find the update command (should be the second reconcile command)
+			reconcileCount := 0
+			for _, cmd := range commands {
+				if cmd.Command == pkgmodel.CommandApply && cmd.Config.Mode == pkgmodel.FormaApplyModeReconcile {
+					reconcileCount++
+					// The second reconcile is our update
+					if reconcileCount == 2 && cmd.State == forma_command.CommandStateSuccess {
+						return true
+					}
+				}
+			}
+			return false
+		}, 10*time.Second, 100*time.Millisecond)
+
+		// Verify both commands completed successfully
+		commands, err = m.Datastore.LoadFormaCommands()
+		require.NoError(t, err)
+
+		// Should have at least 2 commands: initial create (reconcile), update (reconcile)
+		// Sync command might not exist if all resources were filtered out (which is correct!)
+		require.GreaterOrEqual(t, len(commands), 2, "Should have at least 2 commands")
+
+		// Find and verify update command completed successfully (second reconcile)
+		var updateCmd *forma_command.FormaCommand
+		reconcileCount := 0
+		for i := range commands {
+			if commands[i].Command == pkgmodel.CommandApply && commands[i].Config.Mode == pkgmodel.FormaApplyModeReconcile {
+				reconcileCount++
+				if reconcileCount == 2 {
+					updateCmd = commands[i]
+					break
+				}
+			}
+		}
+		require.NotNil(t, updateCmd, "Update command should exist")
+		require.Equal(t, forma_command.CommandStateSuccess, updateCmd.State, "Update command should complete successfully")
+
+		// If a sync command was created, verify it completed successfully
+		// (It might not exist if all resources were filtered out)
+		syncCommand = nil
+		for i := range commands {
+			if commands[i].Command == pkgmodel.CommandSync {
+				syncCommand = commands[i]
+				break
+			}
+		}
+		if syncCommand != nil {
+			require.Equal(t, forma_command.CommandStateSuccess, syncCommand.State, "Sync command should complete successfully if it was created")
+		}
+	})
+}
+
+// TestSynchronizer_SyncDoesNotOverwriteApplyStackChange verifies that sync preserves
+// user-controlled state (Stack, Managed, Schema.Discoverable, Schema.Extractable) when
+// a race occurs between apply and sync operations.
+func TestSynchronizer_SyncDoesNotOverwriteApplyStackChange(t *testing.T) {
+	testutil.RunTestFromProjectRoot(t, func(t *testing.T) {
+		readStarted := make(chan struct{})
+		readCanComplete := make(chan struct{})
+		readCount := 0
+		var mu sync.Mutex
+
+		nativeID := "vpc-" + uuid.New().String()
+
+		overrides := &plugin.ResourcePluginOverrides{
+			Read: func(request *resource.ReadRequest) (*resource.ReadResult, error) {
+				mu.Lock()
+				readCount++
+				currentRead := readCount
+				mu.Unlock()
+
+				if currentRead == 1 {
+					select {
+					case readStarted <- struct{}{}:
+					default:
+					}
+					<-readCanComplete
+				}
+
+				return &resource.ReadResult{
+					ResourceType: request.ResourceType,
+					Properties:   `{"CidrBlock":"10.0.0.0/16","VpcId":"` + nativeID + `"}`,
+				}, nil
+			},
+		}
+
+		cfg := test_helpers.NewTestMetastructureConfig()
+		cfg.Agent.Synchronization.Enabled = false
+		m, def, err := test_helpers.NewTestMetastructureWithConfig(t, overrides, cfg)
+		defer def()
+		require.NoError(t, err)
+
+		unmanagedResource := &pkgmodel.Resource{
+			Ksuid:      util.NewID(),
+			NativeID:   nativeID,
+			Stack:      "$unmanaged",
+			Type:       "FakeAWS::EC2::VPC",
+			Label:      nativeID,
+			Target:     "test-target",
+			Properties: json.RawMessage(`{"CidrBlock":"10.0.0.0/16"}`),
+			Schema:     pkgmodel.Schema{Discoverable: false, Extractable: false},
+			Managed:    false,
+		}
+		_, err = m.Datastore.StoreResource(unmanagedResource, "discovery-cmd")
+		require.NoError(t, err)
+
+		_, err = m.Datastore.CreateTarget(&pkgmodel.Target{Label: "test-target", Discoverable: true})
+		require.NoError(t, err)
+
+		go func() { _ = m.ForceSync() }()
+		<-readStarted
+
+		managedStack := "my-managed-stack"
+		f := &pkgmodel.Forma{
+			Stacks: []pkgmodel.Stack{{Label: managedStack}},
+			Resources: []pkgmodel.Resource{{
+				Ksuid:      unmanagedResource.Ksuid,
+				Label:      nativeID,
+				Type:       "FakeAWS::EC2::VPC",
+				NativeID:   nativeID,
+				Properties: json.RawMessage(`{"CidrBlock":"10.0.0.0/16"}`),
+				Stack:      managedStack,
+				Schema:     pkgmodel.Schema{Fields: []string{"CidrBlock"}, Discoverable: true, Extractable: true},
+				Target:     "test-target",
+				Managed:    true,
+			}},
+			Targets: []pkgmodel.Target{},
+		}
+		_, err = m.ApplyForma(f, &config.FormaCommandConfig{Mode: pkgmodel.FormaApplyModeReconcile}, "test", "", "")
+		require.NoError(t, err)
+
+		require.Eventually(t, func() bool {
+			res, err := m.Datastore.LoadResourceByNativeID(nativeID, "FakeAWS::EC2::VPC")
+			return err == nil && res != nil && res.Stack == managedStack && res.Managed
+		}, 5*time.Second, 100*time.Millisecond)
+
+		// Unblock sync's READ
+		close(readCanComplete)
+		time.Sleep(2 * time.Second)
+
+		res, err := m.Datastore.LoadResourceByNativeID(nativeID, "FakeAWS::EC2::VPC")
+		require.NoError(t, err)
+		require.NotNil(t, res)
+		assert.Equal(t, managedStack, res.Stack, "Stack should be preserved")
+		assert.True(t, res.Managed, "Managed should be preserved")
+		assert.True(t, res.Schema.Discoverable, "Schema.Discoverable should be preserved")
+		assert.True(t, res.Schema.Extractable, "Schema.Extractable should be preserved")
+	})
+}
+
+// TestSynchronizer_UnregistersResourcesAfterFailedChangeset verifies that resources
+// are unregistered from the Synchronizer's exclusion list when a changeset finishes
+// with errors, so that subsequent sync cycles can include them.
+func TestSynchronizer_UnregistersResourcesAfterFailedChangeset(t *testing.T) {
+	testutil.RunTestFromProjectRoot(t, func(t *testing.T) {
+		var mu sync.Mutex
+		syncReadCount := 0
+		// Track which command is which so Read can behave differently for create vs update
+		createDone := false
+
+		overrides := &plugin.ResourcePluginOverrides{
+			Create: func(request *resource.CreateRequest) (*resource.CreateResult, error) {
+				return &resource.CreateResult{
+					ProgressResult: &resource.ProgressResult{
+						Operation:       resource.OperationCreate,
+						OperationStatus: resource.OperationStatusSuccess,
+						RequestID:       "create-" + request.Label,
+						NativeID:        request.Label,
+					},
+				}, nil
+			},
+			Update: func(request *resource.UpdateRequest) (*resource.UpdateResult, error) {
+				// Fail the update operation
+				return &resource.UpdateResult{
+					ProgressResult: &resource.ProgressResult{
+						Operation:       resource.OperationUpdate,
+						OperationStatus: resource.OperationStatusFailure,
+						RequestID:       "update-" + request.Label,
+						NativeID:        request.Label,
+						ErrorCode:       resource.OperationErrorCodeNotStabilized,
+					},
+				}, nil
+			},
+			Read: func(request *resource.ReadRequest) (*resource.ReadResult, error) {
+				mu.Lock()
+				done := createDone
+				mu.Unlock()
+
+				if done {
+					// After create is done, count reads from sync operations
+					mu.Lock()
+					syncReadCount++
+					mu.Unlock()
+				}
+
+				// Always return consistent properties matching what was created
+				return &resource.ReadResult{
+					ResourceType: request.ResourceType,
+					Properties:   `{"foo":"original"}`,
+				}, nil
+			},
+		}
+
+		cfg := test_helpers.NewTestMetastructureConfig()
+		cfg.Agent.Synchronization.Enabled = false
+		cfg.Agent.Retry.MaxRetries = 0
+		m, def, err := test_helpers.NewTestMetastructureWithConfig(t, overrides, cfg)
+		defer def()
+		require.NoError(t, err)
+
+		stack := "test-stack-" + util.NewID()
+
+		// Step 1: Create a resource
+		f := &pkgmodel.Forma{
+			Stacks: []pkgmodel.Stack{{Label: stack}},
+			Resources: []pkgmodel.Resource{
+				{
+					Label:      "test-resource",
+					Type:       "FakeAWS::Resource",
+					Properties: json.RawMessage(`{"foo":"original"}`),
+					Stack:      stack,
+					Schema:     pkgmodel.Schema{Fields: []string{"foo"}},
+					Target:     "test-target",
+				},
+			},
+			Targets: []pkgmodel.Target{{Label: "test-target"}},
+		}
+
+		_, err = m.ApplyForma(f, &config.FormaCommandConfig{Mode: pkgmodel.FormaApplyModeReconcile}, "test", "", "")
+		require.NoError(t, err)
+
+		// Wait for resource creation to complete
+		require.Eventually(t, func() bool {
+			commands, err := m.Datastore.LoadFormaCommands()
+			if err != nil {
+				return false
+			}
+			for _, cmd := range commands {
+				if cmd.Command == pkgmodel.CommandApply && cmd.State == forma_command.CommandStateSuccess {
+					return true
+				}
+			}
+			return false
+		}, 5*time.Second, 100*time.Millisecond)
+
+		mu.Lock()
+		createDone = true
+		mu.Unlock()
+
+		// Step 2: Submit an update that will fail (Update returns OperationStatusFailure)
+		// The Read returns properties matching the DB so no OOB rejection occurs,
+		// then the actual Update call fails.
+		fUpdate := &pkgmodel.Forma{
+			Stacks: []pkgmodel.Stack{{Label: stack}},
+			Resources: []pkgmodel.Resource{
+				{
+					Label:      "test-resource",
+					Type:       "FakeAWS::Resource",
+					Properties: json.RawMessage(`{"foo":"updated"}`),
+					Stack:      stack,
+					Schema:     pkgmodel.Schema{Fields: []string{"foo"}},
+					Target:     "test-target",
+				},
+			},
+			Targets: []pkgmodel.Target{},
+		}
+
+		_, err = m.ApplyForma(fUpdate, &config.FormaCommandConfig{Mode: pkgmodel.FormaApplyModeReconcile}, "test", "", "")
+		require.NoError(t, err)
+
+		// Wait for the update command to reach a terminal state
+		require.Eventually(t, func() bool {
+			commands, err := m.Datastore.LoadFormaCommands()
+			if err != nil {
+				return false
+			}
+			terminalCount := 0
+			for _, cmd := range commands {
+				if cmd.Command == pkgmodel.CommandApply && cmd.State == forma_command.CommandStateSuccess || cmd.State == forma_command.CommandStateFailed {
+					terminalCount++
+				}
+			}
+			return terminalCount >= 2
+		}, 10*time.Second, 100*time.Millisecond)
+
+		// Reset the counter so we only measure reads from the upcoming sync
+		mu.Lock()
+		syncReadCount = 0
+		mu.Unlock()
+
+		// Allow time for the changeset executor's async unregister messages
+		// to be processed by the Synchronizer actor.
+		time.Sleep(500 * time.Millisecond)
+
+		// Step 3: Trigger a sync — this should include the resource
+		// (proving it was unregistered after the failed changeset)
+		err = m.ForceSync()
+		require.NoError(t, err)
+
+		// Wait for sync to either create a command or finish without one
+		require.Eventually(t, func() bool {
+			mu.Lock()
+			reads := syncReadCount
+			mu.Unlock()
+			if reads > 0 {
+				return true // Sync read the resource
+			}
+			// Also check if a sync command was created
+			commands, err := m.Datastore.LoadFormaCommands()
+			if err != nil {
+				return false
+			}
+			for _, cmd := range commands {
+				if cmd.Command == pkgmodel.CommandSync {
+					return true
+				}
+			}
+			return false
+		}, 10*time.Second, 100*time.Millisecond)
+
+		// The sync should have called Read on the resource (it was unregistered)
+		mu.Lock()
+		reads := syncReadCount
+		mu.Unlock()
+		assert.Greater(t, reads, 0, "Sync should have read the resource after the changeset unregistered it")
+	})
+}
+
+// TestSynchronizer_SyncPicksUpNewSchemaFields verifies that when a plugin's schema
+// evolves to include new fields, the synchronizer picks up the fresh schema from the
+// plugin rather than using the stale schema stored in the database. This ensures that
+// new fields returned by Read are classified as regular Properties (not ReadOnlyProperties).
+func TestSynchronizer_SyncPicksUpNewSchemaFields(t *testing.T) {
+	testutil.RunTestFromProjectRoot(t, func(t *testing.T) {
+		var readCalled atomic.Bool
+
+		// The plugin's full schema for FakeAWS::S3::Bucket includes many fields including
+		// "VersioningConfiguration". We apply a resource with a restricted schema that
+		// does NOT include "VersioningConfiguration". After sync, the fresh schema from
+		// the plugin should be used, so "VersioningConfiguration" ends up in Properties.
+		overrides := &plugin.ResourcePluginOverrides{
+			Create: func(request *resource.CreateRequest) (*resource.CreateResult, error) {
+				return &resource.CreateResult{
+					ProgressResult: &resource.ProgressResult{
+						Operation:       resource.OperationCreate,
+						OperationStatus: resource.OperationStatusSuccess,
+						RequestID:       "1",
+						NativeID:        "my-bucket",
+					},
+				}, nil
+			},
+			Read: func(request *resource.ReadRequest) (*resource.ReadResult, error) {
+				readCalled.Store(true)
+				// Return properties that include a field NOT in the resource's original schema
+				return &resource.ReadResult{
+					ResourceType: request.ResourceType,
+					Properties:   `{"BucketName":"my-bucket","Tags":{"env":"prod"},"VersioningConfiguration":{"Status":"Enabled"}}`,
+				}, nil
+			},
+		}
+
+		cfg := test_helpers.NewTestMetastructureConfig()
+		cfg.Agent.Synchronization.Enabled = false
+		m, def, err := test_helpers.NewTestMetastructureWithConfig(t, overrides, cfg)
+		defer def()
+		require.NoError(t, err)
+
+		stack := "test-stack-" + util.NewID()
+		f := &pkgmodel.Forma{
+			Stacks: []pkgmodel.Stack{{Label: stack}},
+			Resources: []pkgmodel.Resource{
+				{
+					Label:      "my-bucket",
+					Type:       "FakeAWS::S3::Bucket",
+					Properties: json.RawMessage(`{"BucketName":"my-bucket","Tags":{"env":"prod"}}`),
+					Stack:      stack,
+					Schema: pkgmodel.Schema{
+						Identifier: "BucketName",
+						// Intentionally restricted: does NOT include "VersioningConfiguration"
+						Fields: []string{"BucketName", "Tags"},
+					},
+					Target: "test-target",
+				},
+			},
+			Targets: []pkgmodel.Target{{Label: "test-target"}},
+		}
+
+		_, err = m.ApplyForma(f, &config.FormaCommandConfig{Mode: pkgmodel.FormaApplyModeReconcile}, "test", "", "")
+		require.NoError(t, err)
+		waitForApplyComplete(t, m)
+
+		// Force a one-time sync
+		waitForSync(t, m, readCalled.Load)
+		require.True(t, readCalled.Load(), "Read function should have been called during force sync")
+
+		// Verify the resource after sync
+		resourcesByStack, err := m.Datastore.LoadAllResourcesByStack()
+		require.NoError(t, err)
+		resources := resourcesByStack[stack]
+		require.Equal(t, 1, len(resources))
+
+		res := resources[0]
+
+		// Parse Properties
+		var props map[string]any
+		err = json.Unmarshal(res.Properties, &props)
+		require.NoError(t, err)
+
+		// "VersioningConfiguration" should be in Properties (not ReadOnlyProperties)
+		// because the sync used the fresh plugin schema which includes this field
+		assert.Contains(t, props, "VersioningConfiguration",
+			"VersioningConfiguration should be in Properties after sync with fresh schema")
+
+		// Also verify the other fields are still there
+		assert.Contains(t, props, "BucketName")
+		assert.Contains(t, props, "Tags")
+
+		// Verify VersioningConfiguration is NOT in ReadOnlyProperties
+		if res.ReadOnlyProperties != nil {
+			var roProps map[string]any
+			err = json.Unmarshal(res.ReadOnlyProperties, &roProps)
+			require.NoError(t, err)
+			assert.NotContains(t, roProps, "VersioningConfiguration",
+				"VersioningConfiguration should NOT be in ReadOnlyProperties")
+		}
+	})
+}
+
+// TestSynchronizer_TargetDeleteCleanupIsIdempotentWithSync checks that a full sync
+// cycle run after a target delete leaves the eagerly-cleaned state untouched:
+//
+//  1. Deploy: static provider target → cluster → nested consumer target ($ref to
+//     the cluster endpoint) → app resource
+//  2. Discovery finds one unmanaged resource on the consumer target and one on the
+//     surviving provider target
+//  3. Destroy the stack — managed resources + the consumer target are deleted, and
+//     the consumer target's unmanaged resource is forgotten at destroy time; the
+//     provider target and its unmanaged resource survive
+//  4. Periodic sync (enabled at a 1s interval) keeps running — across several
+//     cycles it must neither resurrect the forgotten consumer resource nor drop
+//     the surviving provider one
+//
+// Enabling periodic sync (rather than a single ForceSync, whose transient sync
+// command is pruned and cannot be observed) guarantees repeated real cycles run
+// during the stability window.
+func TestSynchronizer_TargetDeleteCleanupIsIdempotentWithSync(t *testing.T) {
+	testutil.RunTestFromProjectRoot(t, func(t *testing.T) {
+		clusterProps := `{"BucketName":"eks-cluster","Endpoint":"https://eks.example.com"}`
+		clusterKsuid := "2MiD2rA1SJbLMGZgTL0hCxjkjjr"
+
+		// isConsumerTarget distinguishes the nested target (consumer) from the
+		// static target (provider) by checking whether the plugin-format config
+		// contains "endpoint" (resolved from $ref) vs "region" (plain value).
+		isConsumerTarget := func(targetConfig json.RawMessage) bool {
+			var cfg map[string]any
+			if err := json.Unmarshal(targetConfig, &cfg); err != nil {
+				return false
+			}
+			_, hasEndpoint := cfg["endpoint"]
+			return hasEndpoint
+		}
+
+		overrides := &plugin.ResourcePluginOverrides{
+			Create: func(request *resource.CreateRequest) (*resource.CreateResult, error) {
+				return &resource.CreateResult{ProgressResult: &resource.ProgressResult{
+					Operation:          resource.OperationCreate,
+					OperationStatus:    resource.OperationStatusSuccess,
+					RequestID:          request.Label,
+					NativeID:           "native-" + request.Label,
+					ResourceProperties: request.Properties,
+				}}, nil
+			},
+			Read: func(request *resource.ReadRequest) (*resource.ReadResult, error) {
+				switch request.NativeID {
+				case "native-cluster":
+					return &resource.ReadResult{
+						ResourceType: "FakeAWS::S3::Bucket",
+						Properties:   clusterProps,
+					}, nil
+				case "native-app":
+					return &resource.ReadResult{
+						ResourceType: "FakeAWS::S3::Bucket",
+						Properties:   `{"BucketName":"my-app"}`,
+					}, nil
+				case "discovered-ns":
+					return &resource.ReadResult{
+						ResourceType: "FakeAWS::S3::Bucket",
+						Properties:   `{"BucketName":"discovered-ns"}`,
+					}, nil
+				default:
+					return &resource.ReadResult{
+						ResourceType: request.ResourceType,
+						Properties:   fmt.Sprintf(`{"BucketName":"%s"}`, request.NativeID),
+					}, nil
+				}
+			},
+			List: func(request *resource.ListRequest) (*resource.ListResult, error) {
+				if request.ResourceType != "FakeAWS::S3::Bucket" {
+					return &resource.ListResult{}, nil
+				}
+				// The consumer (nested, deleted-on-destroy) target yields one
+				// discovered resource; the surviving provider target yields another
+				// so a post-destroy sync cycle has real work and is observable.
+				if isConsumerTarget(request.TargetConfig) {
+					return &resource.ListResult{NativeIDs: []string{"discovered-ns"}}, nil
+				}
+				return &resource.ListResult{NativeIDs: []string{"discovered-provider"}}, nil
+			},
+			Delete: func(request *resource.DeleteRequest) (*resource.DeleteResult, error) {
+				return &resource.DeleteResult{ProgressResult: &resource.ProgressResult{
+					Operation:       resource.OperationDelete,
+					OperationStatus: resource.OperationStatusSuccess,
+					NativeID:        request.NativeID,
+				}}, nil
+			},
+		}
+
+		cfg := test_helpers.NewTestMetastructureConfig()
+		cfg.Agent.Synchronization.Enabled = true
+		cfg.Agent.Synchronization.Interval = 1 * time.Second
+		cfg.Agent.Retry.MaxRetries = 0
+		m, def, err := test_helpers.NewTestMetastructureWithConfig(t, overrides, cfg)
+		defer def()
+		require.NoError(t, err)
+
+		// ── Step 1: Apply ───────────────────────────────────────────────
+		// provider (static target) → cluster resource → consumer (nested
+		// target with $ref to cluster's Endpoint) → app resource
+		forma := &pkgmodel.Forma{
+			Stacks: []pkgmodel.Stack{{Label: "infra"}},
+			Resources: []pkgmodel.Resource{
+				{
+					Label: "cluster", Type: "FakeAWS::S3::Bucket", Stack: "infra", Target: "provider",
+					Managed: true, Ksuid: clusterKsuid,
+					Schema:     pkgmodel.Schema{Identifier: "BucketName", Fields: []string{"BucketName", "Endpoint"}, Portable: true},
+					Properties: json.RawMessage(clusterProps),
+				},
+				{
+					Label: "app", Type: "FakeAWS::S3::Bucket", Stack: "infra", Target: "consumer",
+					Managed:    true,
+					Schema:     pkgmodel.Schema{Identifier: "BucketName", Fields: []string{"BucketName"}, Portable: true},
+					Properties: json.RawMessage(`{"BucketName":"my-app"}`),
+				},
+			},
+			Targets: []pkgmodel.Target{
+				{Label: "provider", Namespace: "FakeAWS", Discoverable: true, Config: json.RawMessage(`{"region":"us-east-1"}`)},
+				{
+					Label:        "consumer",
+					Namespace:    "FakeAWS",
+					Discoverable: true,
+					Config: json.RawMessage(fmt.Sprintf(`{
+						"endpoint": {"$ref": "formae://%s#/Endpoint"}
+					}`, clusterKsuid)),
+				},
+			},
+		}
+
+		_, err = m.ApplyForma(forma,
+			&config.FormaCommandConfig{Mode: pkgmodel.FormaApplyModeReconcile}, "test", "", "")
+		require.NoError(t, err)
+
+		assert.Eventually(t, func() bool {
+			incomplete, _ := m.Datastore.LoadIncompleteFormaCommands()
+			return len(incomplete) == 0
+		}, 10*time.Second, 100*time.Millisecond, "apply should complete")
+
+		// Verify managed resources exist
+		infraResources, err := m.Datastore.LoadResourcesByStack("infra")
+		require.NoError(t, err)
+		require.Len(t, infraResources, 2, "cluster + app should exist after apply")
+
+		// ── Step 2: Discovery ───────────────────────────────────────────
+		// Discover one unmanaged resource on the consumer target and one on the
+		// surviving provider target.
+		incoming := make(chan any, 1)
+		_, err = testutil.StartTestHelperActor(m.Node, incoming)
+		require.NoError(t, err)
+
+		err = testutil.Send(m.Node, "Discovery", discovery.Discover{})
+		require.NoError(t, err)
+
+		assert.Eventually(t, func() bool {
+			unmanaged, err := m.Datastore.LoadResourcesByStack("$unmanaged")
+			if err != nil {
+				return false
+			}
+			return len(unmanaged) >= 2
+		}, 10*time.Second, 100*time.Millisecond, "discovery should find unmanaged resources on both targets")
+
+		// ── Step 3: Destroy ─────────────────────────────────────────────
+		// Destroy the forma. This deletes:
+		// - managed resources (cluster, app)
+		// - consumer target (has $ref dependency → eligible for deletion)
+		// But leaves:
+		// - provider target (no $ref → survives)
+		// - unmanaged discovered resource (not in forma → not destroyed)
+		_, err = m.DestroyForma(forma,
+			&config.FormaCommandConfig{Mode: pkgmodel.FormaApplyModeReconcile}, "test", "", "")
+		require.NoError(t, err)
+
+		assert.Eventually(t, func() bool {
+			cmds, _ := m.Datastore.LoadFormaCommands()
+			incomplete, _ := m.Datastore.LoadIncompleteFormaCommands()
+			// apply + destroy = 2 commands (discovery doesn't create forma commands)
+			return len(cmds) >= 2 && len(incomplete) == 0
+		}, 10*time.Second, 100*time.Millisecond, "destroy should complete")
+
+		// ── Step 4: Verify post-destroy state ───────────────────────────
+		// Managed resources and consumer target are gone.
+		infraResources, err = m.Datastore.LoadResourcesByStack("infra")
+		require.NoError(t, err)
+		assert.Empty(t, infraResources, "managed resources should be destroyed")
+
+		consumerTarget, err := m.Datastore.LoadTarget("consumer")
+		require.NoError(t, err)
+		assert.Nil(t, consumerTarget, "consumer target should be deleted (has $ref)")
+
+		// The consumer's discovered resource is forgotten at destroy time along with
+		// its target, while the surviving provider target's discovered resource
+		// remains. Periodic sync is enabled (1s interval), so settling into and
+		// holding this state also exercises the sync path.
+		onlyProviderRemains := func() bool {
+			unmanaged, err := m.Datastore.LoadResourcesByStack("$unmanaged")
+			if err != nil || len(unmanaged) != 1 {
+				return false
+			}
+			return unmanaged[0].Target == "provider"
+		}
+		require.Eventually(t, onlyProviderRemains, 10*time.Second, 100*time.Millisecond,
+			"consumer's unmanaged resource should be forgotten when its target is deleted")
+
+		// ── Step 5: The cleaned-up state is stable under repeated sync ──
+		// Sync fires every second, so the window below spans several real sync
+		// cycles. Across all of them the forgotten consumer resource must stay gone
+		// (steady-state sync never rediscovers a resource for the deleted target) and
+		// the surviving provider resource must never be dropped.
+		assert.Never(t, func() bool {
+			unmanaged, err := m.Datastore.LoadResourcesByStack("$unmanaged")
+			if err != nil {
+				return true
+			}
+			return len(unmanaged) != 1 || unmanaged[0].Target != "provider"
+		}, 5*time.Second, 250*time.Millisecond,
+			"repeated sync cycles must not resurrect the deleted target's unmanaged resource nor drop the surviving one")
+	})
+}
+
+// TestTargetDelete_ForgetsUnmanagedResourcesImmediately asserts that deleting a
+// target eagerly removes that target's unmanaged (discovered) resources from the
+// datastore at destroy time — without waiting for a sync tick — while leaving
+// unmanaged resources on other, surviving targets untouched.
+//
+// Setup: two discoverable targets. "provider" is a static target that survives
+// the destroy; "consumer" is a nested target ($ref to the cluster endpoint) that
+// is deleted along with the managed resources. Discovery finds two unmanaged
+// resources on the consumer and one on the surviving provider. After DestroyForma
+// completes — and before any ForceSync — the consumer's two unmanaged resources
+// must be gone, and the provider's one must remain.
+func TestTargetDelete_ForgetsUnmanagedResourcesImmediately(t *testing.T) {
+	testutil.RunTestFromProjectRoot(t, func(t *testing.T) {
+		clusterProps := `{"BucketName":"eks-cluster","Endpoint":"https://eks.example.com"}`
+		clusterKsuid := "2MiD2rA1SJbLMGZgTL0hCxjkjjr"
+
+		isConsumerTarget := func(targetConfig json.RawMessage) bool {
+			var cfg map[string]any
+			if err := json.Unmarshal(targetConfig, &cfg); err != nil {
+				return false
+			}
+			_, hasEndpoint := cfg["endpoint"]
+			return hasEndpoint
+		}
+
+		overrides := &plugin.ResourcePluginOverrides{
+			Create: func(request *resource.CreateRequest) (*resource.CreateResult, error) {
+				return &resource.CreateResult{ProgressResult: &resource.ProgressResult{
+					Operation:          resource.OperationCreate,
+					OperationStatus:    resource.OperationStatusSuccess,
+					RequestID:          request.Label,
+					NativeID:           "native-" + request.Label,
+					ResourceProperties: request.Properties,
+				}}, nil
+			},
+			Read: func(request *resource.ReadRequest) (*resource.ReadResult, error) {
+				if request.NativeID == "native-cluster" {
+					return &resource.ReadResult{
+						ResourceType: "FakeAWS::S3::Bucket",
+						Properties:   clusterProps,
+					}, nil
+				}
+				return &resource.ReadResult{
+					ResourceType: "FakeAWS::S3::Bucket",
+					Properties:   fmt.Sprintf(`{"BucketName":"%s"}`, request.NativeID),
+				}, nil
+			},
+			List: func(request *resource.ListRequest) (*resource.ListResult, error) {
+				if request.ResourceType != "FakeAWS::S3::Bucket" {
+					return &resource.ListResult{}, nil
+				}
+				// The consumer (nested) target yields two discovered resources;
+				// the surviving provider target yields one.
+				if isConsumerTarget(request.TargetConfig) {
+					return &resource.ListResult{NativeIDs: []string{"discovered-a", "discovered-b"}}, nil
+				}
+				return &resource.ListResult{NativeIDs: []string{"discovered-provider"}}, nil
+			},
+			Delete: func(request *resource.DeleteRequest) (*resource.DeleteResult, error) {
+				return &resource.DeleteResult{ProgressResult: &resource.ProgressResult{
+					Operation:       resource.OperationDelete,
+					OperationStatus: resource.OperationStatusSuccess,
+					NativeID:        request.NativeID,
+				}}, nil
+			},
+		}
+
+		cfg := test_helpers.NewTestMetastructureConfig()
+		cfg.Agent.Synchronization.Enabled = false
+		cfg.Agent.Retry.MaxRetries = 0
+		m, def, err := test_helpers.NewTestMetastructureWithConfig(t, overrides, cfg)
+		defer def()
+		require.NoError(t, err)
+
+		// ── Apply: provider (static) → cluster → consumer (nested $ref) → app ──
+		forma := &pkgmodel.Forma{
+			Stacks: []pkgmodel.Stack{{Label: "infra"}},
+			Resources: []pkgmodel.Resource{
+				{
+					Label: "cluster", Type: "FakeAWS::S3::Bucket", Stack: "infra", Target: "provider",
+					Managed: true, Ksuid: clusterKsuid,
+					Schema:     pkgmodel.Schema{Identifier: "BucketName", Fields: []string{"BucketName", "Endpoint"}, Portable: true},
+					Properties: json.RawMessage(clusterProps),
+				},
+				{
+					Label: "app", Type: "FakeAWS::S3::Bucket", Stack: "infra", Target: "consumer",
+					Managed:    true,
+					Schema:     pkgmodel.Schema{Identifier: "BucketName", Fields: []string{"BucketName"}, Portable: true},
+					Properties: json.RawMessage(`{"BucketName":"my-app"}`),
+				},
+			},
+			Targets: []pkgmodel.Target{
+				{Label: "provider", Namespace: "FakeAWS", Discoverable: true, Config: json.RawMessage(`{"region":"us-east-1"}`)},
+				{
+					Label:        "consumer",
+					Namespace:    "FakeAWS",
+					Discoverable: true,
+					Config: json.RawMessage(fmt.Sprintf(`{
+						"endpoint": {"$ref": "formae://%s#/Endpoint"}
+					}`, clusterKsuid)),
+				},
+			},
+		}
+
+		_, err = m.ApplyForma(forma,
+			&config.FormaCommandConfig{Mode: pkgmodel.FormaApplyModeReconcile}, "test", "", "")
+		require.NoError(t, err)
+
+		assert.Eventually(t, func() bool {
+			incomplete, _ := m.Datastore.LoadIncompleteFormaCommands()
+			return len(incomplete) == 0
+		}, 10*time.Second, 100*time.Millisecond, "apply should complete")
+
+		// ── Discovery: two unmanaged on consumer, one on provider ──
+		incoming := make(chan any, 1)
+		_, err = testutil.StartTestHelperActor(m.Node, incoming)
+		require.NoError(t, err)
+
+		err = testutil.Send(m.Node, "Discovery", discovery.Discover{})
+		require.NoError(t, err)
+
+		assert.Eventually(t, func() bool {
+			unmanaged, err := m.Datastore.LoadResourcesByStack("$unmanaged")
+			if err != nil {
+				return false
+			}
+			return len(unmanaged) >= 3
+		}, 10*time.Second, 100*time.Millisecond, "discovery should find three unmanaged resources")
+
+		// ── Destroy: deletes managed resources + the consumer target ──
+		_, err = m.DestroyForma(forma,
+			&config.FormaCommandConfig{Mode: pkgmodel.FormaApplyModeReconcile}, "test", "", "")
+		require.NoError(t, err)
+
+		assert.Eventually(t, func() bool {
+			cmds, _ := m.Datastore.LoadFormaCommands()
+			incomplete, _ := m.Datastore.LoadIncompleteFormaCommands()
+			return len(cmds) >= 2 && len(incomplete) == 0
+		}, 10*time.Second, 100*time.Millisecond, "destroy should complete")
+
+		consumerTarget, err := m.Datastore.LoadTarget("consumer")
+		require.NoError(t, err)
+		require.Nil(t, consumerTarget, "consumer target should be deleted (has $ref)")
+
+		providerTarget, err := m.Datastore.LoadTarget("provider")
+		require.NoError(t, err)
+		require.NotNil(t, providerTarget, "provider target should survive (no $ref)")
+
+		// ── Assert cleanup happened at destroy time, before any ForceSync ──
+		// Synchronization is disabled and no ForceSync is issued, so reaching the
+		// steady state below can only be the eager target-delete cleanup: the
+		// deleted consumer target's two unmanaged resources are forgotten, while
+		// the surviving provider target's one unmanaged resource is untouched.
+		assert.Eventually(t, func() bool {
+			unmanaged, err := m.Datastore.LoadResourcesByStack("$unmanaged")
+			if err != nil {
+				return false
+			}
+			remainingTargets := make([]string, 0, len(unmanaged))
+			for _, r := range unmanaged {
+				remainingTargets = append(remainingTargets, r.Target)
+			}
+			return len(remainingTargets) == 1 && remainingTargets[0] == "provider"
+		}, 10*time.Second, 100*time.Millisecond,
+			"only the surviving provider target's unmanaged resource should remain after target deletion")
+	})
+}
+
+// TestSynchronizer_EvictsUnmanagedRowMatchingDiscoveryFilter verifies that a sync
+// pass evicts an unmanaged inventory row when the freshly-read cloud state matches
+// a discovery filter configured on the plugin.
+//
+// Two cases are exercised in one test to keep setup cheap:
+//  1. Unmanaged row — its Read response contains the filter sentinel value.
+//     The row must be gone from inventory after ForceSync.
+//  2. Managed row — same filter sentinel in its Read response but Managed=true.
+//     The row must survive ForceSync because the eviction path is unmanaged-only.
+func TestSynchronizer_EvictsUnmanagedRowMatchingDiscoveryFilter(t *testing.T) {
+	testutil.RunTestFromProjectRoot(t, func(t *testing.T) {
+		// FakeAWS.DiscoveryFilters() returns a filter for FakeAWS::S3::Bucket that
+		// excludes resources where $.SkipDiscovery == "true". The Read override
+		// below returns that value for both resources so we can verify that only
+		// the unmanaged row gets evicted.
+		overrides := &plugin.ResourcePluginOverrides{
+			Read: func(request *resource.ReadRequest) (*resource.ReadResult, error) {
+				return &resource.ReadResult{
+					ResourceType: request.ResourceType,
+					Properties:   `{"BucketName":"` + request.NativeID + `","SkipDiscovery":"true"}`,
+				}, nil
+			},
+		}
+
+		cfg := test_helpers.NewTestMetastructureConfig()
+		cfg.Agent.Synchronization.Enabled = false
+		m, def, err := test_helpers.NewTestMetastructureWithConfig(t, overrides, cfg)
+		defer def()
+		require.NoError(t, err)
+
+		// Create the target that both resources live on.
+		_, err = m.Datastore.CreateTarget(&pkgmodel.Target{Label: "test-target", Discoverable: true, Namespace: "FakeAWS"})
+		require.NoError(t, err)
+
+		unmanagedKsuid := util.NewID()
+		managedKsuid := util.NewID()
+
+		// Seed unmanaged row: Managed=false, stack=$unmanaged.
+		_, err = m.Datastore.StoreResource(&pkgmodel.Resource{
+			Ksuid:      unmanagedKsuid,
+			NativeID:   "bucket-unmanaged",
+			Stack:      "$unmanaged",
+			Type:       "FakeAWS::S3::Bucket",
+			Label:      "bucket-unmanaged",
+			Target:     "test-target",
+			Properties: json.RawMessage(`{"BucketName":"bucket-unmanaged"}`),
+			Schema: pkgmodel.Schema{
+				Identifier: "BucketName",
+				Fields:     []string{"BucketName"},
+			},
+			Managed: false,
+		}, "seed-cmd")
+		require.NoError(t, err)
+
+		// Seed managed row: Managed=true, stack=managed-stack.
+		_, err = m.Datastore.StoreResource(&pkgmodel.Resource{
+			Ksuid:      managedKsuid,
+			NativeID:   "bucket-managed",
+			Stack:      "managed-stack",
+			Type:       "FakeAWS::S3::Bucket",
+			Label:      "bucket-managed",
+			Target:     "test-target",
+			Properties: json.RawMessage(`{"BucketName":"bucket-managed"}`),
+			Schema: pkgmodel.Schema{
+				Identifier: "BucketName",
+				Fields:     []string{"BucketName"},
+			},
+			Managed: true,
+		}, "seed-cmd")
+		require.NoError(t, err)
+
+		// Both rows should be present before the sync.
+		unmanagedRows, err := m.Datastore.LoadResourcesByStack("$unmanaged")
+		require.NoError(t, err)
+		require.Len(t, unmanagedRows, 1, "unmanaged row must be seeded before sync")
+
+		managedRows, err := m.Datastore.LoadResourcesByStack("managed-stack")
+		require.NoError(t, err)
+		require.Len(t, managedRows, 1, "managed row must be seeded before sync")
+
+		// Trigger a single sync pass.
+		err = m.ForceSync()
+		require.NoError(t, err)
+
+		// Wait for the sync to complete by polling the forma commands table.
+		require.Eventually(t, func() bool {
+			cmds, err := m.Datastore.LoadFormaCommands()
+			if err != nil {
+				return false
+			}
+			for _, cmd := range cmds {
+				if cmd.Command == pkgmodel.CommandSync && len(cmd.ResourceUpdates) > 0 {
+					allDone := true
+					for _, ru := range cmd.ResourceUpdates {
+						if ru.State != resource_update.ResourceUpdateStateSuccess &&
+							ru.State != resource_update.ResourceUpdateStateFailed {
+							allDone = false
+							break
+						}
+					}
+					if allDone {
+						return true
+					}
+				}
+			}
+			return false
+		}, 10*time.Second, 100*time.Millisecond, "sync command should complete")
+
+		// Unmanaged row whose Read response matches the filter must be evicted.
+		unmanagedRows, err = m.Datastore.LoadResourcesByStack("$unmanaged")
+		require.NoError(t, err)
+		assert.Empty(t, unmanagedRows, "unmanaged row matching discovery filter must be evicted by sync")
+
+		// Managed row must survive — eviction applies only to unmanaged rows.
+		managedRows, err = m.Datastore.LoadResourcesByStack("managed-stack")
+		require.NoError(t, err)
+		require.Len(t, managedRows, 1, "managed row must survive sync even when it matches a discovery filter")
+	})
+}

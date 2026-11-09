@@ -1,0 +1,88 @@
+/*
+ * © 2025 Platform Engineering Labs Inc.
+ *
+ * SPDX-License-Identifier: FSL-1.1-ALv2
+ */
+
+open module Forma
+
+import "formae.pkl"
+
+description: formae.Description?
+properties: Any?
+
+/// fill: entry point used by the self-injecting output below; constructs a
+/// typed instance of the user's properties class from external `prop:` values.
+function fill(clazz: Class): Typed = formae.fillProps(clazz)
+hidden forma: Listing<formae.Resource|formae.Resolvable|formae.Stack|formae.Target|formae.Policy|formae.Generator>
+
+/// defaultStack: returns the first defined Stack
+hidden defaultStack: formae.StackResolvable =
+forma.toList().filterIsInstance(formae.Stack).firstOrNull?.res
+?? forma.toList().filterIsInstance(formae.StackResolvable).firstOrNull ?? throw("no default stack found")
+
+/// defaultTarget: returns the first defined Target
+hidden defaultTarget: formae.TargetResolvable =
+forma.toList().filterIsInstance(formae.Target).firstOrNull?.res
+?? forma.toList().filterIsInstance(formae.TargetResolvable).firstOrNull ?? throw("no default target found")
+
+// hidden guard for the self-injecting output: the first evaluation amends this
+// module with a filled `properties` instance (reading `prop:` values), the
+// second renders normally with the injected values visible everywhere via
+// late binding. Same mechanism pkl:Command's runtime uses ("synthesize a
+// module that amends the command module and sets options").
+hidden injected: Boolean = false
+
+// NOTE: a lot of this would be uneeded if bugs or unfinished implementation issues were resolved in PKL
+output {
+    value =
+        // `properties is Typed` = the new extends shape (typed Props class).
+        // LEGACY: amends-based formae assign a Dynamic `properties {}` block,
+        // fail this check, and skip injection entirely - their Prop members
+        // self-read `prop:` values as before. Remove this discriminator (and
+        // the legacy passthrough in formae.renderProperties) when the legacy
+        // block is dropped after the deprecation window.
+        if (!injected && properties != null && properties is Typed)
+            let (m = module)
+            ((m) { injected = true; properties = m.fill(m.properties.getClass()) }).output.value
+        else if (formae.mode() == "properties")
+            new formae.FormaRender {
+                Properties = formae.renderProperties(module.properties)
+            }
+        else
+            new formae.FormaRender {
+                Description = module.description
+                Properties = formae.renderProperties(module.properties)
+                Stacks = forma.toList().filterIsInstance(formae.Stack).toListing()
+                Targets = forma.toList().filterIsInstance(formae.Target).toListing()
+                Policies = forma.toList().filterIsInstance(formae.Policy).map((p) -> p.render()).toListing()
+                Generators = forma.toList().filterIsInstance(formae.Generator).map((g) -> g.render()).toListing()
+                Resolvables = forma.toList().filterIsInstance(formae.Resolvable).toListing()
+                Resources = new Listing {
+                    for (res in forma.toList().filterIsInstance(formae.Resource).toListing()) {
+                        (res) {
+                            when (res.stack == null) {
+                                stack = defaultStack
+                            }
+                            when (res.target == null) {
+                                target = defaultTarget
+                            }
+                        }
+                    }
+                }
+            }
+    // NOTE: this is needed currently due to the immutability of pkl values on assignment, and the lack of a Reference type
+    // when this is addressed we can use a PKL native reference type: https://github.com/apple/pkl/issues/912
+    // this is a workaround required to enable the addition of default stack and target support
+    renderer {
+        converters {
+            [Class] = (it) -> it.toString()
+            [formae.StackResolvable] = (it) -> it.label
+            [formae.TargetResolvable] = (it) -> it.label
+            [formae.Resolvable] = (it) -> if (it.stack == null && it.type != "Formae::Stack" && it.type != "Formae::Target") (it) { stack = output.value.getResource(it.label, it.type).stack.label } else it
+            [formae.Resource] = (it) -> it.render()
+            [formae.Policy] = (it) -> it.render()
+            [formae.SubResource] = (it) -> it.render()
+        }
+    }
+}

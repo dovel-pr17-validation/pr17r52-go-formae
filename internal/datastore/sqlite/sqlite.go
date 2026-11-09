@@ -1,0 +1,6248 @@
+// © 2025 Platform Engineering Labs Inc.
+//
+// SPDX-License-Identifier: FSL-1.1-ALv2
+
+package sqlite
+
+import (
+	"context"
+	"database/sql"
+	"errors"
+	"fmt"
+	"log/slog"
+	"strings"
+	"time"
+
+	"github.com/XSAM/otelsql"
+	"github.com/demula/mksuid/v2"
+	json "github.com/goccy/go-json"
+	"github.com/mattn/go-sqlite3"
+	"go.opentelemetry.io/otel"
+	semconv "go.opentelemetry.io/otel/semconv/v1.22.0"
+	"go.opentelemetry.io/otel/trace"
+
+	"github.com/platform-engineering-labs/formae"
+	"github.com/platform-engineering-labs/formae/internal/constants"
+	"github.com/platform-engineering-labs/formae/internal/datastore"
+	"github.com/platform-engineering-labs/formae/internal/metastructure/forma_command"
+	"github.com/platform-engineering-labs/formae/internal/metastructure/resource_update"
+	"github.com/platform-engineering-labs/formae/internal/metastructure/stats"
+	"github.com/platform-engineering-labs/formae/internal/metastructure/types"
+	metautil "github.com/platform-engineering-labs/formae/internal/metastructure/util"
+	"github.com/platform-engineering-labs/formae/internal/util"
+	pkgmodel "github.com/platform-engineering-labs/formae/pkg/model"
+	"github.com/platform-engineering-labs/formae/pkg/plugin"
+)
+
+var sqliteTracer trace.Tracer
+
+const sqliteOtelDriverName = "sqlite3-otel"
+
+func init() {
+	sqliteTracer = otel.Tracer("formae/datastore/sqlite")
+
+	// Register otelsql-instrumented SQLite driver for automatic query tracing
+	sql.Register(sqliteOtelDriverName, otelsql.WrapDriver(&sqlite3.SQLiteDriver{},
+		otelsql.WithAttributes(
+			semconv.DBSystemSqlite,
+		),
+		otelsql.WithSpanOptions(otelsql.SpanOptions{
+			DisableErrSkip: true,
+		}),
+	))
+
+	// Register SQLite factory with the datastore extension registry
+	datastore.DefaultRegistry.Register("sqlite", func(ctx context.Context, cfg *pkgmodel.DatastoreConfig, agentID string) (datastore.Datastore, error) {
+		return NewDatastoreSQLite(ctx, cfg, agentID)
+	})
+}
+
+type DatastoreSQLite struct {
+	conn    *sql.DB // Write connection (single connection for SQLite write safety)
+	agentID string
+	ctx     context.Context
+	// dsn is kept so a data migration lease can open its OWN connection on the
+	// same file. It must never take one from conn: that pool holds a single
+	// connection, so pinning it would starve every ordinary read.
+	dsn string
+}
+
+type TestDatastoreSQLite interface {
+	ClearCommandsTable() error
+}
+
+func nullableJSON(value json.RawMessage) any {
+	if value == nil {
+		return nil
+	}
+	return string(value)
+}
+
+func NewDatastoreSQLite(ctx context.Context, cfg *pkgmodel.DatastoreConfig, agentID string) (datastore.Datastore, error) {
+	// Skip directory creation for in-memory databases
+	isMemoryDb := cfg.Sqlite.FilePath == ":memory:" ||
+		strings.HasPrefix(cfg.Sqlite.FilePath, "file::memory:")
+
+	if cfg.Sqlite.FilePath != "" && !isMemoryDb {
+		if err := util.EnsureFileFolderHierarchy(cfg.Sqlite.FilePath); err != nil {
+			slog.Error("failed to create log folder hierarchy", "error", err)
+			return nil, err
+		}
+	}
+
+	conn, err := sql.Open(sqliteOtelDriverName, cfg.Sqlite.FilePath)
+	if err != nil {
+		slog.Error("Failed to connect to sqlite database", "error", err)
+		return nil, err
+	}
+
+	// Enable WAL mode for better concurrency - allows readers to proceed during writes.
+	// This prevents timeouts when concurrent operations (like CleanupEmptyStacks) need
+	// to read while bulk operations are writing.
+	if _, err := conn.Exec("PRAGMA journal_mode=WAL"); err != nil {
+		slog.Error("Failed to enable WAL mode", "error", err)
+		return nil, err
+	}
+
+	// Set a busy timeout so SQLite waits instead of immediately failing when locked.
+	// 10 seconds should be more than enough for any operation to complete.
+	if _, err := conn.Exec("PRAGMA busy_timeout=10000"); err != nil {
+		slog.Error("Failed to set busy timeout", "error", err)
+		return nil, err
+	}
+
+	// SQLite doesn't handle concurrent writes well - limit to a single connection
+	// to avoid "database is locked" errors during concurrent operations.
+	conn.SetMaxOpenConns(1)
+
+	d := DatastoreSQLite{conn: conn, agentID: agentID, ctx: ctx, dsn: cfg.Sqlite.FilePath}
+
+	if err = datastore.RunMigrations(conn, "sqlite3"); err != nil {
+		return nil, err
+	}
+
+	slog.Info("Started SQLite datastore", "filePath", cfg.Sqlite.FilePath)
+
+	return d, nil
+}
+
+func (d DatastoreSQLite) ClearCommandsTable() error {
+	_, err := d.conn.Exec(fmt.Sprintf("DELETE FROM %s", datastore.CommandsTable))
+	if err != nil {
+		slog.Error(fmt.Sprintf("Failed to clear %s table", datastore.CommandsTable), "error", err)
+		return err
+	}
+	return nil
+}
+
+func (d DatastoreSQLite) StoreFormaCommand(fa *forma_command.FormaCommand, commandID string) error {
+	tx, err := d.conn.Begin()
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	if err = d.storeFormaCommandTx(tx, fa, commandID, false); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+// storeFormaCommandTx writes metadata, membership and all initial contributions.
+// The caller owns commit/rollback; every SQL operation stays on this transaction.
+func (d DatastoreSQLite) storeFormaCommandTx(tx *sql.Tx, fa *forma_command.FormaCommand, commandID string, createOnly bool) error {
+	if err := datastore.ValidateAcceptanceContributions(fa.ResourceUpdates); err != nil {
+		return err
+	}
+	slog.Debug("SQLite START", "method", "StoreFormaCommand", "commandID", commandID, "resourceUpdates", len(fa.ResourceUpdates))
+	start := time.Now()
+	defer func() {
+		slog.Debug("SQLite END", "method", "StoreFormaCommand", "commandID", commandID, "duration", time.Since(start))
+	}()
+	_, span := sqliteTracer.Start(context.Background(), "StoreFormaCommand")
+	defer span.End()
+
+	for _, r := range fa.ResourceUpdates {
+		if r.DesiredState.Properties == nil {
+			slog.Debug("Resource properties are empty for resource", "resourceLabel", r.DesiredState.Label, "commandID", commandID)
+		}
+	}
+
+	targetUpdatesJSON, err := json.Marshal(fa.TargetUpdates)
+	if err != nil {
+		return fmt.Errorf("failed to marshal target updates: %w", err)
+	}
+	targetUpdatesJSON, err = datastore.StripOpaqueRefValues(targetUpdatesJSON)
+	if err != nil {
+		return fmt.Errorf("failed to strip opaque ref values from target updates: %w", err)
+	}
+
+	stackUpdatesJSON, err := json.Marshal(fa.StackUpdates)
+	if err != nil {
+		return fmt.Errorf("failed to marshal stack updates: %w", err)
+	}
+
+	setupMetadata, err := fa.MarshalSetupMetadata(createOnly)
+	if err != nil {
+		return err
+	}
+	policyUpdatesJSON, err := json.Marshal(fa.PolicyUpdates)
+	if err != nil {
+		return fmt.Errorf("failed to marshal policy updates: %w", err)
+	}
+
+	// We no longer store the forma JSON - Description and Config are stored as normalized columns
+	// Normalize timestamps to UTC for consistent TEXT-based sorting in SQLite
+	startTsUTC := fa.StartTs.UTC()
+	modifiedTsUTC := fa.ModifiedTs.UTC()
+
+	// Convert booleans to integers for SQLite
+	descriptionConfirm := 0
+	if fa.Description.Confirm {
+		descriptionConfirm = 1
+	}
+	configForce := 0
+	if fa.Config.Force {
+		configForce = 1
+	}
+	configSimulate := 0
+	if fa.Config.Simulate {
+		configSimulate = 1
+	}
+
+	query := fmt.Sprintf(`INSERT OR REPLACE INTO %s
+		(command_id, timestamp, command, state, agent_version, client_id, agent_id,
+		 description_text, description_confirm, config_mode, config_force, config_simulate,
+		 target_updates, stack_updates, policy_updates, modified_ts, source, subject, subject_name,
+		 message, input_properties, setup_metadata)
+		VALUES (?, ?, ?, CASE WHEN json_extract((SELECT setup_metadata FROM forma_commands WHERE command_id=?1), '$.OnlyMetadata') = 1 THEN 'Success' ELSE ? END, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CASE WHEN json_extract((SELECT setup_metadata FROM forma_commands WHERE command_id=?), '$.Committed') = 1 THEN (SELECT setup_metadata FROM forma_commands WHERE command_id=?) ELSE COALESCE(?, (SELECT setup_metadata FROM forma_commands WHERE command_id=?)) END)`, datastore.CommandsTable)
+
+	if createOnly {
+		query = strings.Replace(query, "INSERT OR REPLACE", "INSERT", 1)
+	}
+
+	_, err = tx.Exec(query, commandID, startTsUTC, fa.Command, fa.State, formae.Version, fa.ClientID, d.agentID,
+		fa.Description.Text, descriptionConfirm, fa.Config.Mode, configForce, configSimulate,
+		targetUpdatesJSON, stackUpdatesJSON, policyUpdatesJSON, modifiedTsUTC, string(fa.Source), fa.Subject, fa.SubjectName,
+		fa.Message, nullableJSON(fa.InputProperties), commandID, commandID, nullableJSON(setupMetadata), commandID)
+	if err != nil {
+		slog.Error("Query", "query", query, "error", err)
+		return err
+	}
+	// The command row was written above and remains locked through commit.
+	// Lifecycle saves must not replace membership allocated by atomic admission.
+	membershipCondition := ""
+	if !createOnly {
+		membershipCondition = " AND NOT EXISTS (SELECT 1 FROM forma_commands WHERE command_id = ?1 AND json_extract(setup_metadata, '$.Committed') = 1)"
+	}
+	if _, err = tx.Exec("DELETE FROM command_stacks WHERE command_id = ?"+membershipCondition, commandID); err != nil {
+		return err
+	}
+	for _, stack := range fa.Stacks {
+		if stack.ID == "" {
+			continue
+		}
+		if _, err = tx.Exec("INSERT INTO command_stacks(command_id, stack_id, stack_label) SELECT ?, ?, ? WHERE 1=1"+membershipCondition, commandID, stack.ID, stack.Label); err != nil {
+			return err
+		}
+	}
+	if fa.Command != pkgmodel.CommandSync {
+		if err := d.bulkStoreResourceUpdatesTx(tx, commandID, fa.ResourceUpdates); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+// formaCommandWithResourceUpdatesQueryBase is the base LEFT JOIN query without WHERE or ORDER BY
+const formaCommandWithResourceUpdatesQueryBase = `
+SELECT
+	fc.command_id, fc.timestamp, fc.command, fc.state, fc.client_id,
+	fc.description_text, fc.description_confirm, fc.config_mode, fc.config_force, fc.config_simulate,
+	fc.target_updates, fc.stack_updates, fc.policy_updates, fc.modified_ts, fc.source, fc.subject, fc.subject_name,
+	fc.setup_metadata, fc.message, fc.input_properties,
+	(SELECT json_group_array(json_object('ID', cs.stack_id, 'Label', cs.stack_label)) FROM command_stacks cs WHERE cs.command_id = fc.command_id),
+	ru.ksuid, ru.operation, ru.state, ru.start_ts, ru.modified_ts,
+	ru.retries, ru.remaining, ru.version, ru.stack_label, ru.group_id, ru.source,
+	ru.resource, ru.resource_target, ru.existing_resource, ru.existing_target,
+	ru.progress_result, ru.most_recent_progress,
+	ru.remaining_resolvables, ru.reference_labels, ru.previous_properties,
+	ru.is_cascade, ru.cascade_source, ru.failure_reason, ru.provenance_records, ru.resolved_root_digests
+FROM forma_commands fc
+LEFT JOIN resource_updates ru ON fc.command_id = ru.command_id`
+
+// resourceUpdateOrderBy ensures deterministic ordering of resource updates (KSUIDs are time-sortable)
+const resourceUpdateOrderBy = " ORDER BY fc.timestamp DESC, ru.ksuid ASC"
+
+// scanJoinedRow scans a row from a FormaCommand LEFT JOIN ResourceUpdate query.
+// Returns the command fields and optionally a ResourceUpdate (nil if no resource update for this row).
+func scanJoinedRow(rows *sql.Rows) (*forma_command.FormaCommand, *resource_update.ResourceUpdate, error) {
+	var cmd forma_command.FormaCommand
+	var commandID, fcTimestamp, command, fcState string
+	var clientID sql.NullString
+	var descriptionText sql.NullString
+	var descriptionConfirm sql.NullInt64
+	var configMode sql.NullString
+	var configForce, configSimulate sql.NullInt64
+	var targetUpdatesJSON []byte
+	var stackUpdatesJSON []byte
+	var policyUpdatesJSON []byte
+	var fcModifiedTs sql.NullString
+	var fcSource sql.NullString
+	var fcSubject, fcSubjectName sql.NullString
+	var fcSetupMetadata sql.NullString
+	var fcMessage, fcInputProperties, fcStacks sql.NullString
+
+	// ResourceUpdate fields (all nullable due to LEFT JOIN)
+	var ruKsuid, ruOperation, ruState sql.NullString
+	var ruStartTs, ruModifiedTs sql.NullString
+	var ruRetries, ruRemaining sql.NullInt64
+	var ruVersion, ruStackLabel, ruGroupID, ruSource sql.NullString
+	var resourceJSON, resourceTargetJSON, existingResourceJSON, existingTargetJSON []byte
+	var progressResultJSON, mostRecentProgressJSON []byte
+	var remainingResolvablesJSON, referenceLabelsJSON, previousPropertiesJSON []byte
+	var ruIsCascade sql.NullInt64
+	var ruCascadeSource sql.NullString
+	var ruFailureReason sql.NullString
+	var ruProvenanceRecords, ruResolvedRootDigests []byte
+
+	err := rows.Scan(
+		// FormaCommand columns
+		&commandID, &fcTimestamp, &command, &fcState, &clientID,
+		&descriptionText, &descriptionConfirm, &configMode, &configForce, &configSimulate,
+		&targetUpdatesJSON, &stackUpdatesJSON, &policyUpdatesJSON, &fcModifiedTs, &fcSource, &fcSubject, &fcSubjectName,
+		&fcSetupMetadata, &fcMessage, &fcInputProperties, &fcStacks,
+		// ResourceUpdate columns
+		&ruKsuid, &ruOperation, &ruState, &ruStartTs, &ruModifiedTs,
+		&ruRetries, &ruRemaining, &ruVersion, &ruStackLabel, &ruGroupID, &ruSource,
+		&resourceJSON, &resourceTargetJSON, &existingResourceJSON, &existingTargetJSON,
+		&progressResultJSON, &mostRecentProgressJSON,
+		&remainingResolvablesJSON, &referenceLabelsJSON, &previousPropertiesJSON,
+		&ruIsCascade, &ruCascadeSource, &ruFailureReason,
+		&ruProvenanceRecords, &ruResolvedRootDigests,
+	)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	// Populate FormaCommand
+	cmd.ID = commandID
+	cmd.Command = pkgmodel.Command(command)
+	cmd.State = forma_command.CommandState(fcState)
+	if clientID.Valid {
+		cmd.ClientID = clientID.String
+	}
+
+	// Read description from normalized columns
+	if descriptionText.Valid {
+		cmd.Description.Text = descriptionText.String
+	}
+	cmd.Description.Confirm = descriptionConfirm.Valid && descriptionConfirm.Int64 == 1
+
+	// Read config from normalized columns
+	if configMode.Valid {
+		cmd.Config.Mode = pkgmodel.FormaApplyMode(configMode.String)
+	}
+	cmd.Config.Force = configForce.Valid && configForce.Int64 == 1
+	cmd.Config.Simulate = configSimulate.Valid && configSimulate.Int64 == 1
+	if fcSource.Valid {
+		cmd.Source = forma_command.Source(fcSource.String)
+	}
+	if fcSubject.Valid {
+		cmd.Subject = fcSubject.String
+	}
+	if fcSubjectName.Valid {
+		cmd.SubjectName = fcSubjectName.String
+	}
+	if fcMessage.Valid {
+		cmd.Message = fcMessage.String
+	}
+	if fcInputProperties.Valid {
+		cmd.InputProperties = json.RawMessage(fcInputProperties.String)
+	}
+	if fcStacks.Valid && fcStacks.String != "[]" {
+		if err := json.Unmarshal([]byte(fcStacks.String), &cmd.Stacks); err != nil {
+			return nil, nil, err
+		}
+	}
+
+	// Parse timestamp - convert to UTC
+	// SQLite stores time.Time as "2006-01-02 15:04:05.999999999-07:00" format
+	if ts, err := time.Parse(time.RFC3339Nano, fcTimestamp); err == nil {
+		cmd.StartTs = ts.UTC()
+	} else if ts, err := time.Parse("2006-01-02 15:04:05.999999999-07:00", fcTimestamp); err == nil {
+		cmd.StartTs = ts.UTC()
+	}
+
+	// Parse modified_ts (TIMESTAMP column)
+	if fcModifiedTs.Valid && fcModifiedTs.String != "" {
+		if ts, err := time.Parse(time.RFC3339Nano, fcModifiedTs.String); err == nil {
+			cmd.ModifiedTs = ts.UTC()
+		} else if ts, err := time.Parse("2006-01-02 15:04:05.999999999-07:00", fcModifiedTs.String); err == nil {
+			cmd.ModifiedTs = ts.UTC()
+		}
+	}
+
+	if len(targetUpdatesJSON) > 0 {
+		if err := json.Unmarshal(targetUpdatesJSON, &cmd.TargetUpdates); err != nil {
+			return nil, nil, fmt.Errorf("failed to unmarshal target updates: %w", err)
+		}
+	}
+
+	if len(stackUpdatesJSON) > 0 {
+		if err := json.Unmarshal(stackUpdatesJSON, &cmd.StackUpdates); err != nil {
+			return nil, nil, fmt.Errorf("failed to unmarshal stack updates: %w", err)
+		}
+	}
+
+	if len(policyUpdatesJSON) > 0 {
+		if err := json.Unmarshal(policyUpdatesJSON, &cmd.PolicyUpdates); err != nil {
+			return nil, nil, fmt.Errorf("failed to unmarshal policy updates: %w", err)
+		}
+	}
+
+	if err := cmd.UnmarshalSetupMetadata([]byte(fcSetupMetadata.String)); err != nil {
+		return nil, nil, err
+	}
+	// Check if there's a ResourceUpdate (LEFT JOIN may return NULL)
+	if !ruKsuid.Valid {
+		return &cmd, nil, nil
+	}
+
+	// Populate ResourceUpdate
+	var ru resource_update.ResourceUpdate
+	ru.Operation = types.OperationType(ruOperation.String)
+	ru.State = resource_update.ResourceUpdateState(ruState.String)
+
+	// Parse ResourceUpdate timestamps (TIMESTAMP columns)
+	if ruStartTs.Valid && ruStartTs.String != "" {
+		if ts, err := time.Parse(time.RFC3339Nano, ruStartTs.String); err == nil {
+			ru.StartTs = ts.UTC()
+		} else if ts, err := time.Parse("2006-01-02 15:04:05.999999999-07:00", ruStartTs.String); err == nil {
+			ru.StartTs = ts.UTC()
+		}
+	}
+	if ruModifiedTs.Valid && ruModifiedTs.String != "" {
+		if ts, err := time.Parse(time.RFC3339Nano, ruModifiedTs.String); err == nil {
+			ru.ModifiedTs = ts.UTC()
+		} else if ts, err := time.Parse("2006-01-02 15:04:05.999999999-07:00", ruModifiedTs.String); err == nil {
+			ru.ModifiedTs = ts.UTC()
+		}
+	}
+
+	if ruRetries.Valid {
+		ru.Retries = uint16(ruRetries.Int64)
+	}
+	if ruRemaining.Valid {
+		ru.Remaining = int16(ruRemaining.Int64)
+	}
+	ru.Version = ruVersion.String
+	ru.StackLabel = ruStackLabel.String
+	ru.GroupID = ruGroupID.String
+	ru.Source = resource_update.FormaCommandSource(ruSource.String)
+
+	if len(resourceJSON) > 0 {
+		if err := json.Unmarshal(resourceJSON, &ru.DesiredState); err != nil {
+			return nil, nil, fmt.Errorf("failed to unmarshal resource: %w", err)
+		}
+		ru.DesiredState.Ksuid = ruKsuid.String
+	}
+	if len(resourceTargetJSON) > 0 {
+		if err := json.Unmarshal(resourceTargetJSON, &ru.ResourceTarget); err != nil {
+			return nil, nil, fmt.Errorf("failed to unmarshal resource target: %w", err)
+		}
+	}
+	if len(existingResourceJSON) > 0 {
+		if err := json.Unmarshal(existingResourceJSON, &ru.PriorState); err != nil {
+			return nil, nil, fmt.Errorf("failed to unmarshal existing resource: %w", err)
+		}
+	}
+	if len(existingTargetJSON) > 0 {
+		if err := json.Unmarshal(existingTargetJSON, &ru.ExistingTarget); err != nil {
+			return nil, nil, fmt.Errorf("failed to unmarshal existing target: %w", err)
+		}
+	}
+
+	if len(progressResultJSON) > 0 {
+		if err := json.Unmarshal(progressResultJSON, &ru.ProgressResult); err != nil {
+			return nil, nil, fmt.Errorf("failed to unmarshal progress result: %w", err)
+		}
+	}
+	if len(mostRecentProgressJSON) > 0 {
+		if err := json.Unmarshal(mostRecentProgressJSON, &ru.MostRecentProgressResult); err != nil {
+			return nil, nil, fmt.Errorf("failed to unmarshal most recent progress: %w", err)
+		}
+	}
+	if len(remainingResolvablesJSON) > 0 {
+		if err := json.Unmarshal(remainingResolvablesJSON, &ru.RemainingResolvables); err != nil {
+			return nil, nil, fmt.Errorf("failed to unmarshal remaining resolvables: %w", err)
+		}
+	}
+	if len(referenceLabelsJSON) > 0 {
+		if err := json.Unmarshal(referenceLabelsJSON, &ru.ReferenceLabels); err != nil {
+			return nil, nil, fmt.Errorf("failed to unmarshal reference labels: %w", err)
+		}
+	}
+
+	ru.PreviousProperties = previousPropertiesJSON
+
+	if ruIsCascade.Valid {
+		ru.IsCascade = ruIsCascade.Int64 != 0
+	}
+	if ruCascadeSource.Valid {
+		ru.CascadeSource = ruCascadeSource.String
+	}
+	if ruFailureReason.Valid {
+		ru.FailureReason = ruFailureReason.String
+	}
+	if len(ruProvenanceRecords) > 0 {
+		if err := json.Unmarshal(ruProvenanceRecords, &ru.ProvenanceRecords); err != nil {
+			return nil, nil, fmt.Errorf("failed to unmarshal provenance records: %w", err)
+		}
+	}
+	if len(ruResolvedRootDigests) > 0 {
+		if err := json.Unmarshal(ruResolvedRootDigests, &ru.ResolvedRootDigests); err != nil {
+			return nil, nil, fmt.Errorf("failed to unmarshal resolved root digests: %w", err)
+		}
+	}
+
+	return &cmd, &ru, nil
+}
+
+// loadFormaCommandsFromJoinedRows processes rows from a LEFT JOIN query and groups ResourceUpdates by command.
+// This is the preferred method as it uses a single query and allows safe use of defer rows.Close().
+func loadFormaCommandsFromJoinedRows(rows *sql.Rows) ([]*forma_command.FormaCommand, error) {
+	defer func() { _ = rows.Close() }()
+
+	// Use a map to collect ResourceUpdates for each command
+	commandMap := make(map[string]*forma_command.FormaCommand)
+	var commandOrder []string // Preserve order
+
+	for rows.Next() {
+		cmd, ru, err := scanJoinedRow(rows)
+		if err != nil {
+			return nil, err
+		}
+
+		existing, found := commandMap[cmd.ID]
+		if !found {
+			commandMap[cmd.ID] = cmd
+			commandOrder = append(commandOrder, cmd.ID)
+			existing = cmd
+		}
+
+		if ru != nil {
+			existing.ResourceUpdates = append(existing.ResourceUpdates, *ru)
+		}
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
+	// Return commands in original order
+	result := make([]*forma_command.FormaCommand, 0, len(commandOrder))
+	for _, id := range commandOrder {
+		result = append(result, commandMap[id])
+	}
+
+	return result, nil
+}
+
+func (d DatastoreSQLite) LoadFormaCommands() ([]*forma_command.FormaCommand, error) {
+	_, span := sqliteTracer.Start(context.Background(), "LoadFormaCommands")
+	defer span.End()
+
+	rows, err := d.conn.Query(formaCommandWithResourceUpdatesQueryBase + resourceUpdateOrderBy)
+	if err != nil {
+		return nil, err
+	}
+	return loadFormaCommandsFromJoinedRows(rows)
+}
+
+func (d DatastoreSQLite) LoadIncompleteFormaCommands() ([]*forma_command.FormaCommand, error) {
+	_, span := sqliteTracer.Start(context.Background(), "LoadIncompleteFormaCommands")
+	defer span.End()
+
+	query := formaCommandWithResourceUpdatesQueryBase + " WHERE fc.command != 'sync' AND fc.state IN (?, ?)" + resourceUpdateOrderBy
+	rows, err := d.conn.Query(query, forma_command.CommandStateNotStarted, forma_command.CommandStateInProgress)
+	if err != nil {
+		return nil, err
+	}
+	return loadFormaCommandsFromJoinedRows(rows)
+}
+
+func (d DatastoreSQLite) DeleteFormaCommand(fa *forma_command.FormaCommand, commandID string) error {
+	slog.Debug("SQLite START", "method", "DeleteFormaCommand", "commandID", commandID)
+	start := time.Now()
+	defer func() {
+		slog.Debug("SQLite END", "method", "DeleteFormaCommand", "commandID", commandID, "duration", time.Since(start))
+	}()
+	_, span := sqliteTracer.Start(context.Background(), "DeleteFormaCommand")
+	defer span.End()
+
+	// Delete resource_updates first (no FK constraint, so we must do this manually)
+	_, err := d.conn.Exec("DELETE FROM resource_updates WHERE command_id = ?", commandID)
+	if err != nil {
+		return fmt.Errorf("failed to delete resource_updates: %w", err)
+	}
+	if _, err = d.conn.Exec("DELETE FROM command_stacks WHERE command_id = ?", commandID); err != nil {
+		return err
+	}
+
+	query := fmt.Sprintf("DELETE FROM %s WHERE command_id = ?", datastore.CommandsTable)
+	_, err = d.conn.Exec(query, commandID)
+	return err
+}
+
+func (d DatastoreSQLite) GetFormaCommandByCommandID(commandID string) (*forma_command.FormaCommand, error) {
+	slog.Debug("SQLite START", "method", "GetFormaCommandByCommandID", "commandID", commandID)
+	start := time.Now()
+	defer func() {
+		slog.Debug("SQLite END", "method", "GetFormaCommandByCommandID", "commandID", commandID, "duration", time.Since(start))
+	}()
+	_, span := sqliteTracer.Start(context.Background(), "GetFormaCommandByCommandID")
+	defer span.End()
+
+	query := formaCommandWithResourceUpdatesQueryBase + " WHERE fc.command_id = ?" + resourceUpdateOrderBy
+	rows, err := d.conn.Query(query, commandID)
+	if err != nil {
+		return nil, err
+	}
+	commands, err := loadFormaCommandsFromJoinedRows(rows)
+	if err != nil {
+		return nil, err
+	}
+
+	if len(commands) == 0 {
+		return nil, fmt.Errorf("forma command not found: %v", commandID)
+	}
+	return commands[0], nil
+}
+
+func (d DatastoreSQLite) GetMostRecentFormaCommandByClientID(clientID string) (*forma_command.FormaCommand, error) {
+	_, span := sqliteTracer.Start(context.Background(), "GetMostRecentFormaCommandByClientID")
+	defer span.End()
+
+	// Use a subquery to find the most recent command_id, then join with resource_updates
+	query := `
+		SELECT
+			fc.command_id, fc.timestamp, fc.command, fc.state, fc.client_id,
+			fc.description_text, fc.description_confirm, fc.config_mode, fc.config_force, fc.config_simulate,
+			fc.target_updates, fc.stack_updates, fc.policy_updates, fc.modified_ts, fc.source, fc.subject, fc.subject_name,
+			fc.setup_metadata, fc.message, fc.input_properties,
+			(SELECT json_group_array(json_object('ID', cs.stack_id, 'Label', cs.stack_label)) FROM command_stacks cs WHERE cs.command_id = fc.command_id),
+			ru.ksuid, ru.operation, ru.state, ru.start_ts, ru.modified_ts,
+			ru.retries, ru.remaining, ru.version, ru.stack_label, ru.group_id, ru.source,
+			ru.resource, ru.resource_target, ru.existing_resource, ru.existing_target,
+			ru.progress_result, ru.most_recent_progress,
+			ru.remaining_resolvables, ru.reference_labels, ru.previous_properties,
+	ru.is_cascade, ru.cascade_source, ru.failure_reason, ru.provenance_records, ru.resolved_root_digests
+		FROM forma_commands fc
+		LEFT JOIN resource_updates ru ON fc.command_id = ru.command_id
+		WHERE fc.command_id = (
+			SELECT command_id FROM forma_commands
+			WHERE client_id = ? AND source = 'user'
+			ORDER BY timestamp DESC
+			LIMIT 1
+		)
+		ORDER BY ru.ksuid ASC
+	`
+	rows, err := d.conn.Query(query, clientID)
+	if err != nil {
+		return nil, err
+	}
+	commands, err := loadFormaCommandsFromJoinedRows(rows)
+	if err != nil {
+		return nil, err
+	}
+	if len(commands) == 0 {
+		return nil, nil
+	}
+	return commands[0], nil
+}
+
+func (d DatastoreSQLite) GetResourceModificationsSinceLastReconcile(stack string) ([]datastore.ResourceModification, error) {
+	_, span := sqliteTracer.Start(context.Background(), "GetResourceModificationsSinceLastReconcile")
+	defer span.End()
+
+	query := fmt.Sprintf(`
+WITH modification_boundary AS (
+    SELECT
+      fc.timestamp
+    FROM forma_commands fc
+    WHERE
+      fc.config_mode = 'reconcile' AND (fc.source IS NULL OR fc.source IN ('', 'user', 'auto-reconciler', 'stack-expirer')) AND (fc.state IN ('Success', 'Failed') OR fc.state = '' OR fc.state IS NULL)
+      AND (
+        (fc.state IN ('Success', 'Failed') AND EXISTS (SELECT 1 FROM command_stacks cs JOIN stacks current_stack ON current_stack.id = cs.stack_id WHERE cs.command_id = fc.command_id AND current_stack.label = ? AND NOT EXISTS (SELECT 1 FROM stacks newer_stack WHERE newer_stack.label = current_stack.label AND newer_stack.version > current_stack.version)))
+        OR (NOT EXISTS (SELECT 1 FROM command_stacks cs WHERE cs.command_id = fc.command_id AND cs.stack_label = ?)
+            AND EXISTS (SELECT 1 FROM resources r WHERE r.command_id = fc.command_id AND r.stack = ? AND NOT EXISTS (SELECT 1 FROM stacks sa JOIN stacks sb ON sa.label=sb.label AND sa.id != sb.id WHERE sa.label=r.stack)))
+      )
+    ORDER BY
+      fc.timestamp DESC
+    LIMIT 1
+  )
+SELECT DISTINCT
+  T2.type,
+  T2.label,
+  T2.operation,
+  T2.ksuid
+FROM %s AS T1
+JOIN resources AS T2
+  ON T1.command_id = T2.command_id
+WHERE
+  T2.operation != 'reaped' AND (T1.timestamp > (SELECT timestamp FROM modification_boundary)
+ OR (NOT EXISTS (SELECT 1 FROM modification_boundary)
+     AND T1.state IN ('Success','Failed','Canceled')
+     AND EXISTS (SELECT 1 FROM command_stacks candidate_membership
+       JOIN stacks candidate_stack ON candidate_stack.id=candidate_membership.stack_id
+       WHERE candidate_membership.command_id=T1.command_id
+         AND candidate_membership.stack_label=T2.stack AND candidate_stack.label=T2.stack
+         AND NOT EXISTS (SELECT 1 FROM stacks newer_candidate_stack
+           WHERE newer_candidate_stack.label=candidate_stack.label
+             AND newer_candidate_stack.version>candidate_stack.version)))) AND T2.stack = ?
+  ORDER BY T2.ksuid ASC;
+		`, datastore.CommandsTable)
+	rows, err := d.conn.Query(query, stack, stack, stack, stack)
+	if err != nil {
+		return nil, err
+	}
+
+	// Phase 1: collect rows. We must fully drain and close rows before opening
+	// secondary queries, because SQLite uses a single connection and a concurrent
+	// QueryRow while rows is open will deadlock waiting for that connection.
+	type rawRow struct {
+		resourceType string
+		label        string
+		operation    string
+		ksuid        string
+	}
+	var raw []rawRow
+	for rows.Next() {
+		var r rawRow
+		if err := rows.Scan(&r.resourceType, &r.label, &r.operation, &r.ksuid); err != nil {
+			closeRows(rows)
+			return nil, err
+		}
+		raw = append(raw, r)
+	}
+	if err := rows.Err(); err != nil {
+		closeRows(rows)
+		return nil, err
+	}
+	closeRows(rows)
+
+	// Phase 2: for update ops, fetch properties via secondary queries (rows is now closed).
+	var modifications []datastore.ResourceModification
+	for _, r := range raw {
+		mod := datastore.ResourceModification{
+			Stack:     stack,
+			Type:      r.resourceType,
+			Label:     r.label,
+			Operation: r.operation,
+			Ksuid:     r.ksuid,
+		}
+		if r.operation == "update" {
+			curProps, propErr := d.fetchCurrentProperties(r.ksuid)
+			if propErr != nil {
+				return nil, fmt.Errorf("failed to fetch current properties for %s: %w", r.ksuid, propErr)
+			}
+			oldProps, propErr := d.fetchReconcileProperties(r.ksuid, stack)
+			if propErr != nil {
+				return nil, fmt.Errorf("failed to fetch reconcile properties for %s: %w", r.ksuid, propErr)
+			}
+			mod.Properties = curProps
+			mod.OldProperties = oldProps
+		}
+		modifications = append(modifications, mod)
+	}
+
+	return modifications, nil
+}
+
+// GetPropertiesAtLastWrite returns the resource's per-field write witness,
+// composed from its genuine-write history (see datastore.ComposeWriteWitness):
+// the newest create/replace echo is the base and each later apply-owned
+// update overlays only the fields its patch wrote. Sync and discovery
+// versions, metadata-only applies (empty patch), and fields an update's echo
+// merely carried along never enter the witness. History is bounded to the
+// most recent writes; a resource whose create falls outside the bound has no
+// witness, which classifies its movement as tolerated.
+func (d DatastoreSQLite) GetPropertiesAtLastWrite(ksuid string) (json.RawMessage, error) {
+	_, span := sqliteTracer.Start(context.Background(), "GetPropertiesAtLastWrite")
+	defer span.End()
+
+	query := `
+SELECT json_extract(r.data, '$.Properties'), ru.operation, json_extract(ru.resource, '$.PatchDocument')
+FROM resources r
+JOIN forma_commands fc ON fc.command_id = r.command_id
+JOIN resource_updates ru ON ru.command_id = r.command_id AND ru.ksuid = r.ksuid
+WHERE r.ksuid = ?
+AND fc.command = 'apply'
+AND r.operation != 'delete' AND r.operation != 'reaped'
+AND (ru.operation != 'update'
+	OR (json_extract(ru.resource, '$.PatchDocument') IS NOT NULL
+		AND json_extract(ru.resource, '$.PatchDocument') != '[]'))
+ORDER BY r.version DESC
+LIMIT 25
+`
+	rows, err := d.conn.Query(query, ksuid)
+	if err != nil {
+		return nil, err
+	}
+	defer closeRows(rows)
+
+	var history []datastore.WriteVersion
+	for rows.Next() {
+		var props, op, patch sql.NullString
+		if err := rows.Scan(&props, &op, &patch); err != nil {
+			return nil, err
+		}
+		v := datastore.WriteVersion{Operation: op.String}
+		if props.Valid {
+			v.Properties = json.RawMessage(props.String)
+		}
+		if patch.Valid {
+			v.Patch = json.RawMessage(patch.String)
+		}
+		history = append(history, v)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return datastore.ComposeWriteWitness(history), nil
+}
+
+// GetOwnedMembers returns the resource's stored ownership record from the
+// latest resource row (see datastore.Datastore.GetOwnedMembers).
+func (d DatastoreSQLite) GetOwnedMembers(ksuid string) (pkgmodel.OwnedMembers, error) {
+	_, span := sqliteTracer.Start(context.Background(), "GetOwnedMembers")
+	defer span.End()
+
+	query := `
+SELECT json_extract(data, '$.OwnedMembers')
+FROM resources
+WHERE ksuid = ?
+ORDER BY version DESC
+LIMIT 1
+`
+	var raw sql.NullString
+	if err := d.conn.QueryRow(query, ksuid).Scan(&raw); err != nil {
+		if err == sql.ErrNoRows {
+			return nil, nil
+		}
+		return nil, err
+	}
+	if !raw.Valid || raw.String == "" || raw.String == "null" {
+		return nil, nil
+	}
+	var owned pkgmodel.OwnedMembers
+	if err := json.Unmarshal([]byte(raw.String), &owned); err != nil {
+		return nil, err
+	}
+	return owned, nil
+}
+
+// fetchCurrentProperties returns the Properties JSON from the latest resource version for the given ksuid.
+func (d DatastoreSQLite) fetchCurrentProperties(ksuid string) (json.RawMessage, error) {
+	query := `
+SELECT json_extract(data, '$.Properties')
+FROM resources
+WHERE ksuid = ?
+ORDER BY version DESC
+LIMIT 1
+`
+	var props sql.NullString
+	if err := d.conn.QueryRow(query, ksuid).Scan(&props); err != nil {
+		if err == sql.ErrNoRows {
+			return nil, nil
+		}
+		return nil, err
+	}
+	if !props.Valid || props.String == "" {
+		return nil, nil
+	}
+	return json.RawMessage(props.String), nil
+}
+
+// fetchReconcileProperties returns the Properties JSON of the resource version
+// that was current as of the most recent reconcile command for the given stack:
+// the latest version whose owning command does not postdate that reconcile.
+// A resource untouched by the last reconcile (no new version row) still
+// resolves to the version it had when that reconcile ran.
+func (d DatastoreSQLite) fetchReconcileProperties(ksuid, stack string) (json.RawMessage, error) {
+	query := `
+WITH boundary AS (
+  SELECT fc.command_id, fc.timestamp FROM forma_commands fc
+  WHERE fc.config_mode = 'reconcile' AND (fc.source IS NULL OR fc.source IN ('', 'user', 'auto-reconciler', 'stack-expirer')) AND (fc.state IN ('Success', 'Failed') OR fc.state = '' OR fc.state IS NULL)
+    AND ((fc.state IN ('Success', 'Failed') AND EXISTS (SELECT 1 FROM command_stacks cs JOIN stacks current_stack ON current_stack.id = cs.stack_id WHERE cs.command_id = fc.command_id AND current_stack.label = ? AND NOT EXISTS (SELECT 1 FROM stacks newer_stack WHERE newer_stack.label = current_stack.label AND newer_stack.version > current_stack.version)))
+      OR (NOT EXISTS (SELECT 1 FROM command_stacks cs WHERE cs.command_id = fc.command_id AND cs.stack_label = ?)
+        AND EXISTS (SELECT 1 FROM resources rr WHERE rr.command_id = fc.command_id AND rr.stack = ? AND NOT EXISTS (SELECT 1 FROM stacks sa JOIN stacks sb ON sa.label=sb.label AND sa.id != sb.id WHERE sa.label=rr.stack))))
+  ORDER BY fc.timestamp DESC LIMIT 1
+), accepted AS (
+ SELECT json_extract(observed.data, '$.Properties') properties, CASE WHEN observed.ksuid IS NULL THEN 0 ELSE 1 END AS observation_exists FROM resource_updates ru
+ JOIN boundary b ON b.command_id = ru.command_id
+ LEFT JOIN resources observed ON observed.ksuid = ru.ksuid AND observed.version = ru.version
+ WHERE ru.ksuid = ? AND ru.operation = 'accept' LIMIT 1
+), previous AS (
+ SELECT json_extract(r.data, '$.Properties') properties FROM resources r
+ JOIN forma_commands fc_r ON fc_r.command_id = r.command_id
+ JOIN boundary b ON 1=1
+ WHERE r.ksuid = ? AND fc_r.timestamp <= b.timestamp
+ ORDER BY r.version DESC LIMIT 1
+)
+SELECT properties, 1 AS accepted, observation_exists FROM accepted
+UNION ALL
+SELECT properties, 0 AS accepted, 1 AS observation_exists FROM previous WHERE NOT EXISTS (SELECT 1 FROM accepted)
+`
+	var accepted, observationExists int
+	var props sql.NullString
+	if err := d.conn.QueryRow(query, stack, stack, stack, ksuid, ksuid).Scan(&props, &accepted, &observationExists); err != nil {
+		if err == sql.ErrNoRows {
+			return nil, nil
+		}
+		return nil, err
+	}
+	if accepted == 1 && observationExists == 0 {
+		return nil, fmt.Errorf("accepted observation version missing for resource %s", ksuid)
+	}
+	if !props.Valid || props.String == "" {
+		return nil, nil
+	}
+	return json.RawMessage(props.String), nil
+}
+
+func (d DatastoreSQLite) Close() {
+	if err := d.conn.Close(); err != nil {
+		slog.Error("Error closing database connection", "error", err)
+	}
+}
+
+func closeRows(rows *sql.Rows) {
+	if err := rows.Close(); err != nil {
+		slog.Error("Error closing database rows", "error", err)
+	}
+}
+
+// extendSQLiteQueryString appends a WHERE clause to queryStr for the given
+// query item.
+//
+// sqlPart is a template that takes one %s — the comparison operator — and
+// includes a literal `?` placeholder. Examples:
+//
+//	" AND command_id %s ?"
+//	" AND LOWER(command) %s LOWER(?)"
+//	" AND EXISTS (SELECT 1 FROM resource_updates ru ... AND ru.stack_label %s ?)"
+//
+// For multi-valued items (Item + ExtraItems) the inner clause is replicated
+// once per value and joined with OR (or AND when the constraint is Excluded
+// — i.e. -stack:a -stack:b means "neither a nor b").
+//
+// String values may carry leading or trailing `*` for wildcard matching:
+// `foo*` → `LIKE 'foo%'`, `*foo` → `LIKE '%foo'`. Internal `_` and `%` in the
+// matched value are escaped with `\` (paired with `ESCAPE '\'` on the LIKE).
+func extendSQLiteQueryString[T any](queryStr string, queryItem *datastore.QueryItem[T], sqlPart string, args *[]any) string {
+	if queryItem == nil {
+		return queryStr
+	}
+
+	values := allQueryItemValues(queryItem)
+	if len(values) == 0 {
+		return queryStr
+	}
+
+	isExcluded := queryItem.Constraint == datastore.Excluded
+
+	// Single value: keep the original template-driven path. Avoids reformatting
+	// when no multi-value or wildcard handling is needed.
+	if len(values) == 1 {
+		op, operand, isLike := sqlOpAndOperand(values[0], isExcluded)
+		clause := resolveEscapeMarker(fmt.Sprintf(sqlPart, op), isLike)
+		queryStr += clause
+		*args = append(*args, operand)
+		return queryStr
+	}
+
+	// Multi-value: replicate the template's inner clause once per value, join
+	// with OR (or AND for Excluded), wrap in parens, and re-prepend " AND ".
+	innerTemplate := strings.TrimPrefix(sqlPart, " AND ")
+	clauses := make([]string, 0, len(values))
+	for _, v := range values {
+		op, operand, isLike := sqlOpAndOperand(v, isExcluded)
+		clause := resolveEscapeMarker(fmt.Sprintf(innerTemplate, op), isLike)
+		clauses = append(clauses, clause)
+		*args = append(*args, operand)
+	}
+
+	glue := " OR "
+	if isExcluded {
+		glue = " AND "
+	}
+	return queryStr + " AND (" + strings.Join(clauses, glue) + ")"
+}
+
+// allQueryItemValues flattens a QueryItem's Item and ExtraItems into a single
+// slice. Returns []any to handle both string and bool fields uniformly.
+func allQueryItemValues[T any](qi *datastore.QueryItem[T]) []any {
+	values := make([]any, 0, 1+len(qi.ExtraItems))
+	values = append(values, any(qi.Item))
+	for _, e := range qi.ExtraItems {
+		values = append(values, any(e))
+	}
+	return values
+}
+
+// sqlOpAndOperand resolves the SQL operator and bound value for one query
+// term, accounting for exclusion and `*` wildcards on strings. Any `*` in
+// the value (anywhere) flips the operator to LIKE and translates to `%`.
+// The third return value is whether the operator uses LIKE (vs =).
+func sqlOpAndOperand(v any, isExcluded bool) (op string, operand any, isLike bool) {
+	s, isString := v.(string)
+	if !isString {
+		// Bool path mirrors the original switch: true→"1", false→"0".
+		if b, ok := v.(bool); ok {
+			if b {
+				return eqOp(isExcluded), "1", false
+			}
+			return eqOp(isExcluded), "0", false
+		}
+		return eqOp(isExcluded), fmt.Sprintf("%v", v), false
+	}
+
+	if !strings.Contains(s, "*") {
+		return eqOp(isExcluded), s, false
+	}
+
+	likeOp := "LIKE"
+	if isExcluded {
+		likeOp = "NOT LIKE"
+	}
+	return likeOp, sqlLikePattern(s), true
+}
+
+func eqOp(isExcluded bool) string {
+	if isExcluded {
+		return "!="
+	}
+	return "="
+}
+
+// escapeMarker is the sentinel placed in `sqlPart` templates at the exact
+// position where the LIKE ESCAPE clause must land — immediately after the
+// LIKE pattern expression. Templates without a LIKE position simply omit it.
+// For LIKE clauses we substitute the actual ESCAPE fragment; for `=` we
+// substitute an empty string.
+//
+// This indirection exists because SQLite has no default escape character for
+// LIKE (https://www.sqlite.org/lang_expr.html#like) and the ESCAPE clause's
+// correct position varies by template:
+//   - bare:        `... ru.stack_label LIKE ?{esc})`  → after `?`, BEFORE `)`
+//   - LOWER-wrap:  `... LOWER(type) LIKE LOWER(?){esc}` → after `LOWER(?)`
+//
+// A naive trailing append or `?` replace gets one of these wrong.
+const escapeMarker = "{esc}"
+
+const sqliteLikeEscapeSuffix = ` ESCAPE '\'`
+
+// resolveEscapeMarker substitutes the escapeMarker in clause with either the
+// ESCAPE suffix (when isLike) or an empty string.
+func resolveEscapeMarker(clause string, isLike bool) string {
+	if isLike {
+		return strings.ReplaceAll(clause, escapeMarker, sqliteLikeEscapeSuffix)
+	}
+	return strings.ReplaceAll(clause, escapeMarker, "")
+}
+
+// sqlLikePattern translates every `*` in s into a SQL LIKE `%`. Any literal
+// `%`, `_`, or `\` in the user value is escaped with `\` so it matches as a
+// literal char. The emitted clause must be paired with `ESCAPE '\'` — see
+// sqliteLikeEscapeSuffix.
+func sqlLikePattern(s string) string {
+	escaped := strings.ReplaceAll(s, "\\", "\\\\")
+	escaped = strings.ReplaceAll(escaped, "%", "\\%")
+	escaped = strings.ReplaceAll(escaped, "_", "\\_")
+	return strings.ReplaceAll(escaped, "*", "%")
+}
+
+func (d DatastoreSQLite) QueryFormaCommands(query *datastore.StatusQuery) ([]*forma_command.FormaCommand, error) {
+	_, span := sqliteTracer.Start(context.Background(), "QueryFormaCommands")
+	defer span.End()
+
+	// Build subquery to find matching command IDs with filtering and LIMIT
+	subqueryStr := "SELECT command_id FROM forma_commands WHERE 1=1"
+	args := []any{}
+
+	subqueryStr = extendSQLiteQueryString(subqueryStr, query.CommandID, " AND command_id %s ?{esc}", &args)
+	subqueryStr = extendSQLiteQueryString(subqueryStr, query.ClientID, " AND client_id %s ?{esc}", &args)
+	subqueryStr = extendSQLiteQueryString(subqueryStr, query.Command, " AND LOWER(command) %s LOWER(?){esc}", &args)
+	subqueryStr = extendSQLiteQueryString(subqueryStr, query.Source, " AND source %s ?{esc}", &args)
+
+	// Stack filter uses the normalized resource_updates table
+	subqueryStr = extendSQLiteQueryString(subqueryStr, query.Stack, " AND EXISTS (SELECT 1 FROM (SELECT command_id, stack_label FROM resource_updates UNION SELECT command_id, stack_label FROM command_stacks) ru WHERE ru.command_id = forma_commands.command_id AND ru.stack_label %s ?{esc})", &args)
+	subqueryStr = extendSQLiteQueryString(subqueryStr, query.Status, " AND LOWER(state) %s LOWER(?){esc}", &args)
+	subqueryStr = extendSQLiteQueryString(subqueryStr, query.Subject, " AND subject %s ?{esc}", &args)
+	subqueryStr = extendSQLiteQueryString(subqueryStr, query.SubjectName, " AND subject_name %s ?{esc}", &args)
+
+	subqueryStr += " ORDER BY timestamp DESC"
+	if query.N > 0 {
+		subqueryStr += " LIMIT ?"
+		args = append(args, query.N)
+	} else {
+		subqueryStr += fmt.Sprintf(" LIMIT %d", datastore.DefaultFormaCommandsQueryLimit)
+	}
+
+	// Main query joins with resource_updates for commands matching the subquery
+	queryStr := fmt.Sprintf(`
+		SELECT
+			fc.command_id, fc.timestamp, fc.command, fc.state, fc.client_id,
+			fc.description_text, fc.description_confirm, fc.config_mode, fc.config_force, fc.config_simulate,
+			fc.target_updates, fc.stack_updates, fc.policy_updates, fc.modified_ts, fc.source, fc.subject, fc.subject_name,
+			fc.setup_metadata, fc.message, fc.input_properties,
+			(SELECT json_group_array(json_object('ID', cs.stack_id, 'Label', cs.stack_label)) FROM command_stacks cs WHERE cs.command_id = fc.command_id),
+			ru.ksuid, ru.operation, ru.state, ru.start_ts, ru.modified_ts,
+			ru.retries, ru.remaining, ru.version, ru.stack_label, ru.group_id, ru.source,
+			ru.resource, ru.resource_target, ru.existing_resource, ru.existing_target,
+			ru.progress_result, ru.most_recent_progress,
+			ru.remaining_resolvables, ru.reference_labels, ru.previous_properties,
+	ru.is_cascade, ru.cascade_source, ru.failure_reason, ru.provenance_records, ru.resolved_root_digests
+		FROM forma_commands fc
+		LEFT JOIN resource_updates ru ON fc.command_id = ru.command_id
+		WHERE fc.command_id IN (%s)
+		ORDER BY fc.timestamp DESC, ru.ksuid ASC
+	`, subqueryStr)
+
+	rows, err := d.conn.Query(queryStr, args...)
+	if err != nil {
+		return nil, err
+	}
+	return loadFormaCommandsFromJoinedRows(rows)
+}
+
+func (d DatastoreSQLite) QueryResources(query *datastore.ResourceQuery) ([]*pkgmodel.Resource, error) {
+	_, span := sqliteTracer.Start(context.Background(), "QueryResources")
+	defer span.End()
+
+	queryStr := fmt.Sprintf(`
+		SELECT data, ksuid
+		FROM resources r1
+		WHERE NOT EXISTS (
+		SELECT 1
+		FROM resources r2
+		WHERE r1.uri = r2.uri
+		AND r2.version > r1.version
+		)
+		AND r1.operation != '%s'
+		AND r1.operation != '%s'`, string(resource_update.OperationDelete), string(resource_update.OperationReaped))
+	args := []any{}
+
+	queryStr = extendSQLiteQueryString(queryStr, query.NativeID, " AND native_id %s ?{esc}", &args)
+	queryStr = extendSQLiteQueryString(queryStr, query.Stack, " AND stack %s ?{esc}", &args)
+	queryStr = extendSQLiteQueryString(queryStr, query.Type, " AND LOWER(type) %s LOWER(?){esc}", &args)
+	queryStr = extendSQLiteQueryString(queryStr, query.Label, " AND label %s ?{esc}", &args)
+	queryStr = extendSQLiteQueryString(queryStr, query.Target, " AND target %s ?{esc}", &args)
+	queryStr = extendSQLiteQueryString(queryStr, query.Managed, " AND managed %s ?{esc}", &args)
+	queryStr += " ORDER BY type, label"
+
+	rows, err := d.conn.Query(queryStr, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer closeRows(rows)
+
+	var resources []*pkgmodel.Resource
+	for rows.Next() {
+		var jsonData, ksuid string
+		if err := rows.Scan(&jsonData, &ksuid); err != nil {
+			return nil, err
+		}
+
+		var resource pkgmodel.Resource
+		if err := json.Unmarshal([]byte(jsonData), &resource); err != nil {
+			return nil, err
+		}
+
+		// Set the KSUID field from the database
+		resource.Ksuid = ksuid
+
+		resources = append(resources, &resource)
+	}
+
+	return resources, rows.Err()
+}
+
+func (d DatastoreSQLite) ListResourceSummaries(q *datastore.ResourceQuery) ([]pkgmodel.ResourceSummary, error) {
+	_, span := sqliteTracer.Start(context.Background(), "ListResourceSummaries")
+	defer span.End()
+
+	queryStr := fmt.Sprintf(`
+		SELECT label, stack, type, native_id, ksuid
+		FROM resources r1
+		WHERE NOT EXISTS (
+		SELECT 1
+		FROM resources r2
+		WHERE r1.uri = r2.uri
+		AND r2.version > r1.version
+		)
+		AND r1.operation != '%s'
+		AND r1.operation != '%s'`, string(resource_update.OperationDelete), string(resource_update.OperationReaped))
+	args := []any{}
+
+	queryStr = extendSQLiteQueryString(queryStr, q.NativeID, " AND native_id %s ?{esc}", &args)
+	queryStr = extendSQLiteQueryString(queryStr, q.Stack, " AND stack %s ?{esc}", &args)
+	queryStr = extendSQLiteQueryString(queryStr, q.Type, " AND LOWER(type) %s LOWER(?){esc}", &args)
+	queryStr = extendSQLiteQueryString(queryStr, q.Label, " AND label %s ?{esc}", &args)
+	queryStr = extendSQLiteQueryString(queryStr, q.Target, " AND target %s ?{esc}", &args)
+	queryStr = extendSQLiteQueryString(queryStr, q.Managed, " AND managed %s ?{esc}", &args)
+	queryStr += " ORDER BY type, label"
+
+	rows, err := d.conn.Query(queryStr, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer closeRows(rows)
+
+	var summaries []pkgmodel.ResourceSummary
+	for rows.Next() {
+		var s pkgmodel.ResourceSummary
+		if err := rows.Scan(&s.Label, &s.Stack, &s.Type, &s.NativeID, &s.Ksuid); err != nil {
+			return nil, err
+		}
+		summaries = append(summaries, s)
+	}
+
+	return summaries, rows.Err()
+}
+
+func (d DatastoreSQLite) storeResource(resource *pkgmodel.Resource, data []byte, commandID string, operation string, expectedIncarnation string) (string, error) {
+	slog.Debug("SQLite START", "method", "storeResource", "ksuid", resource.Ksuid, "label", resource.Label, "operation", operation)
+	start := time.Now()
+	defer func() {
+		slog.Debug("SQLite END", "method", "storeResource", "ksuid", resource.Ksuid, "operation", operation, "duration", time.Since(start))
+	}()
+	if resource.Ksuid == "" {
+		existingResource, err := d.LoadResource(resource.URI())
+		if err != nil {
+			return "", err
+		}
+
+		if existingResource != nil {
+			resource.Ksuid = existingResource.Ksuid
+		} else {
+			resource.Ksuid = metautil.NewID()
+		}
+	}
+
+	// Reaped/incarnation guard. Deletes are exempt: a delete tombstone must
+	// always be recordable (e.g. cleaning up an already-reaped resource). For
+	// every other write, inspect the resource's current (max-version) row and
+	// reject the write when that row is a reaped tombstone, or when an expected
+	// incarnation was supplied and does not match the incarnation stamped on the
+	// current row. An empty stored incarnation (pre-migration rows, or rows
+	// written by incarnation-less callers) skips the incarnation check.
+	if operation != string(resource_update.OperationDelete) {
+		var curOp, curInc string
+		guardErr := d.conn.QueryRow(
+			`SELECT operation, COALESCE(target_incarnation_id, '') FROM resources WHERE uri = ? ORDER BY version DESC LIMIT 1`,
+			resource.URI(),
+		).Scan(&curOp, &curInc)
+		if guardErr != nil && guardErr != sql.ErrNoRows {
+			return "", guardErr
+		}
+		if guardErr == nil {
+			if curOp == string(resource_update.OperationReaped) {
+				return "", fmt.Errorf("%w: resource %s current row is reaped", datastore.ErrResourceWriteRejected, resource.URI())
+			}
+			if expectedIncarnation != "" && curInc != "" && curInc != expectedIncarnation {
+				return "", fmt.Errorf("%w: resource %s incarnation %q does not match expected %q",
+					datastore.ErrResourceWriteRejected, resource.URI(), curInc, expectedIncarnation)
+			}
+		}
+	}
+
+	// Check if this resource already exists using native_id and type
+	query := `SELECT ksuid, data, uri, version, managed, target, COALESCE(target_incarnation_id, ''), COALESCE(command_id, '') FROM resources WHERE native_id = ? AND type = ? ORDER BY version DESC LIMIT 1`
+	row := d.conn.QueryRow(query, resource.NativeID, resource.Type)
+
+	var ksuid string
+	var existingData string
+	var uri string
+	var version string
+	var managed int
+	var target string
+	var existingIncarnation string
+	var existingCommandID string
+	err := row.Scan(&ksuid, &existingData, &uri, &version, &managed, &target, &existingIncarnation, &existingCommandID)
+	if err == sql.ErrNoRows {
+		// Resource does not exist, create the initial version
+		newVersion := mksuid.New()
+
+		query = `
+			INSERT INTO resources (uri, version, command_id, operation, native_id, stack, type, label, target, data, managed, ksuid, target_incarnation_id)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		`
+		_, err = d.conn.Exec(
+			query,
+			resource.URI(),
+			newVersion,
+			commandID,
+			operation,
+			resource.NativeID,
+			resource.Stack,
+			resource.Type,
+			resource.Label,
+			resource.Target,
+			data,
+			datastore.BoolToInt(resource.Managed),
+			resource.Ksuid,
+			expectedIncarnation)
+		if err != nil {
+			slog.Error("Failed to store resource", "error", err, "resourceURI", resource.URI())
+			return "", err
+		}
+		return fmt.Sprintf("%s_%s", resource.Ksuid, newVersion), nil
+	} else if err != nil {
+		return "", err
+	}
+
+	// It can happen in rare cases that the resource existed on the unmanaged stack. This happens when a resource is discovered
+	// before the create operation completes. In this case, we preserve the discovered KSUID to maintain referential integrity
+	// for any resources that may have already created references to it.
+	if managed == 0 && operation != string(resource_update.OperationDelete) {
+		// Preserve the discovered KSUID instead of generating a new one
+		slog.Debug("Resource discovered before apply completed, adopting discovered KSUID",
+			"native_id", resource.NativeID,
+			"type", resource.Type,
+			"discovered_ksuid", ksuid,
+			"original_ksuid", resource.Ksuid)
+		resource.Ksuid = ksuid
+		// Don't delete - we'll update the existing resource to managed status
+		// The rest of the function will handle creating a new version with the preserved KSUID
+	}
+
+	// Resource exists, compare with existing data
+	var existingResource pkgmodel.Resource
+	if err = json.Unmarshal([]byte(existingData), &existingResource); err != nil {
+		return "", err
+	}
+
+	readWriteEqual, readOnlyEqual := datastore.ResourcesAreEqual(resource, &existingResource)
+
+	if operation == string(resource_update.OperationDelete) {
+		// For delete operations, check if the latest version is already a delete
+		var latestOperation string
+		query = `SELECT operation FROM resources WHERE uri = ? ORDER BY version DESC LIMIT 1`
+		row = d.conn.QueryRow(query, resource.URI())
+		err = row.Scan(&latestOperation)
+		if err != nil {
+			return "", err
+		}
+
+		if latestOperation == string(resource_update.OperationDelete) {
+			// Already deleted, return existing version ID
+			return fmt.Sprintf("%s_%s", resource.Ksuid, version), nil
+		}
+	} else {
+		// For non-delete operations, compare resources
+		if readWriteEqual && readOnlyEqual && resource.Ksuid == ksuid {
+			// Resource data is identical, return existing version ID
+			return fmt.Sprintf("%s_%s", resource.Ksuid, version), nil
+		}
+	}
+
+	// We only create a new version if the read-write properties have changed. Read-only property changes do not
+	// trigger a new version but instead update the existing.
+	var newVersion string
+	if operation != string(resource_update.OperationDelete) && readWriteEqual && !readOnlyEqual {
+		newVersion = version
+	} else {
+		newVersion = mksuid.New().String()
+	}
+
+	// A synchronizer read that changes only provider-observed fields refreshes
+	// the existing physical version. Keep that version owned by the command that
+	// created it so pruning the transient read cannot erase write/drift history.
+	// Other callers, missing commands, and metadata changes keep the incoming
+	// attribution conservatively.
+	if newVersion == version && resource.Ksuid == ksuid && resource.Target == target && datastore.BoolToInt(resource.Managed) == managed {
+		var incomingCommand, incomingSource string
+		lookupErr := d.conn.QueryRow(
+			`SELECT command, COALESCE(source, '') FROM forma_commands WHERE command_id = ?`,
+			commandID,
+		).Scan(&incomingCommand, &incomingSource)
+		if lookupErr != nil && lookupErr != sql.ErrNoRows {
+			return "", lookupErr
+		}
+		if lookupErr == nil && incomingCommand == string(pkgmodel.CommandSync) && incomingSource == string(forma_command.SourceSynchronizer) {
+			commandID = existingCommandID
+			if expectedIncarnation == "" {
+				expectedIncarnation = existingIncarnation
+			}
+		}
+	}
+
+	query = `
+		INSERT OR REPLACE INTO resources (uri, version, command_id, operation, native_id, stack, type, label, target, data, managed, ksuid, target_incarnation_id)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`
+	_, err = d.conn.Exec(
+		query,
+		resource.URI(),
+		newVersion,
+		commandID,
+		operation,
+		resource.NativeID,
+		resource.Stack,
+		resource.Type,
+		resource.Label,
+		resource.Target,
+		data,
+		datastore.BoolToInt(resource.Managed),
+		resource.Ksuid,
+		expectedIncarnation)
+	if err != nil {
+		slog.Error("Failed to store resource", "error", err, "resourceURI", resource.URI())
+		return "", err
+	}
+
+	return fmt.Sprintf("%s_%s", resource.Ksuid, newVersion), nil
+}
+
+func (d DatastoreSQLite) StoreResource(resource *pkgmodel.Resource, commandID string, expectedIncarnation ...string) (string, error) {
+	slog.Debug("SQLite START", "method", "StoreResource", "ksuid", resource.Ksuid, "label", resource.Label)
+	start := time.Now()
+	defer func() {
+		slog.Debug("SQLite END", "method", "StoreResource", "ksuid", resource.Ksuid, "duration", time.Since(start))
+	}()
+	_, span := sqliteTracer.Start(context.Background(), "StoreResource")
+	defer span.End()
+
+	jsonData, err := json.Marshal(resource)
+	if err != nil {
+		return "", err
+	}
+
+	inc := ""
+	if len(expectedIncarnation) > 0 {
+		inc = expectedIncarnation[0]
+	}
+	return d.storeResource(resource, jsonData, commandID, string(resource_update.OperationUpdate), inc)
+}
+
+func (d DatastoreSQLite) DeleteResource(resource *pkgmodel.Resource, commandID string) (string, error) {
+	slog.Debug("SQLite START", "method", "DeleteResource", "ksuid", resource.Ksuid, "label", resource.Label)
+	start := time.Now()
+	defer func() {
+		slog.Debug("SQLite END", "method", "DeleteResource", "ksuid", resource.Ksuid, "duration", time.Since(start))
+	}()
+	_, span := sqliteTracer.Start(context.Background(), "DeleteResource")
+	defer span.End()
+
+	return d.storeResource(resource, []byte("{}"), commandID, string(resource_update.OperationDelete), "")
+}
+
+func (d DatastoreSQLite) LoadResource(uri pkgmodel.FormaeURI) (*pkgmodel.Resource, error) {
+	_, span := sqliteTracer.Start(context.Background(), "LoadResource")
+	defer span.End()
+
+	query := `
+	SELECT data, ksuid, version
+	FROM resources
+	WHERE uri = ?
+	AND operation != ? AND operation != 'reaped'
+	ORDER BY version DESC
+	LIMIT 1
+	`
+	row := d.conn.QueryRow(query, uri, resource_update.OperationDelete)
+
+	var jsonData string
+	var ksuid string
+	var version string
+	if err := row.Scan(&jsonData, &ksuid, &version); err != nil {
+		if err == sql.ErrNoRows {
+			return nil, nil // Resource not found, return nil without error
+		}
+		return nil, err
+	}
+
+	var loadedResource pkgmodel.Resource
+	if err := json.Unmarshal([]byte(jsonData), &loadedResource); err != nil {
+		return nil, err
+	}
+
+	loadedResource.Ksuid = ksuid
+	loadedResource.Version = version
+
+	return &loadedResource, nil
+}
+
+func (d DatastoreSQLite) LoadResourceByNativeID(nativeID string, resourceType string) (*pkgmodel.Resource, error) {
+	_, span := sqliteTracer.Start(context.Background(), "LoadResourceByNativeID")
+	defer span.End()
+
+	query := `
+	SELECT data, ksuid
+	FROM resources r1
+	WHERE native_id = ? AND type = ?
+	AND NOT EXISTS (
+		SELECT 1
+		FROM resources r2
+		WHERE r1.uri = r2.uri
+		AND r2.version > r1.version
+	)
+	AND r1.operation != ? AND r1.operation != 'reaped'
+	LIMIT 1
+	`
+	row := d.conn.QueryRow(query, nativeID, resourceType, resource_update.OperationDelete)
+
+	var jsonData string
+	var ksuid string
+	if err := row.Scan(&jsonData, &ksuid); err != nil {
+		if err == sql.ErrNoRows {
+			return nil, nil
+		}
+		return nil, err
+	}
+
+	var loadedResource pkgmodel.Resource
+	if err := json.Unmarshal([]byte(jsonData), &loadedResource); err != nil {
+		return nil, err
+	}
+
+	loadedResource.Ksuid = ksuid
+	return &loadedResource, nil
+}
+
+func (d DatastoreSQLite) LoadAllResources() ([]*pkgmodel.Resource, error) {
+	_, span := sqliteTracer.Start(context.Background(), "LoadAllResources")
+	defer span.End()
+
+	query := `
+	SELECT data, ksuid
+	FROM resources r1
+	WHERE NOT EXISTS (
+	SELECT 1
+	FROM resources r2
+	WHERE r1.uri = r2.uri
+	AND r2.version > r1.version
+	)
+	AND operation != ? AND operation != 'reaped'
+	`
+	rows, err := d.conn.Query(query, resource_update.OperationDelete)
+	if err != nil {
+		return nil, err
+	}
+	defer closeRows(rows)
+
+	var resources []*pkgmodel.Resource
+	for rows.Next() {
+		var jsonData string
+		var ksuid string
+		if err := rows.Scan(&jsonData, &ksuid); err != nil {
+			return nil, err
+		}
+
+		var resource pkgmodel.Resource
+		if err := json.Unmarshal([]byte(jsonData), &resource); err != nil {
+			return nil, err
+		}
+
+		resource.Ksuid = ksuid
+		resources = append(resources, &resource)
+	}
+
+	return resources, rows.Err()
+}
+
+// LoadReapedResources returns the current-version rows tombstoned with the
+// 'reaped' marker, across all targets. See the Datastore interface for the
+// contract.
+func (d DatastoreSQLite) LoadReapedResources() ([]*pkgmodel.Resource, error) {
+	_, span := sqliteTracer.Start(context.Background(), "LoadReapedResources")
+	defer span.End()
+
+	query := `
+	SELECT data, ksuid
+	FROM resources r1
+	WHERE NOT EXISTS (
+	SELECT 1
+	FROM resources r2
+	WHERE r1.uri = r2.uri
+	AND r2.version > r1.version
+	)
+	AND operation = 'reaped'
+	`
+	rows, err := d.conn.Query(query)
+	if err != nil {
+		return nil, err
+	}
+	defer closeRows(rows)
+
+	var resources []*pkgmodel.Resource
+	for rows.Next() {
+		var jsonData, ksuid string
+		if err := rows.Scan(&jsonData, &ksuid); err != nil {
+			return nil, err
+		}
+
+		var resource pkgmodel.Resource
+		if err := json.Unmarshal([]byte(jsonData), &resource); err != nil {
+			return nil, err
+		}
+
+		resource.Ksuid = ksuid
+		resources = append(resources, &resource)
+	}
+
+	return resources, rows.Err()
+}
+
+func (d DatastoreSQLite) BulkStoreResources(resources []pkgmodel.Resource, commandID string) (string, error) {
+	_, span := sqliteTracer.Start(context.Background(), "BulkStoreResources")
+	defer span.End()
+
+	var ret string
+	var err error
+	for _, resource := range resources {
+		if ret, err = d.StoreResource(&resource, commandID); err != nil {
+			slog.Error("Failed to store resource", "error", err, "resourceURI", resource.URI())
+			return "", err
+		}
+	}
+	return ret, nil
+}
+
+func (d DatastoreSQLite) LoadAllResourceVersions() ([]datastore.ResourceVersion, error) {
+	_, span := sqliteTracer.Start(context.Background(), "LoadAllResourceVersions")
+	defer span.End()
+
+	rows, err := d.conn.Query(`SELECT uri, version, data, ksuid FROM resources`)
+	if err != nil {
+		return nil, err
+	}
+	defer closeRows(rows)
+
+	var versions []datastore.ResourceVersion
+	for rows.Next() {
+		var uri, version, jsonData, ksuid string
+		if err := rows.Scan(&uri, &version, &jsonData, &ksuid); err != nil {
+			return nil, err
+		}
+		var resource pkgmodel.Resource
+		if err := json.Unmarshal([]byte(jsonData), &resource); err != nil {
+			return nil, err
+		}
+		resource.Ksuid = ksuid
+		versions = append(versions, datastore.ResourceVersion{URI: uri, Version: version, Resource: &resource})
+	}
+	return versions, rows.Err()
+}
+
+func (d DatastoreSQLite) LoadFormaCommandIDs() ([]string, error) {
+	_, span := sqliteTracer.Start(context.Background(), "LoadFormaCommandIDs")
+	defer span.End()
+	rows, err := d.conn.Query(`SELECT command_id FROM forma_commands ORDER BY command_id`)
+	if err != nil {
+		return nil, err
+	}
+	defer closeRows(rows)
+	var ids []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		ids = append(ids, id)
+	}
+	return ids, rows.Err()
+}
+
+func (d DatastoreSQLite) LoadResourceVersionsPage(afterURI string, afterVersion string, limit int) ([]datastore.ResourceVersion, error) {
+	_, span := sqliteTracer.Start(context.Background(), "LoadResourceVersionsPage")
+	defer span.End()
+	rows, err := d.conn.Query(
+		`SELECT uri, version, data, ksuid FROM resources
+		 WHERE uri > ? OR (uri = ? AND version > ?)
+		 ORDER BY uri, version
+		 LIMIT ?`,
+		afterURI, afterURI, afterVersion, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer closeRows(rows)
+	var versions []datastore.ResourceVersion
+	for rows.Next() {
+		var uri, version, jsonData, ksuid string
+		if err := rows.Scan(&uri, &version, &jsonData, &ksuid); err != nil {
+			return nil, err
+		}
+		var resource pkgmodel.Resource
+		if err := json.Unmarshal([]byte(jsonData), &resource); err != nil {
+			return nil, err
+		}
+		resource.Ksuid = ksuid
+		versions = append(versions, datastore.ResourceVersion{URI: uri, Version: version, Resource: &resource})
+	}
+	return versions, rows.Err()
+}
+
+func (d DatastoreSQLite) UpdateResourceVersionData(uri string, version string, resource *pkgmodel.Resource) error {
+	_, span := sqliteTracer.Start(context.Background(), "UpdateResourceVersionData")
+	defer span.End()
+
+	data, err := json.Marshal(resource)
+	if err != nil {
+		return err
+	}
+	_, err = d.conn.Exec(`UPDATE resources SET data = ? WHERE uri = ? AND version = ?`, string(data), uri, version)
+	return err
+}
+
+func (d DatastoreSQLite) LoadAllResourcesByStack() (map[string][]*pkgmodel.Resource, error) {
+	_, span := sqliteTracer.Start(context.Background(), "LoadAllResourcesByStack")
+	defer span.End()
+
+	query := `
+	SELECT data, ksuid, version
+	FROM resources r1
+	WHERE NOT EXISTS (
+	SELECT 1
+	FROM resources r2
+	WHERE r1.uri = r2.uri
+	AND r2.version > r1.version
+	)
+	AND operation != ? AND operation != 'reaped'
+	`
+
+	rows, err := d.conn.Query(query, resource_update.OperationDelete)
+	if err != nil {
+		return nil, err
+	}
+	defer closeRows(rows)
+
+	var allResources []*pkgmodel.Resource
+	for rows.Next() {
+		var jsonData, ksuid, version string
+		if err := rows.Scan(&jsonData, &ksuid, &version); err != nil {
+			return nil, err
+		}
+
+		var resource pkgmodel.Resource
+		if err := json.Unmarshal([]byte(jsonData), &resource); err != nil {
+			return nil, err
+		}
+
+		resource.Ksuid = ksuid
+		resource.Version = version
+		allResources = append(allResources, &resource)
+	}
+
+	// Group resources by stack label
+	stackResourcesMap := make(map[string][]*pkgmodel.Resource)
+	for _, resource := range allResources {
+		if resource.Stack != "" {
+			stackResourcesMap[resource.Stack] = append(stackResourcesMap[resource.Stack], resource)
+		}
+	}
+
+	return stackResourcesMap, nil
+}
+
+func (d DatastoreSQLite) LoadResourcesByStack(stackLabel string) ([]*pkgmodel.Resource, error) {
+	slog.Debug("SQLite START", "method", "LoadResourcesByStack", "stack", stackLabel)
+	start := time.Now()
+	defer func() {
+		slog.Debug("SQLite END", "method", "LoadResourcesByStack", "stack", stackLabel, "duration", time.Since(start))
+	}()
+	_, span := sqliteTracer.Start(context.Background(), "LoadResourcesByStack")
+	defer span.End()
+
+	query := `
+	SELECT data, ksuid, version
+	FROM resources r1
+	WHERE stack = ?
+	AND NOT EXISTS (
+	SELECT 1
+	FROM resources r2
+	WHERE r1.uri = r2.uri
+	AND r2.version > r1.version
+	)
+	AND operation != ? AND operation != 'reaped'
+	`
+
+	rows, err := d.conn.Query(query, stackLabel, resource_update.OperationDelete)
+	if err != nil {
+		return nil, err
+	}
+	defer closeRows(rows)
+
+	var resources []*pkgmodel.Resource
+	for rows.Next() {
+		var jsonData, ksuid, version string
+		if err := rows.Scan(&jsonData, &ksuid, &version); err != nil {
+			return nil, err
+		}
+
+		var resource pkgmodel.Resource
+		if err := json.Unmarshal([]byte(jsonData), &resource); err != nil {
+			return nil, err
+		}
+
+		resource.Ksuid = ksuid
+		resource.Version = version
+		resources = append(resources, &resource)
+	}
+
+	return resources, nil
+}
+
+// Stack metadata operations
+
+func (d DatastoreSQLite) CreateStack(stack *pkgmodel.Stack, commandID string) (string, error) {
+	_, span := sqliteTracer.Start(context.Background(), "CreateStack")
+	defer span.End()
+
+	// Check if a non-deleted stack with this label already exists
+	existing, err := d.GetStackByLabel(stack.Label)
+	if err != nil {
+		return "", err
+	}
+	if existing != nil {
+		return "", fmt.Errorf("stack already exists: %s", stack.Label)
+	}
+
+	// Use pre-generated ID if available, otherwise generate one
+	id := stack.ID
+	if id == "" {
+		id = mksuid.New().String()
+		stack.ID = id
+	}
+	version := mksuid.New().String()
+
+	query := `INSERT INTO stacks (id, version, command_id, operation, label, description) VALUES (?, ?, ?, ?, ?, ?)`
+	_, err = d.conn.Exec(query, id, version, commandID, "create", stack.Label, stack.Description)
+	if err != nil {
+		slog.Error("Failed to create stack", "error", err, "label", stack.Label)
+		return "", err
+	}
+
+	return version, nil
+}
+
+func (d DatastoreSQLite) UpdateStack(stack *pkgmodel.Stack, commandID string) (string, error) {
+	_, span := sqliteTracer.Start(context.Background(), "UpdateStack")
+	defer span.End()
+
+	// Get the existing stack to find its id (most recent version of any operation)
+	query := `
+		SELECT id, operation FROM stacks
+		WHERE label = ?
+		ORDER BY version DESC
+		LIMIT 1
+	`
+	row := d.conn.QueryRow(query, stack.Label)
+
+	var id, operation string
+	if err := row.Scan(&id, &operation); err != nil {
+		if err == sql.ErrNoRows {
+			return "", fmt.Errorf("stack not found: %s", stack.Label)
+		}
+		return "", err
+	}
+
+	// If the most recent version is a delete, the stack doesn't exist
+	if operation == "delete" {
+		return "", fmt.Errorf("stack not found: %s", stack.Label)
+	}
+
+	// Insert new version with same id
+	version := mksuid.New().String()
+	insertQuery := `INSERT INTO stacks (id, version, command_id, operation, label, description) VALUES (?, ?, ?, ?, ?, ?)`
+	_, err := d.conn.Exec(insertQuery, id, version, commandID, "update", stack.Label, stack.Description)
+	if err != nil {
+		slog.Error("Failed to update stack", "error", err, "label", stack.Label)
+		return "", err
+	}
+
+	return version, nil
+}
+
+func (d DatastoreSQLite) DeleteStack(label string, commandID string) (string, error) {
+	slog.Debug("SQLite START", "method", "DeleteStack", "label", label)
+	start := time.Now()
+	defer func() {
+		slog.Debug("SQLite END", "method", "DeleteStack", "label", label, "duration", time.Since(start))
+	}()
+	_, span := sqliteTracer.Start(context.Background(), "DeleteStack")
+	defer span.End()
+
+	// Get the existing stack to find its id (most recent version of any operation)
+	query := `
+		SELECT id, operation FROM stacks
+		WHERE label = ?
+		ORDER BY version DESC
+		LIMIT 1
+	`
+	slog.Debug("SQLite STMT", "method", "DeleteStack", "stmt", "QueryRow-SELECT", "phase", "before")
+	queryStart := time.Now()
+	row := d.conn.QueryRow(query, label)
+
+	var id, operation string
+	if err := row.Scan(&id, &operation); err != nil {
+		slog.Debug("SQLite STMT", "method", "DeleteStack", "stmt", "QueryRow-SELECT", "phase", "after-error", "duration", time.Since(queryStart), "error", err)
+		if err == sql.ErrNoRows {
+			return "", fmt.Errorf("stack not found: %s", label)
+		}
+		return "", err
+	}
+	slog.Debug("SQLite STMT", "method", "DeleteStack", "stmt", "QueryRow-SELECT", "phase", "after", "duration", time.Since(queryStart), "stackID", id)
+
+	// If the most recent version is a delete, the stack doesn't exist
+	if operation == "delete" {
+		return "", fmt.Errorf("stack not found: %s", label)
+	}
+
+	// Cascade delete: delete all policies associated with this stack
+	slog.Debug("SQLite STMT", "method", "DeleteStack", "stmt", "DeletePoliciesForStack", "phase", "before-call")
+	policyDeleteStart := time.Now()
+	if err := d.DeletePoliciesForStack(id, commandID); err != nil {
+		slog.Warn("Failed to delete policies for stack", "error", err, "stackID", id, "label", label, "duration", time.Since(policyDeleteStart))
+		// Continue with stack deletion even if policy deletion fails
+	}
+	slog.Debug("SQLite STMT", "method", "DeleteStack", "stmt", "DeletePoliciesForStack", "phase", "after-call", "duration", time.Since(policyDeleteStart))
+
+	// Insert tombstone version
+	version := mksuid.New().String()
+	insertQuery := `INSERT INTO stacks (id, version, command_id, operation, label, description) VALUES (?, ?, ?, ?, ?, ?)`
+	slog.Debug("SQLite STMT", "method", "DeleteStack", "stmt", "Exec-INSERT", "phase", "before")
+	execStart := time.Now()
+	_, execErr := d.conn.Exec(insertQuery, id, version, commandID, "delete", label, "")
+	if execErr != nil {
+		slog.Debug("SQLite STMT", "method", "DeleteStack", "stmt", "Exec-INSERT", "phase", "after-error", "duration", time.Since(execStart), "error", execErr)
+		slog.Error("Failed to delete stack", "error", execErr, "label", label)
+		return "", execErr
+	}
+	slog.Debug("SQLite STMT", "method", "DeleteStack", "stmt", "Exec-INSERT", "phase", "after", "duration", time.Since(execStart))
+
+	return version, nil
+}
+
+func (d DatastoreSQLite) GetStackByLabel(label string) (*pkgmodel.Stack, error) {
+	_, span := sqliteTracer.Start(context.Background(), "GetStackByLabel")
+	defer span.End()
+
+	// Get the latest version of the stack, return nil if deleted
+	// We need to check if the MOST RECENT version is a delete operation
+	query := `
+		SELECT id, description, operation FROM stacks
+		WHERE label = ?
+		ORDER BY version DESC
+		LIMIT 1
+	`
+	row := d.conn.QueryRow(query, label)
+
+	var id, description, operation string
+	if err := row.Scan(&id, &description, &operation); err != nil {
+		if err == sql.ErrNoRows {
+			return nil, nil // Stack not found, return nil without error
+		}
+		return nil, err
+	}
+
+	// If the most recent version is a delete, the stack doesn't exist
+	if operation == "delete" {
+		return nil, nil
+	}
+
+	stack := &pkgmodel.Stack{
+		ID:          id,
+		Label:       label,
+		Description: description,
+	}
+
+	// Load policies for this stack (both inline and standalone references)
+	policies, err := d.loadPoliciesForStackAsJSON(id)
+	if err != nil {
+		slog.Warn("Failed to load policies for stack", "label", label, "error", err)
+		// Don't fail the whole operation, just return stack without policies
+	} else {
+		stack.Policies = policies
+	}
+
+	return stack, nil
+}
+
+func (d DatastoreSQLite) LoadStacksByLabels(labels []string) ([]*pkgmodel.Stack, error) {
+	_, span := sqliteTracer.Start(context.Background(), "LoadStacksByLabels")
+	defer span.End()
+
+	if len(labels) == 0 {
+		return []*pkgmodel.Stack{}, nil
+	}
+
+	placeholders := make([]string, len(labels))
+	args := make([]any, len(labels))
+	for i, label := range labels {
+		placeholders[i] = "?"
+		args[i] = label
+	}
+
+	query := fmt.Sprintf(`
+		SELECT label, id, description FROM (
+			SELECT label, id, description, operation,
+			       ROW_NUMBER() OVER (PARTITION BY id ORDER BY version DESC) AS rn
+			FROM stacks
+			WHERE label IN (%s)
+		) sub
+		WHERE rn = 1 AND operation != 'delete'
+	`, strings.Join(placeholders, ","))
+
+	rows, err := d.conn.Query(query, args...)
+	if err != nil {
+		return nil, err
+	}
+
+	type stackRow struct {
+		label, id, description string
+	}
+	var stackRows []stackRow
+	for rows.Next() {
+		var r stackRow
+		if err := rows.Scan(&r.label, &r.id, &r.description); err != nil {
+			_ = rows.Close()
+			return nil, err
+		}
+		stackRows = append(stackRows, r)
+	}
+	_ = rows.Close()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
+	stacks := make([]*pkgmodel.Stack, 0, len(stackRows))
+	for _, r := range stackRows {
+		stack := &pkgmodel.Stack{
+			ID:          r.id,
+			Label:       r.label,
+			Description: r.description,
+		}
+
+		policies, err := d.loadPoliciesForStackAsJSON(r.id)
+		if err != nil {
+			slog.Warn("Failed to load policies for stack", "label", r.label, "error", err)
+		} else {
+			stack.Policies = policies
+		}
+
+		stacks = append(stacks, stack)
+	}
+
+	return stacks, nil
+}
+
+// loadPoliciesForStackAsJSON loads all policies for a stack and returns them as JSON.
+// For inline policies, returns the full policy JSON including Type and Label.
+// For standalone policies, returns {"$ref": "policy://label"} format.
+//
+// IMPORTANT: With SetMaxOpenConns(1), we must close rows before doing another Query.
+// Otherwise we get a deadlock because rows holds the only connection.
+func (d DatastoreSQLite) loadPoliciesForStackAsJSON(stackID string) ([]json.RawMessage, error) {
+	var policies []json.RawMessage
+
+	// 1. Load inline policies (stack_id set directly on the policy)
+	inlineQuery := `
+		WITH latest_policies AS (
+			SELECT id, label, policy_type, policy_data, operation,
+			       ROW_NUMBER() OVER (PARTITION BY id ORDER BY version DESC) as rn
+			FROM policies
+			WHERE stack_id = ?
+		)
+		SELECT label, policy_type, policy_data
+		FROM latest_policies
+		WHERE rn = 1 AND operation != 'delete'
+	`
+	rows, err := d.conn.Query(inlineQuery, stackID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query inline policies: %w", err)
+	}
+
+	// Collect all inline policy data first, then close rows to release the connection
+	type inlinePolicyData struct {
+		label, policyType, policyData string
+	}
+	var inlinePolicies []inlinePolicyData
+	for rows.Next() {
+		var data inlinePolicyData
+		if err := rows.Scan(&data.label, &data.policyType, &data.policyData); err != nil {
+			continue
+		}
+		inlinePolicies = append(inlinePolicies, data)
+	}
+	_ = rows.Close() // Close rows NOW to release connection before next Query
+
+	// Process collected inline policies (no DB connection needed)
+	for _, data := range inlinePolicies {
+		fullPolicyJSON, err := reconstructPolicyJSON(data.label, data.policyType, data.policyData)
+		if err != nil {
+			slog.Warn("Failed to reconstruct policy JSON", "label", data.label, "error", err)
+			continue
+		}
+		policies = append(policies, fullPolicyJSON)
+	}
+
+	// 2. Load standalone policy references (via stack_policies junction table)
+	// Now safe to Query again since we closed the previous rows
+	standaloneQuery := `
+		WITH latest_policies AS (
+			SELECT id, label, operation,
+			       ROW_NUMBER() OVER (PARTITION BY id ORDER BY version DESC) as rn
+			FROM policies
+			WHERE (stack_id IS NULL OR stack_id = '')
+		)
+		SELECT p.label FROM stack_policies sp
+		JOIN latest_policies p ON p.id = sp.policy_id
+		WHERE sp.stack_id = ?
+		AND p.rn = 1 AND p.operation != 'delete'
+	`
+	rows2, err := d.conn.Query(standaloneQuery, stackID)
+	if err != nil {
+		return policies, fmt.Errorf("failed to query standalone policies: %w", err)
+	}
+	defer func() { _ = rows2.Close() }()
+
+	for rows2.Next() {
+		var policyLabel string
+		if err := rows2.Scan(&policyLabel); err != nil {
+			continue
+		}
+		// Create a $ref entry for the standalone policy
+		refJSON := fmt.Sprintf(`{"$ref":"policy://%s"}`, policyLabel)
+		policies = append(policies, json.RawMessage(refJSON))
+	}
+
+	return policies, nil
+}
+
+// reconstructPolicyJSON merges policy_data with type and label to create full policy JSON
+func reconstructPolicyJSON(label, policyType, policyData string) (json.RawMessage, error) {
+	// Parse the stored policy data
+	var data map[string]any
+	if err := json.Unmarshal([]byte(policyData), &data); err != nil {
+		return nil, fmt.Errorf("failed to parse policy data: %w", err)
+	}
+
+	// Add Type and Label
+	data["Type"] = policyType
+	data["Label"] = label
+
+	// Marshal back to JSON
+	result, err := json.Marshal(data)
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal full policy: %w", err)
+	}
+	return result, nil
+}
+
+func (d DatastoreSQLite) CountResourcesInStack(label string) (int, error) {
+	_, span := sqliteTracer.Start(context.Background(), "CountResourcesInStack")
+	defer span.End()
+
+	// Count only latest version of resources that haven't been deleted
+	query := `
+		SELECT COUNT(*) FROM resources r1
+		WHERE stack = ?
+		AND NOT EXISTS (
+			SELECT 1 FROM resources r2
+			WHERE r1.uri = r2.uri
+			AND r2.version > r1.version
+		)
+		AND operation != ? AND operation != 'reaped'
+	`
+	row := d.conn.QueryRow(query, label, resource_update.OperationDelete)
+
+	var count int
+	if err := row.Scan(&count); err != nil {
+		return 0, err
+	}
+
+	return count, nil
+}
+
+// parseSQLiteTimestamp reads a timestamp column that arrives as text. A column
+// produced by a window function has no declared affinity, so the driver hands it
+// over as a string instead of converting it, and the value has to be parsed
+// here. SQLite's CURRENT_TIMESTAMP default writes the first form, in UTC.
+func parseSQLiteTimestamp(value string) time.Time {
+	for _, layout := range []string{
+		"2006-01-02 15:04:05",
+		"2006-01-02 15:04:05.999999999-07:00",
+		time.RFC3339Nano,
+	} {
+		if ts, err := time.Parse(layout, value); err == nil {
+			return ts
+		}
+	}
+	return time.Time{}
+}
+
+func (d DatastoreSQLite) ListAllStacks() ([]*pkgmodel.Stack, error) {
+	_, span := sqliteTracer.Start(context.Background(), "ListAllStackMetadata")
+	defer span.End()
+
+	// Get all stacks at their latest version that aren't deleted.
+	// Uses window functions to reliably get the most recent version per stack id
+	// for the metadata, and the first version's timestamp for CreatedAt — a
+	// stack gains a version whenever its description changes, so the latest
+	// version's valid_from is a modification time, not a creation time.
+	query := `
+		SELECT id, label, description, created_at FROM (
+			SELECT id, label, description, operation,
+			       ROW_NUMBER() OVER (PARTITION BY id ORDER BY version DESC) as rn,
+			       FIRST_VALUE(valid_from) OVER (PARTITION BY id ORDER BY version ASC) as created_at
+			FROM stacks
+		) sub
+		WHERE rn = 1 AND operation != 'delete'
+		ORDER BY label
+	`
+	rows, err := d.conn.Query(query)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+
+	var stacks []*pkgmodel.Stack
+	for rows.Next() {
+		var id, label, description, createdAt string
+		if err := rows.Scan(&id, &label, &description, &createdAt); err != nil {
+			return nil, err
+		}
+		stacks = append(stacks, &pkgmodel.Stack{
+			ID:          id,
+			Label:       label,
+			Description: description,
+			CreatedAt:   parseSQLiteTimestamp(createdAt),
+		})
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
+	return stacks, nil
+}
+
+// Policy operations
+
+func (d DatastoreSQLite) CreatePolicy(policy pkgmodel.Policy, commandID string) (string, error) {
+	_, span := sqliteTracer.Start(context.Background(), "CreatePolicy")
+	defer span.End()
+
+	// Generate KSUIDs for both id and version
+	id := mksuid.New().String()
+	version := mksuid.New().String()
+
+	// Serialize policy-specific data as JSON
+	var policyData []byte
+	var err error
+	switch p := policy.(type) {
+	case *pkgmodel.TTLPolicy:
+		policyData, err = json.Marshal(datastore.TTLPolicyData(p))
+	case *pkgmodel.AutoReconcilePolicy:
+		policyData, err = json.Marshal(map[string]any{
+			"IntervalSeconds": p.IntervalSeconds,
+		})
+	default:
+		return "", fmt.Errorf("unsupported policy type: %T", policy)
+	}
+	if err != nil {
+		return "", fmt.Errorf("failed to marshal policy data: %w", err)
+	}
+
+	query := `INSERT INTO policies (id, version, command_id, operation, label, policy_type, stack_id, policy_data)
+	          VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+	_, err = d.conn.Exec(query, id, version, commandID, "create", policy.GetLabel(), policy.GetType(), policy.GetStackID(), string(policyData))
+	if err != nil {
+		slog.Error("Failed to create policy", "error", err, "label", policy.GetLabel())
+		return "", err
+	}
+
+	return version, nil
+}
+
+func (d DatastoreSQLite) UpdatePolicy(policy pkgmodel.Policy, commandID string) (string, error) {
+	_, span := sqliteTracer.Start(context.Background(), "UpdatePolicy")
+	defer span.End()
+
+	// Get the existing policy to find its id
+	// For standalone policies (empty stack_id), check for both NULL and empty string
+	var query string
+	var id string
+	var err error
+
+	if policy.GetStackID() == "" {
+		// Standalone policy - check for NULL or empty string
+		query = `
+			SELECT id FROM policies
+			WHERE label = ? AND (stack_id IS NULL OR stack_id = '')
+			ORDER BY version DESC
+			LIMIT 1
+		`
+		err = d.conn.QueryRow(query, policy.GetLabel()).Scan(&id)
+	} else {
+		// Inline policy - exact match on stack_id
+		query = `
+			SELECT id FROM policies
+			WHERE label = ? AND stack_id = ?
+			ORDER BY version DESC
+			LIMIT 1
+		`
+		err = d.conn.QueryRow(query, policy.GetLabel(), policy.GetStackID()).Scan(&id)
+	}
+	if err != nil {
+		return "", fmt.Errorf("failed to find existing policy: %w", err)
+	}
+
+	// Generate new version
+	version := mksuid.New().String()
+
+	// Serialize policy-specific data as JSON
+	var policyData []byte
+	switch p := policy.(type) {
+	case *pkgmodel.TTLPolicy:
+		policyData, err = json.Marshal(datastore.TTLPolicyData(p))
+	case *pkgmodel.AutoReconcilePolicy:
+		policyData, err = json.Marshal(map[string]any{
+			"IntervalSeconds": p.IntervalSeconds,
+		})
+	default:
+		return "", fmt.Errorf("unsupported policy type: %T", policy)
+	}
+	if err != nil {
+		return "", fmt.Errorf("failed to marshal policy data: %w", err)
+	}
+
+	insertQuery := `INSERT INTO policies (id, version, command_id, operation, label, policy_type, stack_id, policy_data)
+	                VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+	_, err = d.conn.Exec(insertQuery, id, version, commandID, "update", policy.GetLabel(), policy.GetType(), policy.GetStackID(), string(policyData))
+	if err != nil {
+		slog.Error("Failed to update policy", "error", err, "label", policy.GetLabel())
+		return "", err
+	}
+
+	return version, nil
+}
+
+func (d DatastoreSQLite) GetPoliciesForStack(stackID string) ([]pkgmodel.Policy, error) {
+	_, span := sqliteTracer.Start(context.Background(), "GetPoliciesForStack")
+	defer span.End()
+
+	// Get the latest non-deleted version of each policy for the given stack
+	// This includes both:
+	// 1. Inline policies (stack_id set directly on the policy)
+	// 2. Standalone policies (attached via stack_policies junction table)
+	query := `
+		WITH latest_policies AS (
+			SELECT id, label, policy_type, policy_data, stack_id, operation,
+			       ROW_NUMBER() OVER (PARTITION BY id ORDER BY version DESC) as rn
+			FROM policies
+		),
+		-- Inline policies: stack_id is set directly on the policy
+		inline_policies AS (
+			SELECT label, policy_type, policy_data, stack_id
+			FROM latest_policies
+			WHERE stack_id = ? AND rn = 1 AND operation != 'delete'
+		),
+		-- Standalone policies: attached via stack_policies junction table
+		standalone_policies AS (
+			SELECT lp.label, lp.policy_type, lp.policy_data, lp.stack_id
+			FROM latest_policies lp
+			JOIN stack_policies sp ON sp.policy_id = lp.id
+			WHERE sp.stack_id = ? AND lp.rn = 1 AND lp.operation != 'delete'
+			AND (lp.stack_id IS NULL OR lp.stack_id = '')
+		)
+		SELECT label, policy_type, policy_data, stack_id FROM inline_policies
+		UNION
+		SELECT label, policy_type, policy_data, stack_id FROM standalone_policies
+	`
+
+	rows, err := d.conn.Query(query, stackID, stackID)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+
+	var policies []pkgmodel.Policy
+	for rows.Next() {
+		var label, policyType, policyDataStr string
+		var policyStackID sql.NullString
+		if err := rows.Scan(&label, &policyType, &policyDataStr, &policyStackID); err != nil {
+			return nil, err
+		}
+
+		// For standalone policies, use the queried stackID for display purposes
+		effectiveStackID := stackID
+		if policyStackID.Valid && policyStackID.String != "" {
+			effectiveStackID = policyStackID.String
+		}
+		policy, err := deserializePolicy(label, policyType, policyDataStr, effectiveStackID)
+		if err != nil {
+			slog.Warn("Failed to deserialize policy, skipping", "error", err, "label", label, "type", policyType)
+			continue
+		}
+		policies = append(policies, policy)
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
+	return policies, nil
+}
+
+func (d DatastoreSQLite) GetInlinePoliciesForStack(stackID string) ([]pkgmodel.Policy, error) {
+	return d.getInlinePoliciesForStack(stackID, false)
+}
+
+func (d DatastoreSQLite) GetDesiredInlinePoliciesForStack(stackID string) ([]pkgmodel.Policy, error) {
+	return d.getInlinePoliciesForStack(stackID, true)
+}
+
+func (d DatastoreSQLite) getInlinePoliciesForStack(stackID string, strict bool) ([]pkgmodel.Policy, error) {
+	_, span := sqliteTracer.Start(context.Background(), "GetInlinePoliciesForStack")
+	defer span.End()
+
+	// Standalone policies are stored with an empty stack id, so an empty stack id
+	// here would match them; a stack that is not identified has no inline policies.
+	if stackID == "" {
+		return nil, nil
+	}
+
+	// Only the policies the stack owns: the standalone policies attached to it
+	// through the stack_policies junction table are not inline. Liveness is decided
+	// per policy id: an id whose latest version is a tombstone is already deleted.
+	query := `
+		WITH latest_policies AS (
+			SELECT id, label, policy_type, policy_data, operation,
+			       ROW_NUMBER() OVER (PARTITION BY id ORDER BY version DESC) as rn
+			FROM policies
+			WHERE stack_id = ?
+		)
+		SELECT label, policy_type, policy_data
+		FROM latest_policies
+		WHERE rn = 1 AND operation != 'delete'
+	`
+
+	rows, err := d.conn.Query(query, stackID)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+
+	var policies []pkgmodel.Policy
+	for rows.Next() {
+		var label, policyType, policyDataStr string
+		if err := rows.Scan(&label, &policyType, &policyDataStr); err != nil {
+			return nil, err
+		}
+
+		policy, err := deserializePolicy(label, policyType, policyDataStr, stackID)
+		if err != nil {
+			if strict {
+				return nil, fmt.Errorf("invalid desired metadata: %w", err)
+			}
+			slog.Warn("Failed to deserialize policy, skipping", "error", err, "label", label, "type", policyType)
+			continue
+		}
+		policies = append(policies, policy)
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
+	return policies, nil
+}
+
+func (d DatastoreSQLite) GetStandalonePolicy(label string) (pkgmodel.Policy, error) {
+	_, span := sqliteTracer.Start(context.Background(), "GetStandalonePolicy")
+	defer span.End()
+
+	// Get the latest non-deleted version of the standalone policy with this label
+	// Check for both NULL and empty string since Go driver may store either
+	query := `
+		WITH latest_policy AS (
+			SELECT id, label, policy_type, policy_data, operation,
+			       ROW_NUMBER() OVER (PARTITION BY id ORDER BY version DESC) as rn
+			FROM policies
+			WHERE label = ? AND (stack_id IS NULL OR stack_id = '')
+		)
+		SELECT label, policy_type, policy_data
+		FROM latest_policy
+		WHERE rn = 1 AND operation != 'delete'
+	`
+
+	var policyLabel, policyType, policyDataStr string
+	err := d.conn.QueryRow(query, label).Scan(&policyLabel, &policyType, &policyDataStr)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			return nil, nil
+		}
+		return nil, err
+	}
+
+	return deserializePolicy(policyLabel, policyType, policyDataStr, "")
+}
+
+func (d DatastoreSQLite) LoadStandalonePoliciesByLabels(labels []string) ([]pkgmodel.Policy, error) {
+	_, span := sqliteTracer.Start(context.Background(), "LoadStandalonePoliciesByLabels")
+	defer span.End()
+
+	if len(labels) == 0 {
+		return []pkgmodel.Policy{}, nil
+	}
+
+	placeholders := make([]string, len(labels))
+	args := make([]any, len(labels))
+	for i, label := range labels {
+		placeholders[i] = "?"
+		args[i] = label
+	}
+
+	query := fmt.Sprintf(`
+		WITH latest_policies AS (
+			SELECT id, label, policy_type, policy_data, operation,
+			       ROW_NUMBER() OVER (PARTITION BY id ORDER BY version DESC) AS rn
+			FROM policies
+			WHERE label IN (%s) AND (stack_id IS NULL OR stack_id = '')
+		)
+		SELECT label, policy_type, policy_data
+		FROM latest_policies
+		WHERE rn = 1 AND operation != 'delete'
+	`, strings.Join(placeholders, ","))
+
+	rows, err := d.conn.Query(query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("failed to load standalone policies by labels: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	var policies []pkgmodel.Policy
+	for rows.Next() {
+		var policyLabel, policyType, policyDataStr string
+		if err := rows.Scan(&policyLabel, &policyType, &policyDataStr); err != nil {
+			return nil, fmt.Errorf("failed to scan policy: %w", err)
+		}
+		policy, err := deserializePolicy(policyLabel, policyType, policyDataStr, "")
+		if err != nil {
+			slog.Warn("Failed to deserialize policy", "label", policyLabel, "error", err)
+			continue
+		}
+		policies = append(policies, policy)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("error iterating policies: %w", err)
+	}
+
+	return policies, nil
+}
+
+func (d DatastoreSQLite) ListAllStandalonePolicies() ([]pkgmodel.Policy, error) {
+	_, span := sqliteTracer.Start(context.Background(), "ListAllStandalonePolicies")
+	defer span.End()
+
+	query := `
+		WITH latest_policies AS (
+			SELECT id, label, policy_type, policy_data, operation,
+			       ROW_NUMBER() OVER (PARTITION BY id ORDER BY version DESC) as rn
+			FROM policies
+			WHERE (stack_id IS NULL OR stack_id = '')
+		)
+		SELECT label, policy_type, policy_data
+		FROM latest_policies
+		WHERE rn = 1 AND operation != 'delete'
+		ORDER BY label
+	`
+	rows, err := d.conn.Query(query)
+	if err != nil {
+		return nil, fmt.Errorf("failed to list standalone policies: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	var policies []pkgmodel.Policy
+	for rows.Next() {
+		var label, policyType, policyDataStr string
+		if err := rows.Scan(&label, &policyType, &policyDataStr); err != nil {
+			return nil, fmt.Errorf("failed to scan policy: %w", err)
+		}
+		policy, err := deserializePolicy(label, policyType, policyDataStr, "")
+		if err != nil {
+			slog.Warn("Failed to deserialize policy", "label", label, "error", err)
+			continue
+		}
+		policies = append(policies, policy)
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("error iterating policies: %w", err)
+	}
+
+	return policies, nil
+}
+
+func (d DatastoreSQLite) AttachPolicyToStack(stackID, policyLabel string) error {
+	_, span := sqliteTracer.Start(context.Background(), "AttachPolicyToStack")
+	defer span.End()
+
+	// First, get the policy ID from the label
+	// Check for both NULL and empty string since Go driver may store either
+	policyQuery := `
+		WITH latest_policy AS (
+			SELECT id, label, operation,
+			       ROW_NUMBER() OVER (PARTITION BY id ORDER BY version DESC) as rn
+			FROM policies
+			WHERE label = ? AND (stack_id IS NULL OR stack_id = '')
+		)
+		SELECT id FROM latest_policy
+		WHERE rn = 1 AND operation != 'delete'
+	`
+	var policyID string
+	err := d.conn.QueryRow(policyQuery, policyLabel).Scan(&policyID)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			return fmt.Errorf("standalone policy not found: %s", policyLabel)
+		}
+		return fmt.Errorf("failed to get policy ID: %w", err)
+	}
+
+	// Insert into stack_policies (ignore if already exists)
+	insertQuery := `INSERT OR IGNORE INTO stack_policies (stack_id, policy_id) VALUES (?, ?)`
+	_, err = d.conn.Exec(insertQuery, stackID, policyID)
+	if err != nil {
+		return fmt.Errorf("failed to attach policy to stack: %w", err)
+	}
+
+	slog.Debug("Attached standalone policy to stack",
+		"stackID", stackID,
+		"policyLabel", policyLabel,
+		"policyID", policyID)
+
+	return nil
+}
+
+func (d DatastoreSQLite) IsPolicyAttachedToStack(stackLabel, policyLabel string) (bool, error) {
+	_, span := sqliteTracer.Start(context.Background(), "IsPolicyAttachedToStack")
+	defer span.End()
+
+	// Check if the attachment exists in stack_policies by looking up stack and policy by label
+	query := `
+		WITH latest_stack AS (
+			SELECT id, label, operation,
+			       ROW_NUMBER() OVER (PARTITION BY id ORDER BY version DESC) as rn
+			FROM stacks
+			WHERE label = ?
+		),
+		latest_policy AS (
+			SELECT id, label, operation,
+			       ROW_NUMBER() OVER (PARTITION BY id ORDER BY version DESC) as rn
+			FROM policies
+			WHERE label = ? AND (stack_id IS NULL OR stack_id = '')
+		)
+		SELECT 1 FROM stack_policies sp
+		JOIN latest_stack s ON s.id = sp.stack_id
+		JOIN latest_policy p ON p.id = sp.policy_id
+		WHERE s.rn = 1 AND s.operation != 'delete'
+		AND p.rn = 1 AND p.operation != 'delete'
+		LIMIT 1
+	`
+	var exists int
+	err := d.conn.QueryRow(query, stackLabel, policyLabel).Scan(&exists)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			return false, nil
+		}
+		return false, fmt.Errorf("failed to check policy attachment: %w", err)
+	}
+	return true, nil
+}
+
+func (d DatastoreSQLite) GetStacksReferencingPolicy(policyLabel string) ([]string, error) {
+	_, span := sqliteTracer.Start(context.Background(), "GetStacksReferencingPolicy")
+	defer span.End()
+
+	// Get all stack labels that reference this standalone policy via the junction table
+	query := `
+		WITH latest_stacks AS (
+			SELECT id, label, operation,
+			       ROW_NUMBER() OVER (PARTITION BY id ORDER BY version DESC) as rn
+			FROM stacks
+		),
+		latest_policy AS (
+			SELECT id, label, operation,
+			       ROW_NUMBER() OVER (PARTITION BY id ORDER BY version DESC) as rn
+			FROM policies
+			WHERE label = ? AND (stack_id IS NULL OR stack_id = '')
+		)
+		SELECT s.label FROM stack_policies sp
+		JOIN latest_stacks s ON s.id = sp.stack_id
+		JOIN latest_policy p ON p.id = sp.policy_id
+		WHERE s.rn = 1 AND s.operation != 'delete'
+		AND p.rn = 1 AND p.operation != 'delete'
+		ORDER BY s.label
+	`
+	rows, err := d.conn.Query(query, policyLabel)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get stacks referencing policy: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	var stackLabels []string
+	for rows.Next() {
+		var label string
+		if err := rows.Scan(&label); err != nil {
+			return nil, fmt.Errorf("failed to scan stack label: %w", err)
+		}
+		stackLabels = append(stackLabels, label)
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("error iterating stacks: %w", err)
+	}
+
+	return stackLabels, nil
+}
+
+func (d DatastoreSQLite) GetAttachedPolicyLabelsForStack(stackLabel string) ([]string, error) {
+	_, span := sqliteTracer.Start(context.Background(), "GetAttachedPolicyLabelsForStack")
+	defer span.End()
+
+	query := `
+		WITH latest_stacks AS (
+			SELECT id, label, operation,
+			       ROW_NUMBER() OVER (PARTITION BY id ORDER BY version DESC) as rn
+			FROM stacks
+			WHERE label = ?
+		),
+		latest_policies AS (
+			SELECT id, label, operation,
+			       ROW_NUMBER() OVER (PARTITION BY id ORDER BY version DESC) as rn
+			FROM policies
+			WHERE (stack_id IS NULL OR stack_id = '')
+		)
+		SELECT p.label FROM stack_policies sp
+		JOIN latest_stacks s ON s.id = sp.stack_id
+		JOIN latest_policies p ON p.id = sp.policy_id
+		WHERE s.rn = 1 AND s.operation != 'delete'
+		AND p.rn = 1 AND p.operation != 'delete'
+		ORDER BY p.label
+	`
+	rows, err := d.conn.Query(query, stackLabel)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get attached policies for stack: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	var policyLabels []string
+	for rows.Next() {
+		var label string
+		if err := rows.Scan(&label); err != nil {
+			return nil, fmt.Errorf("failed to scan policy label: %w", err)
+		}
+		policyLabels = append(policyLabels, label)
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("error iterating policies: %w", err)
+	}
+
+	return policyLabels, nil
+}
+
+func (d DatastoreSQLite) DetachPolicyFromStack(stackLabel, policyLabel string) error {
+	_, span := sqliteTracer.Start(context.Background(), "DetachPolicyFromStack")
+	defer span.End()
+
+	query := `
+		DELETE FROM stack_policies
+		WHERE stack_id IN (
+			SELECT id FROM (
+				SELECT id, label, operation,
+				       ROW_NUMBER() OVER (PARTITION BY id ORDER BY version DESC) as rn
+				FROM stacks
+				WHERE label = ?
+			) WHERE rn = 1 AND operation != 'delete'
+		)
+		AND policy_id IN (
+			SELECT id FROM (
+				SELECT id, label, operation,
+				       ROW_NUMBER() OVER (PARTITION BY id ORDER BY version DESC) as rn
+				FROM policies
+				WHERE label = ? AND (stack_id IS NULL OR stack_id = '')
+			) WHERE rn = 1 AND operation != 'delete'
+		)
+	`
+	_, err := d.conn.Exec(query, stackLabel, policyLabel)
+	if err != nil {
+		return fmt.Errorf("failed to detach policy from stack: %w", err)
+	}
+
+	slog.Debug("Detached standalone policy from stack",
+		"stackLabel", stackLabel,
+		"policyLabel", policyLabel)
+
+	return nil
+}
+
+func (d DatastoreSQLite) DeletePolicy(policyLabel string) (string, error) {
+	_, span := sqliteTracer.Start(context.Background(), "DeletePolicy")
+	defer span.End()
+
+	// Get the current policy to get its ID and type
+	query := `
+		WITH latest_policies AS (
+			SELECT id, label, policy_type, operation,
+			       ROW_NUMBER() OVER (PARTITION BY id ORDER BY version DESC) as rn
+			FROM policies
+			WHERE label = ? AND (stack_id IS NULL OR stack_id = '')
+		)
+		SELECT id, policy_type
+		FROM latest_policies
+		WHERE rn = 1 AND operation != 'delete'
+	`
+	var id, policyType string
+	err := d.conn.QueryRow(query, policyLabel).Scan(&id, &policyType)
+	if err != nil {
+		return "", fmt.Errorf("failed to get policy for deletion: %w", err)
+	}
+
+	// Insert tombstone version
+	version := mksuid.New().String()
+	insertQuery := `INSERT INTO policies (id, version, command_id, operation, label, policy_type, stack_id, policy_data) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+	_, err = d.conn.Exec(insertQuery, id, version, "", "delete", policyLabel, policyType, nil, "{}")
+	if err != nil {
+		return "", fmt.Errorf("failed to delete policy: %w", err)
+	}
+
+	slog.Debug("Deleted standalone policy", "label", policyLabel, "id", id)
+
+	return version, nil
+}
+
+func (d DatastoreSQLite) DeleteInlinePolicy(stackID string, policyLabel string, commandID string) (string, error) {
+	_, span := sqliteTracer.Start(context.Background(), "DeleteInlinePolicy")
+	defer span.End()
+
+	// Standalone policies are stored with an empty stack id, so an empty stack id
+	// here would match them; there is no inline policy to delete without a stack.
+	if stackID == "" {
+		return "", nil
+	}
+
+	// Inline policy labels are only unique within their stack, so the lookup is
+	// scoped by stack_id as well as label. Liveness is decided per policy id: an
+	// id whose latest version is a tombstone is already deleted.
+	//
+	// IMPORTANT: With SetMaxOpenConns(1), we must collect all data from rows and
+	// close it BEFORE doing any Exec operations. Otherwise we get a deadlock
+	// because rows holds the only connection.
+	query := `
+		WITH latest_policies AS (
+			SELECT id, label, policy_type, operation,
+			       ROW_NUMBER() OVER (PARTITION BY id ORDER BY version DESC) as rn
+			FROM policies
+			WHERE stack_id = ? AND label = ?
+		)
+		SELECT id, policy_type
+		FROM latest_policies
+		WHERE rn = 1 AND operation != 'delete'
+	`
+	rows, err := d.conn.Query(query, stackID, policyLabel)
+	if err != nil {
+		return "", fmt.Errorf("failed to get inline policy for deletion: %w", err)
+	}
+
+	type policyToDelete struct {
+		id, policyType string
+	}
+	var policiesToDelete []policyToDelete
+	for rows.Next() {
+		var p policyToDelete
+		if err := rows.Scan(&p.id, &p.policyType); err != nil {
+			_ = rows.Close()
+			return "", fmt.Errorf("failed to scan inline policy for deletion: %w", err)
+		}
+		policiesToDelete = append(policiesToDelete, p)
+	}
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		return "", fmt.Errorf("failed to iterate inline policies for deletion: %w", err)
+	}
+	_ = rows.Close() // Close rows NOW to release connection before doing Exec operations
+
+	// An empty version reports that nothing live matched, so a replayed delete
+	// stays a no-op success instead of failing its command.
+	var version string
+	insertQuery := `INSERT INTO policies (id, version, command_id, operation, label, policy_type, stack_id, policy_data) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+	for _, p := range policiesToDelete {
+		version = mksuid.New().String()
+		_, err = d.conn.Exec(insertQuery, p.id, version, commandID, "delete", policyLabel, p.policyType, stackID, "{}")
+		if err != nil {
+			return "", fmt.Errorf("failed to delete inline policy: %w", err)
+		}
+		slog.Debug("Deleted inline policy", "label", policyLabel, "id", p.id, "stackID", stackID)
+	}
+
+	return version, nil
+}
+
+func (d DatastoreSQLite) DeletePoliciesForStack(stackID string, commandID string) error {
+	slog.Debug("SQLite START", "method", "DeletePoliciesForStack", "stackID", stackID)
+	start := time.Now()
+	defer func() {
+		slog.Debug("SQLite END", "method", "DeletePoliciesForStack", "stackID", stackID, "duration", time.Since(start))
+	}()
+	_, span := sqliteTracer.Start(context.Background(), "DeletePoliciesForStack")
+	defer span.End()
+
+	// First, remove any standalone policy attachments from the junction table
+	// This doesn't delete the standalone policies themselves, just the association
+	deleteAttachmentsQuery := `DELETE FROM stack_policies WHERE stack_id = ?`
+	slog.Debug("SQLite STMT", "method", "DeletePoliciesForStack", "stmt", "Exec-DELETE-attachments", "phase", "before")
+	execStart := time.Now()
+	_, err := d.conn.Exec(deleteAttachmentsQuery, stackID)
+	slog.Debug("SQLite STMT", "method", "DeletePoliciesForStack", "stmt", "Exec-DELETE-attachments", "phase", "after", "duration", time.Since(execStart), "error", err)
+	if err != nil {
+		slog.Warn("Failed to delete policy attachments for stack", "error", err, "stackID", stackID)
+	}
+
+	// Now get and delete only inline policies (policies with stack_id set to this stack)
+	// We query directly for inline policies rather than using GetPoliciesForStack
+	// since that also returns standalone policies which shouldn't be deleted
+	//
+	// IMPORTANT: With SetMaxOpenConns(1), we must collect all data from rows and close it
+	// BEFORE doing any Exec operations. Otherwise we get a deadlock because rows holds
+	// the only connection.
+	inlinePoliciesQuery := `
+		WITH latest_policies AS (
+			SELECT id, label, policy_type, policy_data, operation,
+			       ROW_NUMBER() OVER (PARTITION BY id ORDER BY version DESC) as rn
+			FROM policies
+			WHERE stack_id = ?
+		)
+		SELECT id, label, policy_type
+		FROM latest_policies
+		WHERE rn = 1 AND operation != 'delete'
+	`
+	slog.Debug("SQLite STMT", "method", "DeletePoliciesForStack", "stmt", "Query-SELECT-policies", "phase", "before")
+	queryStart := time.Now()
+	rows, err := d.conn.Query(inlinePoliciesQuery, stackID)
+	slog.Debug("SQLite STMT", "method", "DeletePoliciesForStack", "stmt", "Query-SELECT-policies", "phase", "after", "duration", time.Since(queryStart), "error", err)
+	if err != nil {
+		return fmt.Errorf("failed to get inline policies for stack: %w", err)
+	}
+
+	// Collect all policy data first, then close rows to release the connection
+	type policyToDelete struct {
+		id, label, policyType string
+	}
+	var policiesToDelete []policyToDelete
+	for rows.Next() {
+		var p policyToDelete
+		if err := rows.Scan(&p.id, &p.label, &p.policyType); err != nil {
+			slog.Warn("Failed to scan policy for deletion", "error", err)
+			continue
+		}
+		policiesToDelete = append(policiesToDelete, p)
+	}
+	_ = rows.Close() // Close rows NOW to release connection before doing Exec operations
+	slog.Debug("SQLite STMT", "method", "DeletePoliciesForStack", "stmt", "rows-collected-and-closed", "policyCount", len(policiesToDelete))
+
+	// Now safe to do Exec operations since rows is closed
+	for _, p := range policiesToDelete {
+		version := mksuid.New().String()
+		insertQuery := `INSERT INTO policies (id, version, command_id, operation, label, policy_type, stack_id, policy_data) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+		slog.Debug("SQLite STMT", "method", "DeletePoliciesForStack", "stmt", "Exec-INSERT-tombstone", "phase", "before", "policyLabel", p.label)
+		insertStart := time.Now()
+		_, err = d.conn.Exec(insertQuery, p.id, version, commandID, "delete", p.label, p.policyType, stackID, "{}")
+		slog.Debug("SQLite STMT", "method", "DeletePoliciesForStack", "stmt", "Exec-INSERT-tombstone", "phase", "after", "duration", time.Since(insertStart), "policyLabel", p.label, "error", err)
+		if err != nil {
+			slog.Error("Failed to delete inline policy", "error", err, "label", p.label)
+			continue
+		}
+		slog.Debug("Deleted inline policy as part of stack deletion", "label", p.label, "stackID", stackID)
+	}
+
+	return nil
+}
+
+// CreateGenerator persists a new generator. stack_id stores the stack's
+// resolved KSUID — like policy_id on an inline policy, not the label — read
+// off gen.GetStackID(). Unlike CreatePolicy the column is never NULL: a
+// generator is always inline to exactly one stack.
+func (d DatastoreSQLite) CreateGenerator(gen pkgmodel.Generator, commandID string) (string, error) {
+	_, span := sqliteTracer.Start(context.Background(), "CreateGenerator")
+	defer span.End()
+
+	// Honor a KSUID translation already assigned (see pkgmodel.Generator.GetID
+	// and generator_update.GenerateGeneratorUpdates), so a $gen reference
+	// resolved in the same command that creates this generator names the
+	// exact row this call persists, rather than an independently minted one
+	// — mirrors storeResource's identical id-already-assigned handling.
+	id := gen.GetID()
+	if id == "" {
+		id = mksuid.New().String()
+	}
+	version := mksuid.New().String()
+
+	data, err := datastore.GeneratorData(gen)
+	if err != nil {
+		return "", err
+	}
+
+	query := `INSERT INTO generators (id, version, command_id, operation, label, generator_type, stack_id, generator_data, generation_id, generation_spec)
+	          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+	_, err = d.conn.Exec(query, id, version, commandID, "create", gen.GetLabel(), gen.GetType(), gen.GetStackID(), string(data), "", "")
+	if err != nil {
+		slog.Error("Failed to create generator", "error", err, "label", gen.GetLabel())
+		return "", err
+	}
+
+	return version, nil
+}
+
+// UpdateGenerator persists a new version of an existing generator. The
+// existing row is found by label and stack ID — a generator has no
+// standalone form, so unlike UpdatePolicy there is no NULL-stack branch —
+// and the new version row carries forward the same id.
+//
+// A miss on the current label falls back to a lookup by gen.GetAlias(), the
+// generator's previous label: this is the rename path. Without it, a renamed
+// generator would find no row to update, and the caller would have to fall
+// back to Create, minting a fresh id and losing the identity a later
+// rotation schedule keys off.
+func (d DatastoreSQLite) UpdateGenerator(gen pkgmodel.Generator, commandID string) (string, error) {
+	_, span := sqliteTracer.Start(context.Background(), "UpdateGenerator")
+	defer span.End()
+
+	id, generationID, generationSpec, err := d.findGeneratorForUpdate(gen.GetLabel(), gen.GetStackID())
+	if err != nil && gen.GetAlias() != "" {
+		id, generationID, generationSpec, err = d.findGeneratorForUpdate(gen.GetAlias(), gen.GetStackID())
+	}
+	if err != nil {
+		return "", fmt.Errorf("failed to find existing generator: %w", err)
+	}
+
+	version := mksuid.New().String()
+	data, err := datastore.GeneratorData(gen)
+	if err != nil {
+		return "", err
+	}
+
+	insertQuery := `INSERT INTO generators (id, version, command_id, operation, label, generator_type, stack_id, generator_data, generation_id, generation_spec)
+	                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+	_, err = d.conn.Exec(insertQuery, id, version, commandID, "update", gen.GetLabel(), gen.GetType(), gen.GetStackID(), string(data), generationID, generationSpec)
+	if err != nil {
+		slog.Error("Failed to update generator", "error", err, "label", gen.GetLabel())
+		return "", err
+	}
+
+	return version, nil
+}
+
+// findGeneratorForUpdate returns the id and current generation fields of the
+// live generator row matching label and stackID. Shared by UpdateGenerator's
+// current-label lookup and its alias fallback.
+//
+// Windows to the latest version *per id* first, filters out tombstones, and
+// only then matches label — the same ordering GetGenerator and
+// DeleteGenerator use, for the same reason: a label can be shared across a
+// dead row (superseded by a rename) and a live one (a rename-back, or a
+// fresh generator created under a freed label), and matching label before
+// windowing can resolve the wrong id entirely, or a live id's stale,
+// pre-rename generation.
+//
+// The generation fields are read here so UpdateGenerator can copy them
+// forward onto the new version row it writes: a spec edit or an alias rename
+// must not drop the generation a generator currently holds — dropping it
+// would make the next apply see no generation and regenerate, silently
+// rotating a live credential.
+func (d DatastoreSQLite) findGeneratorForUpdate(label, stackID string) (id, generationID, generationSpec string, err error) {
+	query := `
+		WITH latest_generators AS (
+			SELECT id, label, generation_id, generation_spec, operation,
+			       ROW_NUMBER() OVER (PARTITION BY id ORDER BY version DESC) as rn
+			FROM generators
+			WHERE stack_id = ?
+		)
+		SELECT id, generation_id, generation_spec
+		FROM latest_generators
+		WHERE rn = 1 AND operation != 'delete' AND label = ?
+	`
+	err = d.conn.QueryRow(query, stackID, label).Scan(&id, &generationID, &generationSpec)
+	return id, generationID, generationSpec, err
+}
+
+// DeleteGenerator soft-deletes the generator with the given label on the
+// given stack. The stack is resolved from its label the same way
+// GetGenerator does; a stack that doesn't exist has nothing to delete. A
+// label with no live match is a no-op success that returns an empty version,
+// mirroring DeletePolicy.
+//
+// The candidate row is the latest version *per id* across the whole stack,
+// filtered by label only after that windowing — not the latest version
+// among rows already filtered to this label. A rename (UpdateGenerator's
+// alias fallback) leaves the old label's row in place with an older version
+// number; filtering by label first would still find and re-delete that
+// stale row instead of correctly reporting no live match.
+func (d DatastoreSQLite) DeleteGenerator(label, stackLabel string) (string, error) {
+	_, span := sqliteTracer.Start(context.Background(), "DeleteGenerator")
+	defer span.End()
+
+	stack, err := d.GetStackByLabel(stackLabel)
+	if err != nil {
+		return "", fmt.Errorf("failed to resolve stack %q: %w", stackLabel, err)
+	}
+	if stack == nil {
+		return "", nil
+	}
+
+	query := `
+		WITH latest_generators AS (
+			SELECT id, label, generator_type, operation,
+			       ROW_NUMBER() OVER (PARTITION BY id ORDER BY version DESC) as rn
+			FROM generators
+			WHERE stack_id = ?
+		)
+		SELECT id, generator_type
+		FROM latest_generators
+		WHERE rn = 1 AND operation != 'delete' AND label = ?
+	`
+	var id, generatorType string
+	err = d.conn.QueryRow(query, stack.ID, label).Scan(&id, &generatorType)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return "", nil
+		}
+		return "", fmt.Errorf("failed to get generator for deletion: %w", err)
+	}
+
+	version := mksuid.New().String()
+	insertQuery := `INSERT INTO generators (id, version, command_id, operation, label, generator_type, stack_id, generator_data, generation_id, generation_spec) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+	_, err = d.conn.Exec(insertQuery, id, version, "", "delete", label, generatorType, stack.ID, "{}", "", "")
+	if err != nil {
+		return "", fmt.Errorf("failed to delete generator: %w", err)
+	}
+
+	slog.Debug("Deleted generator", "label", label, "id", id, "stackLabel", stackLabel)
+
+	return version, nil
+}
+
+// GetGenerator retrieves the current (latest, non-deleted) generator with the
+// given label on the given stack. The stack label is resolved to its
+// current KSUID first, since generators.stack_id stores the stack's id, not
+// its label — mirroring how a policy's inline lookups are scoped by stack
+// ID. Returns nil, nil if no live stack or no live generator matches.
+//
+// As with DeleteGenerator, the label filter is applied after windowing to
+// the latest version per id, not before: a renamed generator's previous
+// label must not resolve just because its now-superseded row is still the
+// newest one under that label.
+func (d DatastoreSQLite) GetGenerator(label, stackLabel string) (pkgmodel.Generator, error) {
+	_, span := sqliteTracer.Start(context.Background(), "GetGenerator")
+	defer span.End()
+
+	stack, err := d.GetStackByLabel(stackLabel)
+	if err != nil {
+		return nil, fmt.Errorf("failed to resolve stack %q: %w", stackLabel, err)
+	}
+	if stack == nil {
+		return nil, nil
+	}
+
+	query := `
+		WITH latest_generators AS (
+			SELECT label, generator_data, operation,
+			       ROW_NUMBER() OVER (PARTITION BY id ORDER BY version DESC) as rn
+			FROM generators
+			WHERE stack_id = ?
+		)
+		SELECT generator_data
+		FROM latest_generators
+		WHERE rn = 1 AND operation != 'delete' AND label = ?
+	`
+	var dataStr string
+	err = d.conn.QueryRow(query, stack.ID, label).Scan(&dataStr)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("failed to get generator: %w", err)
+	}
+
+	return datastore.GeneratorFromData([]byte(dataStr))
+}
+
+// LoadGeneratorsByStack returns all non-deleted generators owned by a stack.
+// The stack label is resolved to its current KSUID first, for the same
+// reason GetGenerator does. A stack that doesn't exist owns no generators.
+func (d DatastoreSQLite) LoadGeneratorsByStack(stackLabel string) ([]pkgmodel.Generator, error) {
+	return d.loadGeneratorsByStack(stackLabel, false)
+}
+
+func (d DatastoreSQLite) LoadDesiredGeneratorsByStack(stackLabel string) ([]pkgmodel.Generator, error) {
+	return d.loadGeneratorsByStack(stackLabel, true)
+}
+
+func (d DatastoreSQLite) loadGeneratorsByStack(stackLabel string, strict bool) ([]pkgmodel.Generator, error) {
+	_, span := sqliteTracer.Start(context.Background(), "LoadGeneratorsByStack")
+	defer span.End()
+
+	stack, err := d.GetStackByLabel(stackLabel)
+	if err != nil {
+		return nil, fmt.Errorf("failed to resolve stack %q: %w", stackLabel, err)
+	}
+	if stack == nil {
+		return nil, nil
+	}
+
+	query := `
+		WITH latest_generators AS (
+			SELECT id, generator_data, operation,
+			       ROW_NUMBER() OVER (PARTITION BY id ORDER BY version DESC) as rn
+			FROM generators
+			WHERE stack_id = ?
+		)
+		SELECT generator_data
+		FROM latest_generators
+		WHERE rn = 1 AND operation != 'delete'
+	`
+	rows, err := d.conn.Query(query, stack.ID)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+
+	var generators []pkgmodel.Generator
+	for rows.Next() {
+		var dataStr string
+		if err := rows.Scan(&dataStr); err != nil {
+			return nil, err
+		}
+		gen, err := datastore.GeneratorFromData([]byte(dataStr))
+		if err != nil {
+			if strict {
+				return nil, fmt.Errorf("invalid desired metadata: %w", err)
+			}
+			slog.Warn("Failed to deserialize generator, skipping", "error", err, "stackLabel", stackLabel)
+			continue
+		}
+		generators = append(generators, gen)
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
+	return generators, nil
+}
+
+// generatorIdentityFromRow builds a GeneratorIdentity from the raw columns a
+// generator row query returns. generation_spec is stored as empty text on a
+// row that has never had a generation drawn; GenerationSpec must read back as
+// nil, not as an empty-but-non-nil json.RawMessage, so the zero-value case is
+// handled explicitly rather than by just wrapping whatever was stored.
+func generatorIdentityFromRow(id, generationID, generationSpec string) datastore.GeneratorIdentity {
+	if generationID == "" {
+		return datastore.GeneratorIdentity{ID: id}
+	}
+	return datastore.GeneratorIdentity{ID: id, GenerationID: generationID, GenerationSpec: json.RawMessage(generationSpec)}
+}
+
+// GetGeneratorIdentity returns the identity of the live generator with the
+// given label on the given stack. Uses the same windowing and label-after-rn
+// ordering as GetGenerator, for the same reason: a renamed generator's
+// previous label must not resolve just because its now-superseded row is
+// still the newest one under that label.
+func (d DatastoreSQLite) GetGeneratorIdentity(label, stackLabel string) (datastore.GeneratorIdentity, error) {
+	_, span := sqliteTracer.Start(context.Background(), "GetGeneratorIdentity")
+	defer span.End()
+
+	stack, err := d.GetStackByLabel(stackLabel)
+	if err != nil {
+		return datastore.GeneratorIdentity{}, fmt.Errorf("failed to resolve stack %q: %w", stackLabel, err)
+	}
+	if stack == nil {
+		return datastore.GeneratorIdentity{}, nil
+	}
+
+	query := `
+		WITH latest_generators AS (
+			SELECT id, label, generation_id, generation_spec, operation,
+			       ROW_NUMBER() OVER (PARTITION BY id ORDER BY version DESC) as rn
+			FROM generators
+			WHERE stack_id = ?
+		)
+		SELECT id, generation_id, generation_spec
+		FROM latest_generators
+		WHERE rn = 1 AND operation != 'delete' AND label = ?
+	`
+	var id, generationID, generationSpec string
+	err = d.conn.QueryRow(query, stack.ID, label).Scan(&id, &generationID, &generationSpec)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return datastore.GeneratorIdentity{}, nil
+		}
+		return datastore.GeneratorIdentity{}, fmt.Errorf("failed to get generator identity: %w", err)
+	}
+
+	return generatorIdentityFromRow(id, generationID, generationSpec), nil
+}
+
+// GetGeneratorIdentityByID returns the identity of the live generator with
+// the given KSUID, whichever stack owns it. Windows on id directly rather
+// than resolving a stack first: the id alone determines the row family.
+func (d DatastoreSQLite) GetGeneratorIdentityByID(generatorID string) (datastore.GeneratorIdentity, error) {
+	_, span := sqliteTracer.Start(context.Background(), "GetGeneratorIdentityByID")
+	defer span.End()
+
+	query := `
+		WITH latest_generators AS (
+			SELECT id, generation_id, generation_spec, operation,
+			       ROW_NUMBER() OVER (PARTITION BY id ORDER BY version DESC) as rn
+			FROM generators
+			WHERE id = ?
+		)
+		SELECT id, generation_id, generation_spec
+		FROM latest_generators
+		WHERE rn = 1 AND operation != 'delete'
+	`
+	var id, generationID, generationSpec string
+	err := d.conn.QueryRow(query, generatorID).Scan(&id, &generationID, &generationSpec)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return datastore.GeneratorIdentity{}, nil
+		}
+		return datastore.GeneratorIdentity{}, fmt.Errorf("failed to get generator identity by id: %w", err)
+	}
+
+	return generatorIdentityFromRow(id, generationID, generationSpec), nil
+}
+
+// AdvanceGeneration records that a new generation was drawn for this
+// generator, under this spec. Writes a new version row that carries forward
+// the existing label/type/stack/generator_data unchanged — only the
+// generation columns change. Errors if generationID is empty, if drawnUnder
+// is not valid JSON, or if the generator's latest row is a tombstone: a
+// deleted id is not resurrected.
+//
+// The caller is the generator update actor
+// (generator_update.GeneratorUpdater): it calls this once it has drawn a
+// value, so the generation the value came from is durable before any
+// destination is stamped with it.
+func (d DatastoreSQLite) AdvanceGeneration(generatorID, generationID, commandID string, drawnUnder json.RawMessage) error {
+	_, span := sqliteTracer.Start(context.Background(), "AdvanceGeneration")
+	defer span.End()
+
+	if generationID == "" {
+		return fmt.Errorf("advance generation: generationID must not be empty")
+	}
+	if !json.Valid(drawnUnder) {
+		return fmt.Errorf("advance generation: drawnUnder spec must be valid JSON")
+	}
+
+	var label, generatorType, stackID, generatorData, operation string
+	err := d.conn.QueryRow(
+		`SELECT label, generator_type, stack_id, generator_data, operation FROM generators WHERE id = ? ORDER BY version DESC LIMIT 1`,
+		generatorID,
+	).Scan(&label, &generatorType, &stackID, &generatorData, &operation)
+	if err != nil {
+		return fmt.Errorf("failed to find generator %q: %w", generatorID, err)
+	}
+	if operation == "delete" {
+		return fmt.Errorf("generator %q not found", generatorID)
+	}
+
+	version := mksuid.New().String()
+	insertQuery := `INSERT INTO generators (id, version, command_id, operation, label, generator_type, stack_id, generator_data, generation_id, generation_spec)
+	                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+	_, err = d.conn.Exec(insertQuery, generatorID, version, commandID, "update", label, generatorType, stackID, generatorData, generationID, string(drawnUnder))
+	if err != nil {
+		return fmt.Errorf("failed to advance generation: %w", err)
+	}
+
+	return nil
+}
+
+// deserializePolicy creates a Policy from stored data
+func deserializePolicy(label, policyType, policyDataStr, stackID string) (pkgmodel.Policy, error) {
+	switch policyType {
+	case "ttl":
+		return datastore.TTLPolicyFromData(label, policyDataStr, stackID)
+	case "auto-reconcile":
+		var data struct {
+			IntervalSeconds int64 `json:"IntervalSeconds"`
+		}
+		if err := json.Unmarshal([]byte(policyDataStr), &data); err != nil {
+			return nil, fmt.Errorf("failed to unmarshal auto-reconcile policy data: %w", err)
+		}
+		return &pkgmodel.AutoReconcilePolicy{
+			Type:            "auto-reconcile",
+			Label:           label,
+			IntervalSeconds: data.IntervalSeconds,
+			StackID:         stackID,
+		}, nil
+	default:
+		return nil, fmt.Errorf("unknown policy type: %s", policyType)
+	}
+}
+
+// ttlExpiredPredicateSQLite decides whether a TTL policy's deadline has passed.
+// It is shared by the inline and standalone branches of GetExpiredStacks so the
+// two cannot drift apart.
+//
+// An absolute deadline is compared as a string, not as a timestamp. ExpiresAt is
+// stored in one fixed-width UTC form, so byte order — SQLite's default TEXT
+// collation — is chronological order, and the comparison needs no conversion. A
+// malformed value therefore never sorts before now: that one policy fails safe
+// instead of taking the rest of the scan down with it.
+//
+// Comparing as a string cuts both ways, though, so the value is guarded before
+// it is compared. A malformed value that happens to sort ABOVE now is harmless —
+// it simply never expires. One that sorts BELOW now ("", "0000", a zero
+// timestamp) would read as a deadline long past and destroy the stack on the
+// next poll. The guard is therefore what makes "fails safe" true: the value must
+// match the canonical fixed-width shape and be no earlier than
+// pkgmodel.MinExpiresAt, which the parser enforces on the way in so the two
+// agree. Neither check is a cast, so neither can abort the scan.
+//
+// A row carrying both keys is not reachable through any accepted input, but is
+// resolved here in favour of ExpiresAt rather than left to chance.
+const ttlExpiredPredicateSQLite = `CASE
+				WHEN json_extract(p.policy_data, '$.ExpiresAt') IS NOT NULL
+				THEN json_extract(p.policy_data, '$.ExpiresAt') GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9]Z'
+				     AND json_extract(p.policy_data, '$.ExpiresAt') >= '2000-01-01T00:00:00Z'
+				     AND json_extract(p.policy_data, '$.ExpiresAt') < strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
+				ELSE datetime(s.created_at, '+' || json_extract(p.policy_data, '$.TTLSeconds') || ' seconds') < datetime('now')
+			END`
+
+func (d DatastoreSQLite) GetExpiredStacks() ([]datastore.ExpiredStackInfo, error) {
+	slog.Debug("SQLite START", "method", "GetExpiredStacks")
+	start := time.Now()
+	defer func() { slog.Debug("SQLite END", "method", "GetExpiredStacks", "duration", time.Since(start)) }()
+	_, span := sqliteTracer.Start(context.Background(), "GetExpiredStacks")
+	defer span.End()
+
+	// Get stacks with TTL policies that have expired:
+	// - Handles both inline policies (stack_id set) and standalone policies (via stack_policies junction)
+	// - Calculate expiration as the policy's ExpiresAt, or the stack's creation time plus its TTL
+	// - Exclude stacks with active forma commands
+	// - Only consider latest non-deleted versions of both stacks and policies
+	query := fmt.Sprintf(`
+		WITH latest_stacks AS (
+			SELECT id, label, valid_from, operation,
+			       ROW_NUMBER() OVER (PARTITION BY id ORDER BY version DESC) as rn,
+			       FIRST_VALUE(valid_from) OVER (PARTITION BY id ORDER BY version ASC) as created_at
+			FROM stacks
+		),
+		latest_policies AS (
+			SELECT id, label, stack_id, policy_type, policy_data, operation,
+			       ROW_NUMBER() OVER (PARTITION BY id ORDER BY version DESC) as rn
+			FROM policies
+		),
+		-- Inline policies: stack_id is set directly on the policy
+		inline_expired AS (
+			SELECT s.label as stack_label, s.id as stack_id,
+			       json_extract(p.policy_data, '$.OnDependents') as on_dependents,
+			       s.created_at,
+			       json_extract(p.policy_data, '$.ExpiresAt') as expires_at,
+			       json_extract(p.policy_data, '$.TTLSeconds') as ttl_seconds
+			FROM latest_stacks s
+			JOIN latest_policies p ON p.stack_id = s.id
+			WHERE s.rn = 1 AND s.operation != 'delete'
+			AND p.rn = 1 AND p.operation != 'delete'
+			AND p.policy_type = 'ttl'
+			AND %[1]s
+		),
+		-- Standalone policies: attached via stack_policies junction table
+		standalone_expired AS (
+			SELECT s.label as stack_label, s.id as stack_id,
+			       json_extract(p.policy_data, '$.OnDependents') as on_dependents,
+			       s.created_at,
+			       json_extract(p.policy_data, '$.ExpiresAt') as expires_at,
+			       json_extract(p.policy_data, '$.TTLSeconds') as ttl_seconds
+			FROM latest_stacks s
+			JOIN stack_policies sp ON sp.stack_id = s.id
+			JOIN latest_policies p ON p.id = sp.policy_id
+			WHERE s.rn = 1 AND s.operation != 'delete'
+			AND p.rn = 1 AND p.operation != 'delete'
+			AND p.policy_type = 'ttl'
+			AND (p.stack_id IS NULL OR p.stack_id = '')  -- standalone policies have NULL or empty stack_id
+			AND %[1]s
+		),
+		-- Combine both inline and standalone expired stacks
+		all_expired AS (
+			SELECT * FROM inline_expired
+			UNION
+			SELECT * FROM standalone_expired
+		)
+		SELECT stack_label, stack_id, on_dependents, created_at, expires_at, ttl_seconds
+		FROM all_expired
+		WHERE NOT EXISTS (
+			SELECT 1 FROM resource_updates ru
+			JOIN forma_commands fc ON ru.command_id = fc.command_id
+			WHERE ru.stack_label = all_expired.stack_label
+			AND fc.state NOT IN ('Success', 'Failed', 'Canceled')
+		)
+		ORDER BY created_at
+	`, ttlExpiredPredicateSQLite)
+
+	rows, err := d.conn.Query(query)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+
+	var result []datastore.ExpiredStackInfo
+	for rows.Next() {
+		var info datastore.ExpiredStackInfo
+		var onDependents, expiresAt, createdAt sql.NullString
+		var ttlSeconds sql.NullInt64
+		if err := rows.Scan(&info.StackLabel, &info.StackID, &onDependents,
+			&createdAt, &expiresAt, &ttlSeconds); err != nil {
+			return nil, err
+		}
+		info.StackCreatedAt = parseSQLiteTimestamp(createdAt.String)
+		if onDependents.Valid {
+			info.OnDependents = onDependents.String
+		} else {
+			info.OnDependents = "abort" // default
+		}
+		info.ExpiresAt = expiresAt.String
+		if ttlSeconds.Valid {
+			info.TTLSeconds = &ttlSeconds.Int64
+		}
+		result = append(result, info)
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
+	return datastore.DedupeExpiredStacks(result), nil
+}
+
+func (d DatastoreSQLite) GetStacksWithAutoReconcilePolicy() ([]datastore.StackReconcileInfo, error) {
+	_, span := sqliteTracer.Start(context.Background(), "GetStacksWithAutoReconcilePolicy")
+	defer span.End()
+
+	// Get stacks with auto-reconcile policies:
+	// - Handles both inline policies (stack_id set) and standalone policies (via stack_policies junction)
+	// - Extract IntervalSeconds from policy_data
+	// - Find last reconcile timestamp from forma_commands
+	query := `
+		WITH latest_stacks AS (
+			SELECT id, label, valid_from, operation,
+			       ROW_NUMBER() OVER (PARTITION BY id ORDER BY version DESC) as rn
+			FROM stacks
+		),
+		latest_policies AS (
+			SELECT id, label, stack_id, policy_type, policy_data, operation,
+			       ROW_NUMBER() OVER (PARTITION BY id ORDER BY version DESC) as rn
+			FROM policies
+		),
+		-- Inline auto-reconcile policies: stack_id is set directly on the policy
+		inline_auto_reconcile AS (
+			SELECT s.label as stack_label, s.id as stack_id,
+			       CAST(json_extract(p.policy_data, '$.IntervalSeconds') AS INTEGER) as interval_seconds
+			FROM latest_stacks s
+			JOIN latest_policies p ON p.stack_id = s.id
+			WHERE s.rn = 1 AND s.operation != 'delete'
+			AND p.rn = 1 AND p.operation != 'delete'
+			AND p.policy_type = 'auto-reconcile'
+		),
+		-- Standalone auto-reconcile policies: attached via stack_policies junction table
+		standalone_auto_reconcile AS (
+			SELECT s.label as stack_label, s.id as stack_id,
+			       CAST(json_extract(p.policy_data, '$.IntervalSeconds') AS INTEGER) as interval_seconds
+			FROM latest_stacks s
+			JOIN stack_policies sp ON sp.stack_id = s.id
+			JOIN latest_policies p ON p.id = sp.policy_id
+			WHERE s.rn = 1 AND s.operation != 'delete'
+			AND p.rn = 1 AND p.operation != 'delete'
+			AND p.policy_type = 'auto-reconcile'
+			AND (p.stack_id IS NULL OR p.stack_id = '')
+		),
+		-- Combine both inline and standalone
+		all_auto_reconcile AS (
+			SELECT * FROM inline_auto_reconcile
+			UNION
+			SELECT * FROM standalone_auto_reconcile
+		),
+		-- Find last reconcile timestamp for each stack
+        last_reconcile AS (
+            SELECT s.id AS stack_id, MAX(fc.timestamp) AS last_reconcile_at
+            FROM latest_stacks s
+            JOIN forma_commands fc ON fc.config_mode='reconcile' AND fc.command='apply'
+              AND fc.state='Success'
+              AND (fc.source IS NULL OR fc.source IN ('','user','auto-reconciler','stack-expirer'))
+              AND (EXISTS (SELECT 1 FROM command_stacks cs WHERE cs.command_id=fc.command_id AND cs.stack_id=s.id AND cs.stack_label=s.label)
+                OR (NOT EXISTS (SELECT 1 FROM command_stacks cs WHERE cs.command_id=fc.command_id AND cs.stack_label=s.label)
+                  AND NOT EXISTS (SELECT 1 FROM stacks sa JOIN stacks sb ON sa.label=sb.label AND sa.id!=sb.id WHERE sa.label=s.label)
+                  AND EXISTS (SELECT 1 FROM resource_updates ru WHERE ru.command_id=fc.command_id AND ru.stack_label=s.label)))
+            WHERE s.rn=1 AND s.operation!='delete'
+            GROUP BY s.id
+        )
+		SELECT ar.stack_label, ar.stack_id, ar.interval_seconds,
+		       COALESCE(lr.last_reconcile_at, '1970-01-01 00:00:00') as last_reconcile_at
+		FROM all_auto_reconcile ar
+		LEFT JOIN last_reconcile lr ON ar.stack_id = lr.stack_id
+	`
+
+	rows, err := d.conn.Query(query)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+
+	var result []datastore.StackReconcileInfo
+	for rows.Next() {
+		var info datastore.StackReconcileInfo
+		var lastReconcileStr string
+		if err := rows.Scan(&info.StackLabel, &info.StackID, &info.IntervalSeconds, &lastReconcileStr); err != nil {
+			return nil, err
+		}
+		info.LastReconcileAt = parseSQLiteTimestamp(lastReconcileStr)
+		if info.LastReconcileAt.IsZero() {
+			return nil, fmt.Errorf("invalid reconcile timestamp %q", lastReconcileStr)
+		}
+		result = append(result, info)
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
+	return result, nil
+}
+
+// GetGeneratorsWithRotation returns every live generator with the instant its
+// last rotation committed. The cadence itself is read from the stored spec by
+// datastore.RotationInfoFromRows, so this query never parses JSON.
+//
+// A new generation_id marks a draw; config edits carry the existing ID
+// forward. Compare adjacent versions before filtering by command success so
+// neither a schedule edit nor a copied failed draw can advance the anchor.
+//
+// last_committed_draw is the derivation the rotation scheduler runs on: a
+// generation row records that a value was drawn and the command that drew it,
+// and joining that command's state is what says whether the value ever reached
+// its destinations. A command that is not Success advances nothing, so a
+// failed authority-side update leaves the cadence measured from the previous
+// success. The command's start is the instant used, matching how the
+// auto-reconcile schedule reads fc.timestamp.
+func (d DatastoreSQLite) GetGeneratorsWithRotation() ([]datastore.GeneratorRotationInfo, error) {
+	_, span := sqliteTracer.Start(context.Background(), "GetGeneratorsWithRotation")
+	defer span.End()
+
+	query := `
+		WITH latest_generators AS (
+			SELECT id, label, stack_id, generator_data, operation,
+			       ROW_NUMBER() OVER (PARTITION BY id ORDER BY version DESC) as rn
+			FROM generators
+		),
+		latest_stacks AS (
+			SELECT id, label, operation,
+			       ROW_NUMBER() OVER (PARTITION BY id ORDER BY version DESC) as rn
+			FROM stacks
+		),
+		generator_history AS (
+			SELECT id, command_id, generation_id,
+			       LAG(generation_id) OVER (PARTITION BY id ORDER BY version) as previous_generation_id
+			FROM generators
+		),
+		last_committed_draw AS (
+			SELECT g.id as generator_id, MAX(fc.timestamp) as last_rotation_at
+			FROM generator_history g
+			JOIN forma_commands fc ON fc.command_id = g.command_id
+			WHERE g.generation_id != '' AND fc.state = 'Success'
+			AND (g.previous_generation_id IS NULL OR g.previous_generation_id != g.generation_id)
+			GROUP BY g.id
+		)
+		SELECT g.id, g.label, s.label, g.generator_data,
+		       COALESCE(d.last_rotation_at, '') as last_rotation_at
+		FROM latest_generators g
+		JOIN latest_stacks s ON s.id = g.stack_id
+		LEFT JOIN last_committed_draw d ON d.generator_id = g.id
+		WHERE g.rn = 1 AND g.operation != 'delete'
+		AND s.rn = 1 AND s.operation != 'delete'
+	`
+
+	rows, err := d.conn.Query(query)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+
+	var rotationRows []datastore.GeneratorRotationRow
+	for rows.Next() {
+		var row datastore.GeneratorRotationRow
+		var lastRotationStr string
+		if err := rows.Scan(&row.GeneratorID, &row.Label, &row.StackLabel, &row.GeneratorData, &lastRotationStr); err != nil {
+			return nil, err
+		}
+		if lastRotationStr != "" {
+			row.LastRotationAt = parseSQLiteTimestamp(lastRotationStr)
+			if row.LastRotationAt.IsZero() {
+				// An unreadable instant must not read as "never rotated":
+				// that would rotate the credential on every sweep.
+				return nil, fmt.Errorf("generator %s: cannot read the instant of its last committed draw", row.GeneratorID)
+			}
+			row.LastRotationAt = row.LastRotationAt.UTC()
+		}
+		rotationRows = append(rotationRows, row)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
+	return datastore.RotationInfoFromRows(rotationRows)
+}
+
+func (d DatastoreSQLite) GetResourcesAtLastReconcile(stackLabel string) ([]datastore.ResourceSnapshot, error) {
+	_, span := sqliteTracer.Start(context.Background(), "GetResourcesAtLastReconcile")
+	defer span.End()
+
+	// Declared state for auto-reconcile: per-resource DesiredState from the
+	// most recent user-source reconcile that touched each resource. Failed
+	// reconciles count (so failed updates are retried until they converge);
+	// Canceled and InProgress reconciles do not (they aren't accepted user
+	// intent).
+	//
+	// Reading per-resource identity rather than per-command is the key invariant.
+	// The generator only emits resource_updates rows for resources whose
+	// state actually changes — unchanged resources produce no row. If we
+	// scoped the snapshot to a single reconcile command, a partial reconcile
+	// that changed only some resources would yield a desired-state Forma
+	// that omits the unchanged ones, and auto-reconcile would implicitly
+	// delete them as drift. Taking the most recent user-source reconcile
+	// row per stable stack/type/label identity keeps unchanged resources
+	// represented by the earlier reconcile that last declared them. Immutable
+	// replacements may mint a successor ksuid; that physical history must not
+	// produce duplicate current declarations for one authored identity.
+	//
+	// Destroy commands also contribute to the baseline. A destroy is the
+	// user's latest declaration that the named resources should not exist —
+	// its resource_updates rows have operation='delete' and become the
+	// latest-per-ksuid touch for any destroyed resource. The outer filter
+	// (operation != 'delete') then drops them from the snapshot, yielding
+	// the correct empty desired baseline for fully-destroyed stacks (or
+	// the correctly trimmed baseline for partial destroys). Without this
+	// branch, a destroy is invisible to the baseline and auto-reconcile
+	// resurrects the destroyed resources on its next beat.
+	//
+	// Destroys land in forma_commands with command='destroy' and
+	// config_mode='patch' (the API server's DestroyForma path sends only
+	// Simulate; FormaCommandFromForma defaults empty Mode to Patch), so
+	// the OR branch admits them without further filtering on config_mode.
+	//
+	// Delete operations are excluded from the outer SELECT: a deletion the
+	// user requested is not part of the desired state going forward.
+	// Legacy commands have no command_stacks row and may start before the
+	// stack they create is persisted. The single-incarnation guard below,
+	// not the command timestamp, makes label-based identity recovery safe.
+	// Legacy retries minted new IDs. A later successful reconcile fulfills a
+	// never-created failed attempt of the same identity; retain its command
+	// history, but don't render duplicate declarations or resurrect it after
+	// the successful successor is deleted. Modern intent stays explicit.
+	query := `
+		WITH user_reconcile_updates AS (
+			SELECT ru.ksuid, ru.resource, ru.operation, fc.timestamp, fc.command_id,
+              ru.state AS resource_state,
+              CASE WHEN ru.operation='create' AND ru.state='Failed'
+                AND NOT EXISTS (SELECT 1 FROM command_stacks legacy_cs WHERE legacy_cs.command_id=fc.command_id)
+                AND NOT EXISTS (SELECT 1 FROM resources physical WHERE physical.ksuid=ru.ksuid)
+                THEN 1 ELSE 0 END AS legacy_failed_create,
+              json_extract(ru.resource, '$.Label') AS declared_label,
+              json_extract(ru.resource, '$.Type') AS declared_type,
+              json_extract(ru.resource, '$.Target') AS declared_target,
+              COALESCE((SELECT MAX(cs.stack_id) FROM command_stacks cs WHERE cs.command_id=fc.command_id AND cs.stack_label=ru.stack_label),
+                (SELECT MIN(h.id) FROM stacks h WHERE h.label=ru.stack_label)) AS stack_id
+			FROM resource_updates ru
+			INNER JOIN forma_commands fc ON ru.command_id = fc.command_id
+			WHERE (
+				(fc.command = 'apply' AND fc.config_mode = 'reconcile')
+				OR fc.command = 'destroy'
+			)
+			AND fc.state IN ('Success', 'Failed')
+			AND ru.source = 'user'
+            AND (fc.source IS NULL OR fc.source IN ('','user','auto-reconciler','stack-expirer'))
+            AND (NOT EXISTS (SELECT 1 FROM command_stacks cs WHERE cs.command_id = fc.command_id AND cs.stack_label = ru.stack_label)
+                 AND NOT EXISTS (SELECT 1 FROM stacks sa JOIN stacks sb ON sa.label=sb.label AND sa.id!=sb.id WHERE sa.label=ru.stack_label)
+                 OR EXISTS (SELECT 1 FROM command_stacks cs JOIN stacks current_stack ON current_stack.id = cs.stack_id
+                   WHERE cs.command_id = fc.command_id AND current_stack.label = ru.stack_label AND current_stack.operation != 'delete'
+                   AND NOT EXISTS (SELECT 1 FROM stacks newer_stack WHERE newer_stack.label = current_stack.label AND newer_stack.version > current_stack.version)))
+
+			AND ru.stack_label = ?
+		),
+		latest_per_ksuid AS (
+			SELECT ksuid, resource, operation, command_id, stack_id, timestamp, legacy_failed_create, declared_label, declared_type, declared_target,
+			       ROW_NUMBER() OVER (
+			           PARTITION BY ksuid
+			           ORDER BY timestamp DESC,
+			                    command_id DESC,
+			                    CASE WHEN operation = 'delete' THEN 1 ELSE 0 END
+			       ) as physical_rn
+			FROM user_reconcile_updates
+		),
+		latest_per_identity AS (
+			SELECT ksuid, resource, operation, command_id, stack_id, timestamp, legacy_failed_create, declared_label, declared_type, declared_target,
+			       ROW_NUMBER() OVER (
+			           PARTITION BY stack_id, declared_label, LOWER(declared_type)
+			           ORDER BY timestamp DESC,
+			                    command_id DESC,
+			                    CASE WHEN operation = 'delete' THEN 1 ELSE 0 END
+			       ) as rn
+			FROM latest_per_ksuid
+			WHERE physical_rn = 1
+		)
+		SELECT ksuid, resource, command_id, stack_id
+		FROM latest_per_identity
+		WHERE rn = 1 AND operation NOT IN ('delete', 'accept_delete', 'withdraw')
+          AND NOT (legacy_failed_create=1 AND EXISTS (
+            SELECT 1 FROM user_reconcile_updates successor
+            WHERE successor.timestamp > latest_per_identity.timestamp
+              AND successor.ksuid != latest_per_identity.ksuid
+              AND successor.stack_id = latest_per_identity.stack_id
+              AND successor.declared_label = latest_per_identity.declared_label
+              AND successor.declared_type = latest_per_identity.declared_type
+              AND successor.declared_target = latest_per_identity.declared_target
+              AND successor.resource_state='Success'
+              AND successor.operation IN ('create','update','accept')
+          ))
+		ORDER BY ksuid ASC
+	`
+
+	rows, err := d.conn.Query(query, stackLabel)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+
+	var result []datastore.ResourceSnapshot
+	for rows.Next() {
+		var ksuid, declaration, commandID string
+		var stackID sql.NullString
+		if err := rows.Scan(&ksuid, &declaration, &commandID, &stackID); err != nil {
+			return nil, err
+		}
+		snapshot, err := datastore.DecodeDesiredSnapshot(ksuid, commandID, stackID.String, []byte(declaration))
+		if err != nil {
+			return nil, err
+		}
+
+		result = append(result, snapshot)
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
+	return result, nil
+}
+
+func (d DatastoreSQLite) StackHasActiveCommands(stackLabel string) (bool, error) {
+	_, span := sqliteTracer.Start(context.Background(), "StackHasActiveCommands")
+	defer span.End()
+
+	query := `
+		SELECT EXISTS (
+			SELECT 1 FROM resource_updates ru
+			JOIN forma_commands fc ON ru.command_id = fc.command_id
+			WHERE ru.stack_label = ?
+			AND fc.state NOT IN ('Success', 'Failed', 'Canceled')
+		)
+	`
+
+	var exists bool
+	err := d.conn.QueryRow(query, stackLabel).Scan(&exists)
+	if err != nil {
+		return false, err
+	}
+
+	return exists, nil
+}
+
+func (d DatastoreSQLite) CreateTarget(target *pkgmodel.Target) (string, error) {
+	_, span := sqliteTracer.Start(context.Background(), "CreateTarget")
+	defer span.End()
+
+	cfg, err := json.Marshal(target.Config)
+	if err != nil {
+		return "", err
+	}
+	cfg, err = datastore.StripOpaqueRefValues(cfg)
+	if err != nil {
+		return "", fmt.Errorf("failed to strip opaque ref values from target config: %w", err)
+	}
+
+	var configSchemaJSON []byte
+	if len(target.ConfigSchema.Hints) > 0 {
+		configSchemaJSON, err = json.Marshal(target.ConfigSchema)
+		if err != nil {
+			return "", err
+		}
+	}
+
+	incarnationID := mksuid.New().String()
+
+	reapKind, reapMaxUnreachableSeconds, err := pkgmodel.ReapingToColumns(target.Reaping)
+	if err != nil {
+		return "", err
+	}
+
+	query := `INSERT INTO targets (label, version, namespace, config, config_schema, discoverable, target_incarnation_id, health_state, unreachable_accum_seconds, reap_kind, reap_max_unreachable_seconds) VALUES (?, 1, ?, ?, ?, ?, ?, 'unknown', 0, ?, ?)`
+	_, err = d.conn.Exec(query, target.Label, target.Namespace, cfg, configSchemaJSON, datastore.BoolToInt(target.Discoverable), incarnationID, reapKind, reapMaxUnreachableSeconds)
+	if err != nil {
+		slog.Debug("Failed to create target (may be retried as update)", "error", err, "label", target.Label)
+		return "", err
+	}
+
+	target.ExecutionIncarnation = incarnationID
+	return fmt.Sprintf("%s_1", target.Label), nil
+}
+
+func (d DatastoreSQLite) UpdateTarget(target *pkgmodel.Target) (string, error) {
+	_, span := sqliteTracer.Start(context.Background(), "UpdateTarget")
+	defer span.End()
+
+	// Load the latest row to carry health state forward onto the new version.
+	healthQuery := `
+		SELECT version, target_incarnation_id, health_state, last_seen_at, observed_at,
+		       first_unreachable_at, last_sample_at, unreachable_accum_seconds, last_error_code
+		FROM targets WHERE label = ? ORDER BY version DESC LIMIT 1`
+	healthRow := d.conn.QueryRow(healthQuery, target.Label)
+
+	var currentVersion int64
+	var incarnationID, healthState sql.NullString
+	var lastSeenAt, observedAt, firstUnreachableAt, lastSampleAt sql.NullString
+	var unreachableAccumSeconds sql.NullInt64
+	var lastErrorCode sql.NullString
+	if err := healthRow.Scan(&currentVersion, &incarnationID, &healthState, &lastSeenAt, &observedAt,
+		&firstUnreachableAt, &lastSampleAt, &unreachableAccumSeconds, &lastErrorCode); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return "", fmt.Errorf("target %s does not exist, cannot update", target.Label)
+		}
+		return "", err
+	}
+
+	newVersion := int(currentVersion) + 1
+
+	cfg, err := json.Marshal(target.Config)
+	if err != nil {
+		return "", err
+	}
+	cfg, err = datastore.StripOpaqueRefValues(cfg)
+	if err != nil {
+		return "", fmt.Errorf("failed to strip opaque ref values from target config: %w", err)
+	}
+
+	var configSchemaJSON []byte
+	if len(target.ConfigSchema.Hints) > 0 {
+		configSchemaJSON, err = json.Marshal(target.ConfigSchema)
+		if err != nil {
+			return "", err
+		}
+	}
+
+	reapKind, reapMaxUnreachableSeconds, err := pkgmodel.ReapingToColumns(target.Reaping)
+	if err != nil {
+		return "", err
+	}
+
+	// Recovery: when the current row has been reaped, re-declaring the target
+	// brings it back to life. Mint a fresh incarnation id and reset health to
+	// 'unknown' (accrual 0, timestamps cleared) rather than carrying the reaped
+	// state forward — a new incarnation makes stale in-flight observations for
+	// the old incarnation no-ops.
+	newIncarnationID := incarnationID.String
+	newHealthState := healthState.String
+	newLastSeenAt := lastSeenAt
+	newObservedAt := observedAt
+	newFirstUnreachableAt := firstUnreachableAt
+	newLastSampleAt := lastSampleAt
+	newUnreachableAccumSeconds := unreachableAccumSeconds.Int64
+	newLastErrorCode := lastErrorCode
+	recovered := healthState.String == pkgmodel.TargetHealthStateReaped
+	if recovered {
+		newIncarnationID = mksuid.New().String()
+		newHealthState = pkgmodel.TargetHealthStateUnknown
+		newLastSeenAt = sql.NullString{}
+		newObservedAt = sql.NullString{}
+		newFirstUnreachableAt = sql.NullString{}
+		newLastSampleAt = sql.NullString{}
+		newUnreachableAccumSeconds = 0
+		newLastErrorCode = sql.NullString{}
+	}
+
+	insertQuery := `
+		INSERT INTO targets (label, version, namespace, config, config_schema, discoverable,
+		                     target_incarnation_id, health_state, last_seen_at, observed_at,
+		                     first_unreachable_at, last_sample_at, unreachable_accum_seconds, last_error_code,
+		                     reap_kind, reap_max_unreachable_seconds)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+
+	// The version INSERT and the recovery un-reap must be atomic. A crash strictly
+	// between them would leave the target recovered (fresh incarnation, health
+	// 'unknown') while its resources stayed marked 'reaped'; a resumed UpdateTarget
+	// would not re-trigger the un-reap (the target is no longer reaped), stranding
+	// those resources as invisible tombstones the write-guard permanently rejects.
+	// One transaction makes it both-or-neither.
+	tx, err := d.conn.Begin()
+	if err != nil {
+		return "", fmt.Errorf("failed to begin target update transaction: %w", err)
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			_ = tx.Rollback()
+		}
+	}()
+
+	_, err = tx.Exec(insertQuery, target.Label, newVersion, target.Namespace, cfg, configSchemaJSON,
+		datastore.BoolToInt(target.Discoverable),
+		newIncarnationID, newHealthState,
+		newLastSeenAt, newObservedAt, newFirstUnreachableAt, newLastSampleAt,
+		newUnreachableAccumSeconds, newLastErrorCode,
+		reapKind, reapMaxUnreachableSeconds)
+	if err != nil {
+		slog.Error("Failed to update target", "error", err, "label", target.Label, "version", newVersion)
+		return "", err
+	}
+
+	// Recovery: bring the reaped target's tombstoned resource rows back to life
+	// and stamp them with the fresh incarnation. Reaping flipped each current-row
+	// resource on this target to the 'reaped' marker in place; recovery reverses
+	// that so the resources are visible again and any subsequent re-adopt write
+	// (which now carries — or, post-crash, omits — the fresh incarnation) is
+	// accepted by the resource-write guard instead of being rejected as a
+	// tombstone. Delete tombstones are left untouched.
+	if recovered {
+		if _, err = tx.Exec(`
+			UPDATE resources SET operation = ?, target_incarnation_id = ?
+			WHERE target = ?
+			  AND operation = 'reaped'
+			  AND NOT EXISTS (
+			    SELECT 1 FROM resources r2
+			    WHERE r2.uri = resources.uri AND r2.version > resources.version
+			  )`,
+			string(resource_update.OperationUpdate), newIncarnationID, target.Label); err != nil {
+			slog.Error("Failed to un-reap resources on target recovery", "error", err, "label", target.Label)
+			return "", err
+		}
+	}
+
+	if err = tx.Commit(); err != nil {
+		return "", fmt.Errorf("failed to commit target update transaction: %w", err)
+	}
+	committed = true
+
+	target.ExecutionIncarnation = newIncarnationID
+	return fmt.Sprintf("%s_%d", target.Label, newVersion), nil
+}
+
+func (d DatastoreSQLite) DeleteTarget(targetLabel string) (string, error) {
+	_, span := sqliteTracer.Start(context.Background(), "DeleteTarget")
+	defer span.End()
+
+	// Hard delete all versions of the target
+	query := `DELETE FROM targets WHERE label = ?`
+	result, err := d.conn.Exec(query, targetLabel)
+	if err != nil {
+		slog.Error("Failed to delete target", "error", err, "label", targetLabel)
+		return "", err
+	}
+
+	rowsAffected, err := result.RowsAffected()
+	if err != nil {
+		return "", err
+	}
+
+	if rowsAffected == 0 {
+		return "", fmt.Errorf("target %s does not exist, cannot delete", targetLabel)
+	}
+
+	return fmt.Sprintf("%s_deleted", targetLabel), nil
+}
+
+func (d DatastoreSQLite) CountResourcesInTarget(targetLabel string) (int, error) {
+	_, span := sqliteTracer.Start(context.Background(), "CountResourcesInTarget")
+	defer span.End()
+
+	// Count only latest version of resources that haven't been deleted
+	query := `
+		SELECT COUNT(*) FROM resources r1
+		WHERE target = ?
+		AND NOT EXISTS (
+			SELECT 1 FROM resources r2
+			WHERE r1.uri = r2.uri
+			AND r2.version > r1.version
+		)
+		AND operation != ? AND operation != 'reaped'
+	`
+	row := d.conn.QueryRow(query, targetLabel, resource_update.OperationDelete)
+
+	var count int
+	if err := row.Scan(&count); err != nil {
+		return 0, err
+	}
+
+	return count, nil
+}
+
+func (d DatastoreSQLite) UpdateTargetHealth(obs pkgmodel.TargetHealthObservation) (bool, error) {
+	_, span := sqliteTracer.Start(context.Background(), "UpdateTargetHealth")
+	defer span.End()
+
+	observedAt := obs.ObservedAt.UTC().Format(time.RFC3339Nano)
+
+	var lastSeenAt any
+	if obs.LastSeenAt != nil {
+		lastSeenAt = obs.LastSeenAt.UTC().Format(time.RFC3339Nano)
+	}
+
+	var lastErrorCode any
+	if obs.LastErrorCode != "" {
+		lastErrorCode = obs.LastErrorCode
+	}
+
+	// A reachable ("success") observation clears any accrued unreachability:
+	// the target is healthy again, so first_unreachable_at and the accumulated
+	// unreachable seconds reset to their pristine (never-unreachable) values.
+	accrualReset := ""
+	if obs.State == pkgmodel.TargetHealthStateReachable {
+		accrualReset = `,
+				first_unreachable_at = NULL,
+				unreachable_accum_seconds = 0`
+	}
+
+	// Base WHERE: label matches max-version row, not reaped, monotonic guard on observed_at.
+	// SQLite stores timestamps as text; NULL observed_at means no prior observation, so allow it.
+	var query string
+	var args []any
+	if obs.IncarnationID != "" {
+		query = fmt.Sprintf(`
+			UPDATE targets SET
+				health_state = ?,
+				observed_at = ?,
+				last_seen_at = COALESCE(?, last_seen_at),
+				last_error_code = ?%s
+			WHERE label = ?
+			  AND version = (SELECT MAX(version) FROM targets WHERE label = ?)
+			  AND health_state <> 'reaped'
+			  AND (observed_at IS NULL OR julianday(observed_at) < julianday(?))
+			  AND target_incarnation_id = ?`, accrualReset)
+		args = []any{obs.State, observedAt, lastSeenAt, lastErrorCode,
+			obs.TargetLabel, obs.TargetLabel, observedAt, obs.IncarnationID}
+	} else {
+		query = fmt.Sprintf(`
+			UPDATE targets SET
+				health_state = ?,
+				observed_at = ?,
+				last_seen_at = COALESCE(?, last_seen_at),
+				last_error_code = ?%s
+			WHERE label = ?
+			  AND version = (SELECT MAX(version) FROM targets WHERE label = ?)
+			  AND health_state <> 'reaped'
+			  AND (observed_at IS NULL OR julianday(observed_at) < julianday(?))`, accrualReset)
+		args = []any{obs.State, observedAt, lastSeenAt, lastErrorCode,
+			obs.TargetLabel, obs.TargetLabel, observedAt}
+	}
+
+	result, err := d.conn.Exec(query, args...)
+	if err != nil {
+		return false, err
+	}
+	n, err := result.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	return n == 1, nil
+}
+
+func (d DatastoreSQLite) AdvanceTargetAccrual(targetLabel, incarnationID string, lastSampleAt time.Time, deltaSeconds int64) (bool, error) {
+	_, span := sqliteTracer.Start(context.Background(), "AdvanceTargetAccrual")
+	defer span.End()
+
+	query := `
+		UPDATE targets SET
+			unreachable_accum_seconds = unreachable_accum_seconds + ?,
+			last_sample_at = ?
+		WHERE label = ?
+		  AND version = (SELECT MAX(version) FROM targets WHERE label = ?)
+		  AND health_state = 'unreachable'
+		  AND target_incarnation_id = ?`
+
+	result, err := d.conn.Exec(query, deltaSeconds, lastSampleAt.UTC().Format(time.RFC3339Nano),
+		targetLabel, targetLabel, incarnationID)
+	if err != nil {
+		return false, err
+	}
+	n, err := result.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	return n == 1, nil
+}
+
+func (d DatastoreSQLite) GetUnreachableTargets() ([]*pkgmodel.Target, error) {
+	_, span := sqliteTracer.Start(context.Background(), "GetUnreachableTargets")
+	defer span.End()
+
+	var targets []*pkgmodel.Target
+
+	query := `
+		SELECT label, version, namespace, config, config_schema, discoverable,
+		       target_incarnation_id, health_state, last_seen_at, observed_at,
+		       first_unreachable_at, last_sample_at, unreachable_accum_seconds, last_error_code,
+		       reap_kind, reap_max_unreachable_seconds
+		FROM targets t1
+		WHERE NOT EXISTS (
+			SELECT 1
+			FROM targets t2
+			WHERE t1.label = t2.label
+			AND t2.version > t1.version
+		)
+		AND t1.health_state = 'unreachable'`
+	rows, err := d.conn.Query(query)
+	if err != nil {
+		return nil, err
+	}
+	defer closeRows(rows)
+
+	for rows.Next() {
+		var label, namespace string
+		var version int
+		var config json.RawMessage
+		var configSchemaStr sql.NullString
+		var discoverable int
+		var incarnationID, healthState string
+		var lastSeenAt, observedAt, firstUnreachableAt, lastSampleAt sql.NullString
+		var unreachableAccumSeconds int64
+		var lastErrorCode sql.NullString
+		var reapKind string
+		var reapMaxUnreachableSeconds int64
+		if err := rows.Scan(&label, &version, &namespace, &config, &configSchemaStr, &discoverable,
+			&incarnationID, &healthState, &lastSeenAt, &observedAt,
+			&firstUnreachableAt, &lastSampleAt, &unreachableAccumSeconds, &lastErrorCode,
+			&reapKind, &reapMaxUnreachableSeconds); err != nil {
+			return nil, err
+		}
+
+		var configSchema pkgmodel.ConfigSchema
+		if configSchemaStr.Valid {
+			if err := json.Unmarshal([]byte(configSchemaStr.String), &configSchema); err != nil {
+				return nil, fmt.Errorf("failed to unmarshal config_schema for target %s: %w", label, err)
+			}
+		}
+
+		targets = append(targets, &pkgmodel.Target{
+			Label:        label,
+			Namespace:    namespace,
+			Config:       config,
+			ConfigSchema: configSchema,
+			Discoverable: discoverable == 1,
+			Version:      version,
+			Reaping:      pkgmodel.ReapingRawFromColumns(reapKind, reapMaxUnreachableSeconds),
+			Health: scanSQLiteTargetHealth(incarnationID, healthState, lastSeenAt, observedAt,
+				firstUnreachableAt, lastSampleAt, unreachableAccumSeconds, lastErrorCode),
+		})
+	}
+
+	return targets, rows.Err()
+}
+
+func (d DatastoreSQLite) CheckTargetsReaped(labels []string) ([]string, error) {
+	_, span := sqliteTracer.Start(context.Background(), "CheckTargetsReaped")
+	defer span.End()
+
+	if len(labels) == 0 {
+		return nil, nil
+	}
+
+	placeholders := make([]string, len(labels))
+	args := make([]any, len(labels))
+	for i, label := range labels {
+		placeholders[i] = "?"
+		args[i] = label
+	}
+
+	query := fmt.Sprintf(`
+		SELECT t1.label
+		FROM targets t1
+		WHERE t1.label IN (%s)
+		AND NOT EXISTS (
+			SELECT 1 FROM targets t2
+			WHERE t1.label = t2.label AND t2.version > t1.version
+		)
+		AND t1.health_state = 'reaped'`, strings.Join(placeholders, ","))
+
+	rows, err := d.conn.Query(query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer closeRows(rows)
+
+	var reaped []string
+	for rows.Next() {
+		var label string
+		if err := rows.Scan(&label); err != nil {
+			return nil, err
+		}
+		reaped = append(reaped, label)
+	}
+
+	return reaped, rows.Err()
+}
+
+// PersistTargetReap performs the whole target reap in one transaction. See the
+// Datastore interface for the contract. SQLite compares the text-stored grace
+// timestamps via julianday() (mirroring UpdateTargetHealth) so fractional-second
+// formatting can't skew the comparison.
+func (d DatastoreSQLite) PersistTargetReap(req datastore.PersistTargetReapRequest) (bool, []string, error) {
+	_, span := sqliteTracer.Start(context.Background(), "PersistTargetReap")
+	defer span.End()
+
+	tx, err := d.conn.Begin()
+	if err != nil {
+		return false, nil, fmt.Errorf("failed to begin transaction: %w", err)
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			_ = tx.Rollback()
+		}
+	}()
+
+	lastSeenBefore := req.LastSeenBefore.UTC().Format(time.RFC3339Nano)
+	lastSampleBefore := req.LastSampleBefore.UTC().Format(time.RFC3339Nano)
+
+	// 1. Conditional transition FIRST — the atomic CAS (no locks). The reap
+	//    thresholds are re-read from the row's OWN persisted columns, never
+	//    trusted from the request.
+	casQuery := `
+		UPDATE targets SET health_state = 'reaped'
+		WHERE label = ?
+		  AND version = (SELECT MAX(version) FROM targets WHERE label = ?)
+		  AND target_incarnation_id = ?
+		  AND health_state = 'unreachable'
+		  AND reap_kind = 'after'
+		  AND unreachable_accum_seconds >= reap_max_unreachable_seconds
+		  AND julianday(last_seen_at) <= julianday(?)
+		  AND julianday(last_sample_at) <= julianday(?)`
+	casRes, err := tx.Exec(casQuery, req.Label, req.Label, req.IncarnationID, lastSeenBefore, lastSampleBefore)
+	if err != nil {
+		return false, nil, err
+	}
+	n, err := casRes.RowsAffected()
+	if err != nil {
+		return false, nil, err
+	}
+	if n != 1 {
+		// Not eligible, stale, or already reaped: reap nothing.
+		return false, nil, nil
+	}
+
+	// Read the accrued seconds for the audit row.
+	var accumSeconds int64
+	if err = tx.QueryRow(
+		`SELECT unreachable_accum_seconds FROM targets
+		 WHERE label = ? AND version = (SELECT MAX(version) FROM targets WHERE label = ?)`,
+		req.Label, req.Label,
+	).Scan(&accumSeconds); err != nil {
+		return false, nil, err
+	}
+
+	// 2. Active-command assertion: no incomplete (non-sync) forma_command may
+	//    touch this target label, via a resource_update's resource target or a
+	//    target-update op, across all stacks.
+	var active bool
+	if err = tx.QueryRow(`
+		SELECT
+		  EXISTS (
+		    SELECT 1 FROM resource_updates ru
+		    JOIN forma_commands fc ON ru.command_id = fc.command_id
+		    WHERE fc.command != 'sync'
+		      AND fc.state NOT IN ('Success', 'Failed', 'Canceled')
+		      AND json_extract(ru.resource, '$.Target') = ?
+		  )
+		  OR EXISTS (
+		    SELECT 1 FROM forma_commands fc
+		    WHERE fc.command != 'sync'
+		      AND fc.state NOT IN ('Success', 'Failed', 'Canceled')
+		      AND fc.target_updates IS NOT NULL
+		      AND EXISTS (
+		        SELECT 1 FROM json_each(fc.target_updates) je
+		        WHERE json_extract(je.value, '$.Target.Label') = ?
+		      )
+		  )`, req.Label, req.Label).Scan(&active); err != nil {
+		return false, nil, err
+	}
+	if active {
+		// An in-flight command owns this target; abandon the reap.
+		return false, nil, nil
+	}
+
+	// Collect the distinct stacks whose live resources this reap tombstones, so
+	// the caller can clean up any stack the reap empties. The predicate matches
+	// the tombstone UPDATE below exactly. Rows must be fully read and closed
+	// before the next statement runs on this single-connection transaction.
+	reapedStacks, err := func() ([]string, error) {
+		rows, qErr := tx.Query(`
+			SELECT DISTINCT stack FROM resources
+			WHERE target = ?
+			  AND operation != ? AND operation != 'reaped'
+			  AND NOT EXISTS (
+			    SELECT 1 FROM resources r2
+			    WHERE r2.uri = resources.uri AND r2.version > resources.version
+			  )`, req.Label, resource_update.OperationDelete)
+		if qErr != nil {
+			return nil, qErr
+		}
+		defer closeRows(rows)
+		var stacks []string
+		for rows.Next() {
+			var stack string
+			if sErr := rows.Scan(&stack); sErr != nil {
+				return nil, sErr
+			}
+			stacks = append(stacks, stack)
+		}
+		return stacks, rows.Err()
+	}()
+	if err != nil {
+		return false, nil, err
+	}
+
+	// 3. Tombstone every current-row resource on this target (skipping rows that
+	//    are already delete/reaped tombstones).
+	tombRes, err := tx.Exec(`
+		UPDATE resources SET operation = 'reaped'
+		WHERE target = ?
+		  AND operation != ? AND operation != 'reaped'
+		  AND NOT EXISTS (
+		    SELECT 1 FROM resources r2
+		    WHERE r2.uri = resources.uri AND r2.version > resources.version
+		  )`, req.Label, resource_update.OperationDelete)
+	if err != nil {
+		return false, nil, err
+	}
+	resourceCount, err := tombRes.RowsAffected()
+	if err != nil {
+		return false, nil, err
+	}
+
+	// 4. Insert the UNIQUE audit row.
+	if _, err = tx.Exec(
+		`INSERT INTO target_reap_audit (incarnation_id, label, reaped_at, accum_seconds, resource_count)
+		 VALUES (?, ?, ?, ?, ?)`,
+		req.IncarnationID, req.Label, req.ReapedAt.UTC().Format(time.RFC3339Nano), accumSeconds, resourceCount,
+	); err != nil {
+		return false, nil, err
+	}
+
+	if err = tx.Commit(); err != nil {
+		return false, nil, err
+	}
+	committed = true
+	return true, reapedStacks, nil
+}
+
+// scanSQLiteTargetHealth reads the health columns from a scan result and returns
+// a populated TargetHealth. nullTimestamp is a sql.NullString holding an ISO-8601
+// timestamp string as SQLite stores datetimes as text.
+func scanSQLiteTargetHealth(
+	incarnationID string,
+	healthState string,
+	lastSeenAt sql.NullString,
+	observedAt sql.NullString,
+	firstUnreachableAt sql.NullString,
+	lastSampleAt sql.NullString,
+	unreachableAccumSeconds int64,
+	lastErrorCode sql.NullString,
+) *pkgmodel.TargetHealth {
+	parseTime := func(ns sql.NullString) *time.Time {
+		if !ns.Valid || ns.String == "" {
+			return nil
+		}
+		t, err := time.Parse(time.RFC3339Nano, ns.String)
+		if err != nil {
+			// Try without nanoseconds
+			t, err = time.Parse(time.RFC3339, ns.String)
+			if err != nil {
+				return nil
+			}
+		}
+		return &t
+	}
+
+	h := &pkgmodel.TargetHealth{
+		IncarnationID:           incarnationID,
+		State:                   healthState,
+		LastSeenAt:              parseTime(lastSeenAt),
+		ObservedAt:              parseTime(observedAt),
+		FirstUnreachableAt:      parseTime(firstUnreachableAt),
+		LastSampleAt:            parseTime(lastSampleAt),
+		UnreachableAccumSeconds: unreachableAccumSeconds,
+	}
+	if lastErrorCode.Valid {
+		h.LastErrorCode = lastErrorCode.String
+	}
+	return h
+}
+
+func (d DatastoreSQLite) LoadTarget(label string) (*pkgmodel.Target, error) {
+	_, span := sqliteTracer.Start(context.Background(), "LoadTarget")
+	defer span.End()
+
+	query := `
+		SELECT version, namespace, config, config_schema, discoverable,
+		       target_incarnation_id, health_state, last_seen_at, observed_at,
+		       first_unreachable_at, last_sample_at, unreachable_accum_seconds, last_error_code,
+		       reap_kind, reap_max_unreachable_seconds
+		FROM targets WHERE label = ? ORDER BY version DESC LIMIT 1`
+	row := d.conn.QueryRow(query, label)
+
+	var version int
+	var namespace string
+	var config json.RawMessage
+	var configSchemaStr sql.NullString
+	var discoverable int
+	var incarnationID, healthState string
+	var lastSeenAt, observedAt, firstUnreachableAt, lastSampleAt sql.NullString
+	var unreachableAccumSeconds int64
+	var lastErrorCode sql.NullString
+	var reapKind string
+	var reapMaxUnreachableSeconds int64
+	if err := row.Scan(&version, &namespace, &config, &configSchemaStr, &discoverable,
+		&incarnationID, &healthState, &lastSeenAt, &observedAt,
+		&firstUnreachableAt, &lastSampleAt, &unreachableAccumSeconds, &lastErrorCode,
+		&reapKind, &reapMaxUnreachableSeconds); err != nil {
+		if err == sql.ErrNoRows {
+			return nil, nil // Target not found, return nil without error
+		}
+		return nil, err
+	}
+
+	var configSchema pkgmodel.ConfigSchema
+	if configSchemaStr.Valid {
+		if err := json.Unmarshal([]byte(configSchemaStr.String), &configSchema); err != nil {
+			return nil, fmt.Errorf("failed to unmarshal config_schema for target %s: %w", label, err)
+		}
+	}
+
+	return &pkgmodel.Target{
+		Label:        label,
+		Namespace:    namespace,
+		Config:       config,
+		ConfigSchema: configSchema,
+		Discoverable: discoverable == 1,
+		Version:      version,
+		Reaping:      pkgmodel.ReapingRawFromColumns(reapKind, reapMaxUnreachableSeconds),
+		Health: scanSQLiteTargetHealth(incarnationID, healthState, lastSeenAt, observedAt,
+			firstUnreachableAt, lastSampleAt, unreachableAccumSeconds, lastErrorCode),
+	}, nil
+}
+
+func (d DatastoreSQLite) LoadAllTargets() ([]*pkgmodel.Target, error) {
+	slog.Debug("SQLite START", "method", "LoadAllTargets")
+	start := time.Now()
+	defer func() { slog.Debug("SQLite END", "method", "LoadAllTargets", "duration", time.Since(start)) }()
+	_, span := sqliteTracer.Start(context.Background(), "LoadAllTargets")
+	defer span.End()
+
+	var targets []*pkgmodel.Target
+
+	query := `
+		SELECT label, version, namespace, config, config_schema, discoverable,
+		       target_incarnation_id, health_state, last_seen_at, observed_at,
+		       first_unreachable_at, last_sample_at, unreachable_accum_seconds, last_error_code,
+		       reap_kind, reap_max_unreachable_seconds
+		FROM targets t1
+		WHERE NOT EXISTS (
+			SELECT 1
+			FROM targets t2
+			WHERE t1.label = t2.label
+			AND t2.version > t1.version
+		)`
+	rows, err := d.conn.Query(query)
+	if err != nil {
+		return nil, err
+	}
+
+	defer closeRows(rows)
+
+	for rows.Next() {
+		var label, namespace string
+		var version int
+		var config json.RawMessage
+		var configSchemaStr sql.NullString
+		var discoverable int
+		var incarnationID, healthState string
+		var lastSeenAt, observedAt, firstUnreachableAt, lastSampleAt sql.NullString
+		var unreachableAccumSeconds int64
+		var lastErrorCode sql.NullString
+		var reapKind string
+		var reapMaxUnreachableSeconds int64
+		if err := rows.Scan(&label, &version, &namespace, &config, &configSchemaStr, &discoverable,
+			&incarnationID, &healthState, &lastSeenAt, &observedAt,
+			&firstUnreachableAt, &lastSampleAt, &unreachableAccumSeconds, &lastErrorCode,
+			&reapKind, &reapMaxUnreachableSeconds); err != nil {
+			return nil, err
+		}
+
+		var configSchema pkgmodel.ConfigSchema
+		if configSchemaStr.Valid {
+			if err := json.Unmarshal([]byte(configSchemaStr.String), &configSchema); err != nil {
+				return nil, fmt.Errorf("failed to unmarshal config_schema for target %s: %w", label, err)
+			}
+		}
+
+		targets = append(targets, &pkgmodel.Target{
+			Label:        label,
+			Namespace:    namespace,
+			Config:       config,
+			ConfigSchema: configSchema,
+			Discoverable: discoverable == 1,
+			Version:      version,
+			Reaping:      pkgmodel.ReapingRawFromColumns(reapKind, reapMaxUnreachableSeconds),
+			Health: scanSQLiteTargetHealth(incarnationID, healthState, lastSeenAt, observedAt,
+				firstUnreachableAt, lastSampleAt, unreachableAccumSeconds, lastErrorCode),
+		})
+	}
+
+	return targets, rows.Err()
+}
+
+func (d DatastoreSQLite) LoadTargetsByLabels(targetNames []string) ([]*pkgmodel.Target, error) {
+	_, span := sqliteTracer.Start(context.Background(), "LoadTargetsByLabels")
+	defer span.End()
+
+	if len(targetNames) == 0 {
+		return []*pkgmodel.Target{}, nil
+	}
+
+	placeholders := make([]string, len(targetNames))
+	args := make([]any, len(targetNames))
+
+	for i, name := range targetNames {
+		placeholders[i] = "?"
+		args[i] = name
+	}
+
+	query := fmt.Sprintf(`
+		SELECT t1.label, t1.version, t1.namespace, t1.config, t1.config_schema, t1.discoverable,
+		       t1.target_incarnation_id, t1.health_state, t1.last_seen_at, t1.observed_at,
+		       t1.first_unreachable_at, t1.last_sample_at, t1.unreachable_accum_seconds, t1.last_error_code,
+		       t1.reap_kind, t1.reap_max_unreachable_seconds
+		FROM targets t1
+		WHERE t1.label IN (%s)
+		AND NOT EXISTS (
+			SELECT 1
+			FROM targets t2
+			WHERE t1.label = t2.label
+			AND t2.version > t1.version
+		)`, strings.Join(placeholders, ","))
+
+	rows, err := d.conn.Query(query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer closeRows(rows)
+
+	var targets []*pkgmodel.Target
+	for rows.Next() {
+		var label, namespace string
+		var version int
+		var config json.RawMessage
+		var configSchemaStr sql.NullString
+		var discoverable int
+		var incarnationID, healthState string
+		var lastSeenAt, observedAt, firstUnreachableAt, lastSampleAt sql.NullString
+		var unreachableAccumSeconds int64
+		var lastErrorCode sql.NullString
+		var reapKind string
+		var reapMaxUnreachableSeconds int64
+		if err := rows.Scan(&label, &version, &namespace, &config, &configSchemaStr, &discoverable,
+			&incarnationID, &healthState, &lastSeenAt, &observedAt,
+			&firstUnreachableAt, &lastSampleAt, &unreachableAccumSeconds, &lastErrorCode,
+			&reapKind, &reapMaxUnreachableSeconds); err != nil {
+			return nil, err
+		}
+
+		var configSchema pkgmodel.ConfigSchema
+		if configSchemaStr.Valid {
+			if err := json.Unmarshal([]byte(configSchemaStr.String), &configSchema); err != nil {
+				return nil, fmt.Errorf("failed to unmarshal config_schema for target %s: %w", label, err)
+			}
+		}
+
+		targets = append(targets, &pkgmodel.Target{
+			Label:        label,
+			Namespace:    namespace,
+			Config:       config,
+			ConfigSchema: configSchema,
+			Discoverable: discoverable == 1,
+			Version:      version,
+			Reaping:      pkgmodel.ReapingRawFromColumns(reapKind, reapMaxUnreachableSeconds),
+			Health: scanSQLiteTargetHealth(incarnationID, healthState, lastSeenAt, observedAt,
+				firstUnreachableAt, lastSampleAt, unreachableAccumSeconds, lastErrorCode),
+		})
+	}
+
+	return targets, rows.Err()
+}
+
+func (d DatastoreSQLite) LoadDiscoverableTargets() ([]*pkgmodel.Target, error) {
+	_, span := sqliteTracer.Start(context.Background(), "LoadDiscoverableTargets")
+	defer span.End()
+
+	// Get latest version per label where discoverable = true
+	// Deduplicate by config across all namespaces
+	query := `
+		WITH latest_targets AS (
+			SELECT label, version, namespace, config, config_schema, discoverable,
+			       target_incarnation_id, health_state, last_seen_at, observed_at,
+			       first_unreachable_at, last_sample_at, unreachable_accum_seconds, last_error_code,
+			       reap_kind, reap_max_unreachable_seconds
+			FROM targets t1
+			WHERE discoverable = 1
+			AND NOT EXISTS (
+				SELECT 1
+				FROM targets t2
+				WHERE t1.label = t2.label
+				AND t2.version > t1.version
+			)
+		)
+		SELECT label, version, namespace, config, config_schema, discoverable,
+		       target_incarnation_id, health_state, last_seen_at, observed_at,
+		       first_unreachable_at, last_sample_at, unreachable_accum_seconds, last_error_code,
+		       reap_kind, reap_max_unreachable_seconds
+		FROM latest_targets
+		GROUP BY config
+		HAVING version = MAX(version)`
+
+	rows, err := d.conn.Query(query)
+	if err != nil {
+		return nil, err
+	}
+	defer closeRows(rows)
+
+	var targets []*pkgmodel.Target
+	for rows.Next() {
+		var label, ns string
+		var version int
+		var config json.RawMessage
+		var configSchemaStr sql.NullString
+		var discoverable int
+		var incarnationID, healthState string
+		var lastSeenAt, observedAt, firstUnreachableAt, lastSampleAt sql.NullString
+		var unreachableAccumSeconds int64
+		var lastErrorCode sql.NullString
+		var reapKind string
+		var reapMaxUnreachableSeconds int64
+		if err := rows.Scan(&label, &version, &ns, &config, &configSchemaStr, &discoverable,
+			&incarnationID, &healthState, &lastSeenAt, &observedAt,
+			&firstUnreachableAt, &lastSampleAt, &unreachableAccumSeconds, &lastErrorCode,
+			&reapKind, &reapMaxUnreachableSeconds); err != nil {
+			return nil, err
+		}
+
+		var configSchema pkgmodel.ConfigSchema
+		if configSchemaStr.Valid {
+			if err := json.Unmarshal([]byte(configSchemaStr.String), &configSchema); err != nil {
+				return nil, fmt.Errorf("failed to unmarshal config_schema for target %s: %w", label, err)
+			}
+		}
+
+		targets = append(targets, &pkgmodel.Target{
+			Label:        label,
+			Namespace:    ns,
+			Config:       config,
+			ConfigSchema: configSchema,
+			Discoverable: discoverable == 1,
+			Version:      version,
+			Reaping:      pkgmodel.ReapingRawFromColumns(reapKind, reapMaxUnreachableSeconds),
+			Health: scanSQLiteTargetHealth(incarnationID, healthState, lastSeenAt, observedAt,
+				firstUnreachableAt, lastSampleAt, unreachableAccumSeconds, lastErrorCode),
+		})
+	}
+
+	return targets, rows.Err()
+}
+
+func (d DatastoreSQLite) QueryTargets(query *datastore.TargetQuery) ([]*pkgmodel.Target, error) {
+	_, span := sqliteTracer.Start(context.Background(), "QueryTargets")
+	defer span.End()
+
+	queryStr := `
+		SELECT label, version, namespace, config, config_schema, discoverable,
+		       target_incarnation_id, health_state, last_seen_at, observed_at,
+		       first_unreachable_at, last_sample_at, unreachable_accum_seconds, last_error_code,
+		       reap_kind, reap_max_unreachable_seconds
+		FROM targets t1
+		WHERE NOT EXISTS (
+			SELECT 1
+			FROM targets t2
+			WHERE t1.label = t2.label
+			AND t2.version > t1.version
+		)
+		AND health_state != 'reaped'`
+	args := []any{}
+
+	queryStr = extendSQLiteQueryString(queryStr, query.Label, " AND label %s ?{esc}", &args)
+	queryStr = extendSQLiteQueryString(queryStr, query.Namespace, " AND namespace %s ?{esc}", &args)
+	queryStr = extendSQLiteQueryString(queryStr, query.Discoverable, " AND discoverable %s ?{esc}", &args)
+	queryStr += " ORDER BY label"
+
+	slog.Debug("QueryTargets", "queryStr", queryStr, "args", args)
+
+	rows, err := d.conn.Query(queryStr, args...)
+	if err != nil {
+		slog.Error("QueryTargets failed", "error", err)
+		return nil, err
+	}
+	defer closeRows(rows)
+
+	var targets []*pkgmodel.Target
+	for rows.Next() {
+		var label, namespace string
+		var version int
+		var config json.RawMessage
+		var configSchemaStr sql.NullString
+		var discoverable int
+		var incarnationID, healthState string
+		var lastSeenAt, observedAt, firstUnreachableAt, lastSampleAt sql.NullString
+		var unreachableAccumSeconds int64
+		var lastErrorCode sql.NullString
+		var reapKind string
+		var reapMaxUnreachableSeconds int64
+		if err := rows.Scan(&label, &version, &namespace, &config, &configSchemaStr, &discoverable,
+			&incarnationID, &healthState, &lastSeenAt, &observedAt,
+			&firstUnreachableAt, &lastSampleAt, &unreachableAccumSeconds, &lastErrorCode,
+			&reapKind, &reapMaxUnreachableSeconds); err != nil {
+			return nil, err
+		}
+
+		var configSchema pkgmodel.ConfigSchema
+		if configSchemaStr.Valid {
+			if err := json.Unmarshal([]byte(configSchemaStr.String), &configSchema); err != nil {
+				return nil, fmt.Errorf("failed to unmarshal config_schema for target %s: %w", label, err)
+			}
+		}
+
+		targets = append(targets, &pkgmodel.Target{
+			Label:        label,
+			Namespace:    namespace,
+			Config:       config,
+			ConfigSchema: configSchema,
+			Discoverable: discoverable == 1,
+			Version:      version,
+			Reaping:      pkgmodel.ReapingRawFromColumns(reapKind, reapMaxUnreachableSeconds),
+			Health: scanSQLiteTargetHealth(incarnationID, healthState, lastSeenAt, observedAt,
+				firstUnreachableAt, lastSampleAt, unreachableAccumSeconds, lastErrorCode),
+		})
+	}
+
+	slog.Debug("QueryTargets results", "count", len(targets))
+	return targets, rows.Err()
+}
+
+func (d DatastoreSQLite) LatestLabelForResource(label string) (string, error) {
+	_, span := sqliteTracer.Start(context.Background(), "LatestLabelForResource")
+	defer span.End()
+
+	query := `
+    SELECT label FROM resources
+    WHERE label = ? OR label LIKE ? || '-%'
+    ORDER BY LENGTH(label) DESC, label DESC
+    LIMIT 1;
+    `
+	row := d.conn.QueryRow(query, label, label)
+
+	var latestLabel string
+	if err := row.Scan(&latestLabel); err != nil {
+		if err == sql.ErrNoRows {
+			return "", nil // Resource not found, return empty string
+		}
+		return "", err
+	}
+
+	return latestLabel, nil
+}
+
+func (d DatastoreSQLite) Stats() (*stats.Stats, error) {
+	_, span := sqliteTracer.Start(context.Background(), "Stats")
+	defer span.End()
+
+	res := stats.Stats{}
+
+	clientsQuery := fmt.Sprintf("SELECT COUNT(DISTINCT client_id) FROM %s", datastore.CommandsTable)
+	row := d.conn.QueryRow(clientsQuery)
+
+	var clientCount int
+	if err := row.Scan(&clientCount); err != nil {
+		return nil, err
+	}
+
+	res.Clients = clientCount
+
+	commandsQuery := fmt.Sprintf("SELECT command, COUNT(*) FROM %s WHERE command != ? GROUP BY command", datastore.CommandsTable)
+	rows, err := d.conn.Query(commandsQuery, pkgmodel.CommandSync)
+	if err != nil {
+		return nil, err
+	}
+
+	defer closeRows(rows)
+
+	res.Commands = make(map[string]int)
+	for rows.Next() {
+		var command string
+		var count int
+		if err = rows.Scan(&command, &count); err != nil {
+			return nil, err
+		}
+
+		res.Commands[command] = count
+	}
+
+	err = rows.Err()
+	if err != nil {
+		return nil, err
+	}
+
+	statusQuery := fmt.Sprintf("SELECT state, COUNT(*) FROM %s WHERE command != ? GROUP BY state", datastore.CommandsTable)
+	rows, err = d.conn.Query(statusQuery, pkgmodel.CommandSync)
+	if err != nil {
+		return nil, err
+	}
+
+	defer closeRows(rows)
+
+	res.States = make(map[string]int)
+	for rows.Next() {
+		var state string
+		var count int
+		if err = rows.Scan(&state, &count); err != nil {
+			return nil, err
+		}
+
+		res.States[state] = count
+	}
+
+	err = rows.Err()
+	if err != nil {
+		return nil, err
+	}
+
+	stacksQuery := fmt.Sprintf(`
+		SELECT COUNT(DISTINCT stack)
+		FROM resources r1
+		WHERE stack IS NOT NULL
+		AND stack != '%s'
+		AND operation != ? AND operation != 'reaped'
+		AND NOT EXISTS (
+			SELECT 1
+			FROM resources r2
+			WHERE r1.uri = r2.uri
+			AND r2.version > r1.version
+		)`, constants.UnmanagedStack)
+	row = d.conn.QueryRow(stacksQuery, resource_update.OperationDelete)
+
+	var stackCount int
+	if err = row.Scan(&stackCount); err != nil {
+		return nil, err
+	}
+
+	res.Stacks = stackCount
+
+	res.ManagedResources = make(map[string]int)
+	managedResourcesQuery := fmt.Sprintf(`
+		SELECT SUBSTR(type, 1, INSTR(type, '::') - 1) as namespace, COUNT(*)
+		FROM resources r1
+		WHERE stack IS NOT NULL
+		AND stack != '%s'
+		AND operation != ? AND operation != 'reaped'
+		AND NOT EXISTS (
+			SELECT 1
+			FROM resources r2
+			WHERE r1.uri = r2.uri
+			AND r2.version > r1.version
+		)
+		GROUP BY namespace`, constants.UnmanagedStack)
+	rows, err = d.conn.Query(managedResourcesQuery, resource_update.OperationDelete)
+	if err != nil {
+		return nil, err
+	}
+	defer closeRows(rows)
+
+	for rows.Next() {
+		var namespace string
+		var count int
+		if err = rows.Scan(&namespace, &count); err != nil {
+			return nil, err
+		}
+		res.ManagedResources[namespace] = count
+	}
+	if err = rows.Err(); err != nil {
+		return nil, err
+	}
+
+	res.UnmanagedResources = make(map[string]int)
+	unmanagedResourcesQuery := fmt.Sprintf(`
+		SELECT SUBSTR(type, 1, INSTR(type, '::') - 1) as namespace, COUNT(*)
+		FROM resources r1
+		WHERE stack = '%s'
+		AND operation != ? AND operation != 'reaped'
+		AND NOT EXISTS (
+			SELECT 1
+			FROM resources r2
+			WHERE r1.uri = r2.uri
+			AND r2.version > r1.version
+		)
+		GROUP BY namespace`, constants.UnmanagedStack)
+	rows, err = d.conn.Query(unmanagedResourcesQuery, resource_update.OperationDelete)
+	if err != nil {
+		return nil, err
+	}
+	defer closeRows(rows)
+
+	for rows.Next() {
+		var namespace string
+		var count int
+		if err = rows.Scan(&namespace, &count); err != nil {
+			return nil, err
+		}
+		res.UnmanagedResources[namespace] = count
+	}
+	if err = rows.Err(); err != nil {
+		return nil, err
+	}
+
+	res.Targets = make(map[string]int)
+	targetsQuery := `
+		SELECT namespace, COUNT(*)
+		FROM targets t1
+		WHERE NOT EXISTS (
+			SELECT 1
+			FROM targets t2
+			WHERE t1.label = t2.label
+			AND t2.version > t1.version
+		)
+		AND health_state != 'reaped'
+		GROUP BY namespace
+	`
+	rows, err = d.conn.Query(targetsQuery)
+	if err != nil {
+		return nil, err
+	}
+	defer closeRows(rows)
+
+	for rows.Next() {
+		var namespace string
+		var count int
+		if err = rows.Scan(&namespace, &count); err != nil {
+			return nil, err
+		}
+		res.Targets[namespace] = count
+	}
+	if err = rows.Err(); err != nil {
+		return nil, err
+	}
+
+	res.ResourceTypes = make(map[string]int)
+	resourceTypesQuery := `
+		SELECT type, COUNT(*)
+		FROM resources r1
+		WHERE operation != ? AND operation != 'reaped'
+		AND NOT EXISTS (
+			SELECT 1
+			FROM resources r2
+			WHERE r1.uri = r2.uri
+			AND r2.version > r1.version
+		)
+		GROUP BY type
+	`
+	rows, err = d.conn.Query(resourceTypesQuery, resource_update.OperationDelete)
+	if err != nil {
+		return nil, err
+	}
+	defer closeRows(rows)
+
+	for rows.Next() {
+		var resourceType string
+		var count int
+		if err = rows.Scan(&resourceType, &count); err != nil {
+			return nil, err
+		}
+
+		res.ResourceTypes[resourceType] = count
+	}
+
+	err = rows.Err()
+	if err != nil {
+		return nil, err
+	}
+	return &res, nil
+}
+
+func (d DatastoreSQLite) LoadResourceById(ksuid string) (*pkgmodel.Resource, error) {
+	_, span := sqliteTracer.Start(context.Background(), "LoadResourceById")
+	defer span.End()
+
+	query := `
+	SELECT data, ksuid
+	FROM resources
+	WHERE ksuid = ?
+	AND operation != ? AND operation != 'reaped'
+	ORDER BY version DESC
+	LIMIT 1
+	`
+	row := d.conn.QueryRow(query, ksuid, resource_update.OperationDelete)
+
+	var jsonData string
+	var ksuidResult string
+	if err := row.Scan(&jsonData, &ksuidResult); err != nil {
+		if err == sql.ErrNoRows {
+			return nil, nil // Resource not found
+		}
+		return nil, err
+	}
+
+	var loadedResource pkgmodel.Resource
+	if err := json.Unmarshal([]byte(jsonData), &loadedResource); err != nil {
+		return nil, err
+	}
+
+	// Set the KSUID directly since we already have it
+	loadedResource.Ksuid = ksuidResult
+
+	return &loadedResource, nil
+}
+
+// LoadLatestResourceByKsuid retrieves the true latest version of the resource
+// identified by ksuid without pre-filtering by operation. It returns nil, nil
+// when no row exists for the ksuid or when the latest row's operation is delete
+// or reaped, so callers receive not-found semantics for deleted resources.
+func (d DatastoreSQLite) LoadLatestResourceByKsuid(ksuid string) (*pkgmodel.Resource, error) {
+	_, span := sqliteTracer.Start(context.Background(), "LoadLatestResourceByKsuid")
+	defer span.End()
+
+	query := `
+	SELECT data, ksuid, operation
+	FROM resources
+	WHERE ksuid = ?
+	ORDER BY version DESC
+	LIMIT 1
+	`
+	row := d.conn.QueryRow(query, ksuid)
+
+	var jsonData, ksuidResult, operation string
+	if err := row.Scan(&jsonData, &ksuidResult, &operation); err != nil {
+		if err == sql.ErrNoRows {
+			return nil, nil // no row for this ksuid
+		}
+		return nil, err
+	}
+
+	// Treat delete and reaped tombstones as not-found.
+	if operation == string(resource_update.OperationDelete) || operation == string(resource_update.OperationReaped) {
+		return nil, nil
+	}
+
+	var loadedResource pkgmodel.Resource
+	if err := json.Unmarshal([]byte(jsonData), &loadedResource); err != nil {
+		return nil, err
+	}
+	loadedResource.Ksuid = ksuidResult
+	return &loadedResource, nil
+}
+
+// FindResourcesDependingOn finds resources that reference the given KSUID via $ref in their properties.
+// This is essential for referential integrity — without it we risk leaving orphaned resources in an
+// inconsistent state. Currently this requires a full table scan (LIKE on the data column) which will
+// be slow for users with large resource counts.
+// TODO: make the dependency graph discoverable from the schema so we can query edges directly.
+func (d DatastoreSQLite) FindResourcesDependingOn(ksuid string) ([]*pkgmodel.Resource, error) {
+	slog.Debug("SQLite START", "method", "FindResourcesDependingOn", "ksuid", ksuid)
+	start := time.Now()
+	defer func() {
+		slog.Debug("SQLite END", "method", "FindResourcesDependingOn", "ksuid", ksuid, "duration", time.Since(start))
+	}()
+	_, span := sqliteTracer.Start(context.Background(), "FindResourcesDependingOn")
+	defer span.End()
+
+	// Search for resources that contain a $ref to this KSUID in their properties
+	// The format is: "formae://KSUID#/..." (JSON without spaces after colons)
+	pattern := fmt.Sprintf("%%\"$ref\":\"formae://%s#%%", ksuid)
+
+	query := `
+	SELECT data, ksuid
+	FROM resources r1
+	WHERE data LIKE ?
+	AND NOT EXISTS (
+		SELECT 1
+		FROM resources r2
+		WHERE r1.uri = r2.uri
+		AND r2.version > r1.version
+	)
+	AND operation != ? AND operation != 'reaped'
+	`
+
+	rows, err := d.conn.Query(query, pattern, resource_update.OperationDelete)
+	if err != nil {
+		return nil, err
+	}
+	defer closeRows(rows)
+
+	var resources []*pkgmodel.Resource
+	for rows.Next() {
+		var jsonData, ksuidResult string
+		if err := rows.Scan(&jsonData, &ksuidResult); err != nil {
+			return nil, err
+		}
+
+		var resource pkgmodel.Resource
+		if err := json.Unmarshal([]byte(jsonData), &resource); err != nil {
+			return nil, err
+		}
+		resource.Ksuid = ksuidResult
+		resources = append(resources, &resource)
+	}
+
+	return resources, nil
+}
+
+// FindResourcesReferencingGenerator finds the live resources that bind a property
+// to the given generator through a $gen envelope. SQLite has no refs column, so
+// like the $ref lookup this is a full table scan over the data column. The LIKE
+// is a prefilter kept deliberately loose (it is blind to case, and to whether
+// the key sits inside an envelope), and pkgmodel.BindsGenerator decides which
+// candidates are really destinations.
+func (d DatastoreSQLite) FindResourcesReferencingGenerator(generatorKsuid string) ([]*pkgmodel.Resource, error) {
+	slog.Debug("SQLite START", "method", "FindResourcesReferencingGenerator", "generator", generatorKsuid)
+	start := time.Now()
+	defer func() {
+		slog.Debug("SQLite END", "method", "FindResourcesReferencingGenerator", "generator", generatorKsuid, "duration", time.Since(start))
+	}()
+	_, span := sqliteTracer.Start(context.Background(), "FindResourcesReferencingGenerator")
+	defer span.End()
+
+	// A translated $gen envelope stores the generator KSUID under $generator
+	// (JSON without spaces after colons).
+	pattern := fmt.Sprintf("%%\"$generator\":\"%s\"%%", generatorKsuid)
+
+	query := `
+	SELECT data, ksuid
+	FROM resources r1
+	WHERE data LIKE ?
+	AND NOT EXISTS (
+		SELECT 1
+		FROM resources r2
+		WHERE r1.uri = r2.uri
+		AND r2.version > r1.version
+	)
+	AND operation != ? AND operation != 'reaped'
+	`
+
+	rows, err := d.conn.Query(query, pattern, resource_update.OperationDelete)
+	if err != nil {
+		return nil, err
+	}
+	defer closeRows(rows)
+
+	var resources []*pkgmodel.Resource
+	for rows.Next() {
+		var jsonData, ksuidResult string
+		if err := rows.Scan(&jsonData, &ksuidResult); err != nil {
+			return nil, err
+		}
+
+		// The SQL above is only a prefilter: it is deliberately broader than
+		// the truth so no destination is missed. pkgmodel.BindsGenerator is
+		// authoritative, and drops any candidate it matched for another reason.
+		if !pkgmodel.BindsGenerator([]byte(jsonData), generatorKsuid) {
+			continue
+		}
+
+		var resource pkgmodel.Resource
+		if err := json.Unmarshal([]byte(jsonData), &resource); err != nil {
+			return nil, err
+		}
+		resource.Ksuid = ksuidResult
+		resources = append(resources, &resource)
+	}
+
+	return resources, rows.Err()
+}
+
+func (d DatastoreSQLite) FindResourcesDependingOnMany(ksuids []string) (map[string][]*pkgmodel.Resource, error) {
+	slog.Debug("SQLite START", "method", "FindResourcesDependingOnMany", "ksuids", len(ksuids))
+	start := time.Now()
+	defer func() {
+		slog.Debug("SQLite END", "method", "FindResourcesDependingOnMany", "ksuids", len(ksuids), "duration", time.Since(start))
+	}()
+	_, span := sqliteTracer.Start(context.Background(), "FindResourcesDependingOnMany")
+	defer span.End()
+
+	if len(ksuids) == 0 {
+		return make(map[string][]*pkgmodel.Resource), nil
+	}
+
+	// Build OR conditions for each KSUID pattern
+	// The format is: "$ref":"formae://KSUID#/..."
+	var conditions []string
+	var args []any
+	for _, ksuid := range ksuids {
+		pattern := fmt.Sprintf("%%\"$ref\":\"formae://%s#%%", ksuid)
+		conditions = append(conditions, "data LIKE ?")
+		args = append(args, pattern)
+	}
+	args = append(args, resource_update.OperationDelete)
+
+	query := fmt.Sprintf(`
+	SELECT data, ksuid
+	FROM resources r1
+	WHERE (%s)
+	AND NOT EXISTS (
+		SELECT 1
+		FROM resources r2
+		WHERE r1.uri = r2.uri
+		AND r2.version > r1.version
+	)
+	AND operation != ? AND operation != 'reaped'
+	`, strings.Join(conditions, " OR "))
+
+	rows, err := d.conn.Query(query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer closeRows(rows)
+
+	// Build a map of KSUID -> resources that depend on it
+	result := make(map[string][]*pkgmodel.Resource)
+	for rows.Next() {
+		var jsonData, ksuidResult string
+		if err := rows.Scan(&jsonData, &ksuidResult); err != nil {
+			return nil, err
+		}
+
+		var resource pkgmodel.Resource
+		if err := json.Unmarshal([]byte(jsonData), &resource); err != nil {
+			return nil, err
+		}
+		resource.Ksuid = ksuidResult
+
+		// Find which of the input KSUIDs this resource depends on
+		for _, ksuid := range ksuids {
+			pattern := fmt.Sprintf("\"$ref\":\"formae://%s#", ksuid)
+			if strings.Contains(jsonData, pattern) {
+				result[ksuid] = append(result[ksuid], &resource)
+			}
+		}
+	}
+
+	return result, nil
+}
+
+func (d DatastoreSQLite) FindTargetsDependingOnMany(ksuids []string) (map[string][]*pkgmodel.Target, error) {
+	slog.Debug("SQLite START", "method", "FindTargetsDependingOnMany", "ksuids", len(ksuids))
+	start := time.Now()
+	defer func() {
+		slog.Debug("SQLite END", "method", "FindTargetsDependingOnMany", "ksuids", len(ksuids), "duration", time.Since(start))
+	}()
+	_, span := sqliteTracer.Start(context.Background(), "FindTargetsDependingOnMany")
+	defer span.End()
+
+	if len(ksuids) == 0 {
+		return make(map[string][]*pkgmodel.Target), nil
+	}
+
+	// Build OR conditions for each KSUID pattern
+	// The format is: "$ref":"formae://KSUID#/..."
+	var conditions []string
+	var args []any
+	for _, ksuid := range ksuids {
+		pattern := fmt.Sprintf("%%\"$ref\":\"formae://%s#%%", ksuid)
+		conditions = append(conditions, "config LIKE ?")
+		args = append(args, pattern)
+	}
+
+	query := fmt.Sprintf(`
+	SELECT label, version, namespace, config, config_schema, discoverable,
+	       target_incarnation_id, health_state, last_seen_at, observed_at,
+	       first_unreachable_at, last_sample_at, unreachable_accum_seconds, last_error_code,
+	       reap_kind, reap_max_unreachable_seconds
+	FROM targets t1
+	WHERE (%s)
+	AND NOT EXISTS (
+		SELECT 1
+		FROM targets t2
+		WHERE t1.label = t2.label
+		AND t2.version > t1.version
+	)
+	`, strings.Join(conditions, " OR "))
+
+	rows, err := d.conn.Query(query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer closeRows(rows)
+
+	// Build a map of KSUID -> targets that depend on it
+	result := make(map[string][]*pkgmodel.Target)
+	for rows.Next() {
+		var label, namespace string
+		var version int
+		var config json.RawMessage
+		var configSchemaStr sql.NullString
+		var discoverable int
+		var incarnationID, healthState string
+		var lastSeenAt, observedAt, firstUnreachableAt, lastSampleAt sql.NullString
+		var unreachableAccumSeconds int64
+		var lastErrorCode sql.NullString
+		var reapKind string
+		var reapMaxUnreachableSeconds int64
+		if err := rows.Scan(&label, &version, &namespace, &config, &configSchemaStr, &discoverable,
+			&incarnationID, &healthState, &lastSeenAt, &observedAt,
+			&firstUnreachableAt, &lastSampleAt, &unreachableAccumSeconds, &lastErrorCode,
+			&reapKind, &reapMaxUnreachableSeconds); err != nil {
+			return nil, err
+		}
+
+		var configSchema pkgmodel.ConfigSchema
+		if configSchemaStr.Valid {
+			if err := json.Unmarshal([]byte(configSchemaStr.String), &configSchema); err != nil {
+				return nil, fmt.Errorf("failed to unmarshal config_schema for target %s: %w", label, err)
+			}
+		}
+
+		target := &pkgmodel.Target{
+			Label:        label,
+			Namespace:    namespace,
+			Config:       config,
+			ConfigSchema: configSchema,
+			Discoverable: discoverable == 1,
+			Version:      version,
+			Reaping:      pkgmodel.ReapingRawFromColumns(reapKind, reapMaxUnreachableSeconds),
+			Health: scanSQLiteTargetHealth(incarnationID, healthState, lastSeenAt, observedAt,
+				firstUnreachableAt, lastSampleAt, unreachableAccumSeconds, lastErrorCode),
+		}
+
+		// Find which of the input KSUIDs this target depends on
+		configStr := string(config)
+		for _, ksuid := range ksuids {
+			pattern := fmt.Sprintf("\"$ref\":\"formae://%s#", ksuid)
+			if strings.Contains(configStr, pattern) {
+				result[ksuid] = append(result[ksuid], target)
+			}
+		}
+	}
+
+	return result, nil
+}
+
+func (d DatastoreSQLite) GetKSUIDByTriplet(stack, label, resourceType string) (string, error) {
+	_, span := sqliteTracer.Start(context.Background(), "GetKSUIDByTriplet")
+	defer span.End()
+
+	// Only the triplet's latest version counts: a resource whose newest row is
+	// a delete/reaped tombstone is gone, and an older live version must not
+	// resurrect its ksuid. Mirrors BatchGetKSUIDsByTriplets.
+	query := `
+	SELECT ksuid
+	FROM resources r1
+	WHERE r1.stack = ? AND r1.label = ? AND LOWER(r1.type) = LOWER(?)
+	AND r1.operation != ? AND r1.operation != 'reaped'
+	AND NOT EXISTS (
+		SELECT 1 FROM resources r2
+		WHERE r1.stack = r2.stack AND r1.label = r2.label AND r1.type = r2.type
+		AND r2.version > r1.version
+	)
+	LIMIT 1
+	`
+	row := d.conn.QueryRow(query, stack, label, resourceType, resource_update.OperationDelete)
+
+	var ksuidResult string
+	if err := row.Scan(&ksuidResult); err != nil {
+		if err == sql.ErrNoRows {
+			return "", nil
+		}
+		return "", err
+	}
+
+	return ksuidResult, nil
+}
+
+func (d DatastoreSQLite) BatchGetKSUIDsByTriplets(triplets []pkgmodel.TripletKey) (map[pkgmodel.TripletKey]string, error) {
+	_, span := sqliteTracer.Start(context.Background(), "BatchGetKSUIDsByTriplets")
+	defer span.End()
+
+	if len(triplets) == 0 {
+		return make(map[pkgmodel.TripletKey]string), nil
+	}
+
+	// Build the IN clause with triplet values
+	placeholders := make([]string, len(triplets))
+	args := make([]any, len(triplets)*3)
+
+	for i, triplet := range triplets {
+		placeholders[i] = "(?, ?, ?)"
+		args[i*3] = triplet.Stack
+		args[i*3+1] = triplet.Label
+		args[i*3+2] = triplet.Type
+	}
+
+	query := fmt.Sprintf(`
+		SELECT stack, label, type, ksuid
+		FROM resources r1
+		WHERE (stack, label, type) IN (%s)
+		AND r1.operation != ? AND r1.operation != 'reaped'
+		AND NOT EXISTS (
+			SELECT 1 FROM resources r2
+			WHERE r1.stack = r2.stack AND r1.label = r2.label AND r1.type = r2.type
+			AND r2.version > r1.version
+		)`, strings.Join(placeholders, ","))
+
+	args = append(args, resource_update.OperationDelete)
+	rows, err := d.conn.Query(query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer closeRows(rows)
+
+	result := make(map[pkgmodel.TripletKey]string)
+	for rows.Next() {
+		var stack, label, resourceType, ksuid string
+		if err := rows.Scan(&stack, &label, &resourceType, &ksuid); err != nil {
+			return nil, err
+		}
+
+		key := pkgmodel.TripletKey{Stack: stack, Label: label, Type: resourceType}
+		result[key] = ksuid
+	}
+
+	return result, rows.Err()
+}
+
+func (d DatastoreSQLite) BatchGetTripletsByKSUIDs(ksuids []string) (map[string]pkgmodel.TripletKey, error) {
+	_, span := sqliteTracer.Start(context.Background(), "BatchGetTripletsByKSUIDs")
+	defer span.End()
+
+	if len(ksuids) == 0 {
+		return make(map[string]pkgmodel.TripletKey), nil
+	}
+
+	// Build the IN clause with KSUID values
+	placeholders := make([]string, len(ksuids))
+	args := make([]any, len(ksuids))
+
+	for i, ksuid := range ksuids {
+		placeholders[i] = "?"
+		args[i] = ksuid
+	}
+
+	query := fmt.Sprintf(`
+		WITH latest_resources AS (
+			SELECT ksuid, stack, label, type, managed, version,
+			       ROW_NUMBER() OVER (PARTITION BY ksuid ORDER BY managed DESC, version DESC) as rn
+			FROM resources
+			WHERE ksuid IN (%s)
+			AND operation != ? AND operation != 'reaped'
+		)
+		SELECT ksuid, stack, label, type
+		FROM latest_resources
+		WHERE rn = 1`, strings.Join(placeholders, ","))
+
+	// Add operation type to args for the delete check
+	args = append(args, resource_update.OperationDelete)
+
+	rows, err := d.conn.Query(query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer closeRows(rows)
+
+	result := make(map[string]pkgmodel.TripletKey)
+	for rows.Next() {
+		var ksuid, stack, label, resourceType string
+		if err := rows.Scan(&ksuid, &stack, &label, &resourceType); err != nil {
+			return nil, err
+		}
+
+		result[ksuid] = pkgmodel.TripletKey{Stack: stack, Label: label, Type: resourceType}
+	}
+
+	return result, rows.Err()
+}
+
+// BulkStoreResourceUpdates stores multiple ResourceUpdates in a single transaction
+// This is the key performance optimization: insert all updates in one transaction
+// marshalOrNil JSON-encodes v, or returns nil for an empty value so the
+// column stays NULL.
+func marshalOrNil(v any) any {
+	switch t := v.(type) {
+	case []resource_update.OccurrenceRecord:
+		if len(t) == 0 {
+			return nil
+		}
+	case map[string]string:
+		if len(t) == 0 {
+			return nil
+		}
+	}
+	b, err := json.Marshal(v)
+	if err != nil {
+		return nil
+	}
+	return string(b)
+}
+
+func (d DatastoreSQLite) BulkStoreResourceUpdates(commandID string, updates []resource_update.ResourceUpdate) error {
+	if err := datastore.ValidateAcceptanceContributions(updates); err != nil {
+		return err
+	}
+	if len(updates) == 0 {
+		return nil
+	}
+	tx, err := d.conn.Begin()
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	if err := d.bulkStoreResourceUpdatesTx(tx, commandID, updates); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+func (d DatastoreSQLite) bulkStoreResourceUpdatesTx(tx *sql.Tx, commandID string, updates []resource_update.ResourceUpdate) error {
+	if len(updates) == 0 {
+		return nil
+	}
+	stmt, err := tx.Prepare(`
+		INSERT OR REPLACE INTO resource_updates (
+			command_id, ksuid, operation, state, start_ts, modified_ts,
+			retries, remaining, version, stack_label, group_id, source,
+			resource, resource_target, existing_resource, existing_target,
+			progress_result, most_recent_progress,
+			remaining_resolvables, reference_labels, previous_properties,
+			is_cascade, cascade_source, failure_reason,
+			provenance_records, resolved_root_digests
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`)
+	if err != nil {
+		return fmt.Errorf("failed to prepare statement: %w", err)
+	}
+	defer func() { _ = stmt.Close() }()
+
+	for _, ru := range updates {
+		resourceJSON, err := json.Marshal(ru.DesiredState)
+		if err != nil {
+			return fmt.Errorf("failed to marshal resource: %w", err)
+		}
+
+		if ru.IsAcceptance() {
+			resourceJSON, err = datastore.StripOpaqueRefValues(resourceJSON)
+			if err != nil {
+				return fmt.Errorf("strip acceptance opaque values: %w", err)
+			}
+		}
+		if ru.StackLabel == "" {
+			ru.StackLabel = ru.DesiredState.Stack
+		}
+
+		resourceTargetJSON, err := json.Marshal(ru.ResourceTarget)
+		if err != nil {
+			return fmt.Errorf("failed to marshal resource target: %w", err)
+		}
+		resourceTargetJSON, err = datastore.StripOpaqueRefValues(resourceTargetJSON)
+		if err != nil {
+			return fmt.Errorf("failed to strip opaque ref values from resource target: %w", err)
+		}
+
+		existingResourceJSON, err := json.Marshal(ru.PriorState)
+		if err != nil {
+			return fmt.Errorf("failed to marshal existing resource: %w", err)
+		}
+
+		// existing_target is stripped too: a pre-change (legacy) target row may still carry a plaintext opaque $ref value, so we never re-persist it unstripped.
+		existingTargetJSON, err := json.Marshal(ru.ExistingTarget)
+		if err != nil {
+			return fmt.Errorf("failed to marshal existing target: %w", err)
+		}
+		existingTargetJSON, err = datastore.StripOpaqueRefValues(existingTargetJSON)
+		if err != nil {
+			return fmt.Errorf("failed to strip opaque ref values from existing target: %w", err)
+		}
+
+		progressResultJSON, err := json.Marshal(ru.ProgressResult)
+		if err != nil {
+			return fmt.Errorf("failed to marshal progress result: %w", err)
+		}
+
+		mostRecentProgressJSON, err := json.Marshal(ru.MostRecentProgressResult)
+		if err != nil {
+			return fmt.Errorf("failed to marshal most recent progress: %w", err)
+		}
+
+		remainingResolvablesJSON, err := json.Marshal(ru.RemainingResolvables)
+		if err != nil {
+			return fmt.Errorf("failed to marshal remaining resolvables: %w", err)
+		}
+
+		referenceLabelsJSON, err := json.Marshal(ru.ReferenceLabels)
+		if err != nil {
+			return fmt.Errorf("failed to marshal reference labels: %w", err)
+		}
+
+		// Use StackLabel if set, otherwise fallback to Resource.Stack
+		stackLabel := ru.StackLabel
+		if stackLabel == "" {
+			stackLabel = ru.DesiredState.Stack
+		}
+
+		// Normalize timestamps to UTC for consistent TEXT-based sorting in SQLite
+		startTsUTC := ru.StartTs.UTC()
+		modifiedTsUTC := ru.ModifiedTs.UTC()
+
+		_, err = stmt.Exec(
+			commandID,
+			ru.DesiredState.Ksuid,
+			string(ru.Operation),
+			string(ru.State),
+			startTsUTC,
+			modifiedTsUTC,
+			ru.Retries,
+			ru.Remaining,
+			ru.Version,
+			stackLabel,
+			ru.GroupID,
+			string(ru.Source),
+			resourceJSON,
+			resourceTargetJSON,
+			existingResourceJSON,
+			existingTargetJSON,
+			progressResultJSON,
+			mostRecentProgressJSON,
+			remainingResolvablesJSON,
+			referenceLabelsJSON,
+			ru.PreviousProperties,
+			ru.IsCascade,
+			ru.CascadeSource,
+			ru.FailureReason,
+			marshalOrNil(ru.ProvenanceRecords),
+			marshalOrNil(ru.ResolvedRootDigests),
+		)
+		if err != nil {
+			return fmt.Errorf("failed to insert resource update: %w", err)
+		}
+	}
+
+	return nil
+}
+
+// LoadResourceUpdates loads all ResourceUpdates for a given command
+func (d DatastoreSQLite) LoadResourceUpdates(commandID string) ([]resource_update.ResourceUpdate, error) {
+	slog.Debug("SQLite START", "method", "LoadResourceUpdates", "commandID", commandID)
+	start := time.Now()
+	defer func() {
+		slog.Debug("SQLite END", "method", "LoadResourceUpdates", "commandID", commandID, "duration", time.Since(start))
+	}()
+	_, span := sqliteTracer.Start(context.Background(), "LoadResourceUpdates")
+	defer span.End()
+
+	query := `
+		SELECT ksuid, operation, state, start_ts, modified_ts,
+			retries, remaining, version, stack_label, group_id, source,
+			resource, resource_target, existing_resource, existing_target,
+			progress_result, most_recent_progress,
+			remaining_resolvables, reference_labels, previous_properties,
+			provenance_records, resolved_root_digests
+		FROM resource_updates
+		WHERE command_id = ?
+	`
+
+	rows, err := d.conn.Query(query, commandID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query resource updates: %w", err)
+	}
+	defer closeRows(rows)
+
+	var updates []resource_update.ResourceUpdate
+	for rows.Next() {
+		var ru resource_update.ResourceUpdate
+		var ksuid, operation, state string
+		var startTsStr, modifiedTsStr sql.NullString
+		var stackLabel, groupID, source, version sql.NullString
+		var resourceJSON, resourceTargetJSON, existingResourceJSON, existingTargetJSON []byte
+		var progressResultJSON, mostRecentProgressJSON []byte
+		var remainingResolvablesJSON, referenceLabelsJSON, previousPropertiesJSON []byte
+		var provenanceRecordsJSON, resolvedRootDigestsJSON []byte
+
+		err := rows.Scan(
+			&ksuid,
+			&operation,
+			&state,
+			&startTsStr,
+			&modifiedTsStr,
+			&ru.Retries,
+			&ru.Remaining,
+			&version,
+			&stackLabel,
+			&groupID,
+			&source,
+			&resourceJSON,
+			&resourceTargetJSON,
+			&existingResourceJSON,
+			&existingTargetJSON,
+			&progressResultJSON,
+			&mostRecentProgressJSON,
+			&remainingResolvablesJSON,
+			&referenceLabelsJSON,
+			&previousPropertiesJSON,
+			&provenanceRecordsJSON,
+			&resolvedRootDigestsJSON,
+		)
+		if err != nil {
+			return nil, fmt.Errorf("failed to scan resource update: %w", err)
+		}
+
+		ru.Operation = types.OperationType(operation)
+		ru.State = resource_update.ResourceUpdateState(state)
+		if len(provenanceRecordsJSON) > 0 {
+			if err := json.Unmarshal(provenanceRecordsJSON, &ru.ProvenanceRecords); err != nil {
+				return nil, fmt.Errorf("failed to unmarshal provenance records: %w", err)
+			}
+		}
+		if len(resolvedRootDigestsJSON) > 0 {
+			if err := json.Unmarshal(resolvedRootDigestsJSON, &ru.ResolvedRootDigests); err != nil {
+				return nil, fmt.Errorf("failed to unmarshal resolved root digests: %w", err)
+			}
+		}
+
+		// Parse timestamps (TIMESTAMP columns)
+		if startTsStr.Valid && startTsStr.String != "" {
+			if ts, err := time.Parse(time.RFC3339Nano, startTsStr.String); err == nil {
+				ru.StartTs = ts.UTC()
+			} else if ts, err := time.Parse("2006-01-02 15:04:05.999999999-07:00", startTsStr.String); err == nil {
+				ru.StartTs = ts.UTC()
+			}
+		}
+		if modifiedTsStr.Valid && modifiedTsStr.String != "" {
+			if ts, err := time.Parse(time.RFC3339Nano, modifiedTsStr.String); err == nil {
+				ru.ModifiedTs = ts.UTC()
+			} else if ts, err := time.Parse("2006-01-02 15:04:05.999999999-07:00", modifiedTsStr.String); err == nil {
+				ru.ModifiedTs = ts.UTC()
+			}
+		}
+		ru.Version = version.String
+		ru.StackLabel = stackLabel.String
+		ru.GroupID = groupID.String
+		ru.Source = resource_update.FormaCommandSource(source.String)
+
+		if err := json.Unmarshal(resourceJSON, &ru.DesiredState); err != nil {
+			return nil, fmt.Errorf("failed to unmarshal resource: %w", err)
+		}
+		ru.DesiredState.Ksuid = ksuid
+
+		if err := json.Unmarshal(resourceTargetJSON, &ru.ResourceTarget); err != nil {
+			return nil, fmt.Errorf("failed to unmarshal resource target: %w", err)
+		}
+
+		if err := json.Unmarshal(existingResourceJSON, &ru.PriorState); err != nil {
+			return nil, fmt.Errorf("failed to unmarshal existing resource: %w", err)
+		}
+
+		if err := json.Unmarshal(existingTargetJSON, &ru.ExistingTarget); err != nil {
+			return nil, fmt.Errorf("failed to unmarshal existing target: %w", err)
+		}
+
+		if err := json.Unmarshal(progressResultJSON, &ru.ProgressResult); err != nil {
+			return nil, fmt.Errorf("failed to unmarshal progress result: %w", err)
+		}
+
+		if err := json.Unmarshal(mostRecentProgressJSON, &ru.MostRecentProgressResult); err != nil {
+			return nil, fmt.Errorf("failed to unmarshal most recent progress: %w", err)
+		}
+
+		if err := json.Unmarshal(remainingResolvablesJSON, &ru.RemainingResolvables); err != nil {
+			return nil, fmt.Errorf("failed to unmarshal remaining resolvables: %w", err)
+		}
+
+		if err := json.Unmarshal(referenceLabelsJSON, &ru.ReferenceLabels); err != nil {
+			return nil, fmt.Errorf("failed to unmarshal reference labels: %w", err)
+		}
+
+		ru.PreviousProperties = previousPropertiesJSON
+
+		updates = append(updates, ru)
+	}
+
+	return updates, rows.Err()
+}
+
+// UpdateResourceUpdateState updates the state of a single ResourceUpdate
+// This is the key performance improvement: updating one row instead of re-serializing entire command
+func (d DatastoreSQLite) UpdateResourceUpdateState(commandID string, ksuid string, operation types.OperationType, state resource_update.ResourceUpdateState, modifiedTs time.Time) error {
+	slog.Debug("SQLite START", "method", "UpdateResourceUpdateState", "commandID", commandID, "ksuid", ksuid, "state", state)
+	start := time.Now()
+	defer func() {
+		slog.Debug("SQLite END", "method", "UpdateResourceUpdateState", "commandID", commandID, "ksuid", ksuid, "duration", time.Since(start))
+	}()
+	_, span := sqliteTracer.Start(context.Background(), "UpdateResourceUpdateState")
+	defer span.End()
+
+	query := `
+		UPDATE resource_updates
+		SET state = ?, modified_ts = ?
+		WHERE command_id = ? AND ksuid = ? AND operation = ?
+		  AND state NOT IN ('Success','Failed','Rejected','Canceled')
+	`
+
+	// Normalize timestamp to UTC for consistent TEXT-based sorting in SQLite
+	result, err := d.conn.Exec(query, string(state), modifiedTs.UTC(), commandID, ksuid, string(operation))
+	if err != nil {
+		return fmt.Errorf("failed to update resource update state: %w", err)
+	}
+
+	rowsAffected, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("failed to get rows affected: %w", err)
+	}
+
+	if rowsAffected == 0 {
+		slog.Debug("UpdateResourceUpdateState: row already in terminal state or not found, no-op", "commandID", commandID, "ksuid", ksuid)
+		return nil
+	}
+
+	return nil
+}
+
+// UpdateResourceUpdateProgress updates a ResourceUpdate with progress information
+func (d DatastoreSQLite) UpdateResourceUpdateProgress(commandID string, ksuid string, operation types.OperationType, state resource_update.ResourceUpdateState, startTs time.Time, modifiedTs time.Time, progress plugin.TrackedProgress, resolvedRootDigests map[string]string) error {
+	slog.Debug("SQLite START", "method", "UpdateResourceUpdateProgress", "commandID", commandID, "ksuid", ksuid, "state", state)
+	start := time.Now()
+	defer func() {
+		slog.Debug("SQLite END", "method", "UpdateResourceUpdateProgress", "commandID", commandID, "ksuid", ksuid, "duration", time.Since(start))
+	}()
+	_, span := sqliteTracer.Start(context.Background(), "UpdateResourceUpdateProgress")
+	defer span.End()
+
+	// First, load existing progress results to append to
+	var existingProgressJSON []byte
+	query := `SELECT progress_result FROM resource_updates WHERE command_id = ? AND ksuid = ? AND operation = ?`
+	err := d.conn.QueryRow(query, commandID, ksuid, string(operation)).Scan(&existingProgressJSON)
+	if err != nil {
+		return fmt.Errorf("failed to load existing progress: %w", err)
+	}
+
+	var existingProgress []plugin.TrackedProgress
+	if len(existingProgressJSON) > 0 {
+		if err := json.Unmarshal(existingProgressJSON, &existingProgress); err != nil {
+			return fmt.Errorf("failed to unmarshal existing progress: %w", err)
+		}
+	}
+
+	// Append new progress
+	existingProgress = append(existingProgress, progress)
+
+	progressJSON, err := json.Marshal(existingProgress)
+	if err != nil {
+		return fmt.Errorf("failed to marshal progress: %w", err)
+	}
+
+	mostRecentJSON, err := json.Marshal(progress)
+	if err != nil {
+		return fmt.Errorf("failed to marshal most recent progress: %w", err)
+	}
+
+	updateQuery := `
+		UPDATE resource_updates
+		SET state = ?, start_ts = ?, modified_ts = ?, progress_result = ?, most_recent_progress = ?,
+			resolved_root_digests = COALESCE(?, resolved_root_digests)
+		WHERE command_id = ? AND ksuid = ? AND operation = ?
+	`
+
+	// Normalize timestamps to UTC for consistent TEXT-based sorting in SQLite
+	result, err := d.conn.Exec(updateQuery, string(state), startTs.UTC(), modifiedTs.UTC(), progressJSON, mostRecentJSON, marshalOrNil(resolvedRootDigests), commandID, ksuid, string(operation))
+	if err != nil {
+		return fmt.Errorf("failed to update resource update progress: %w", err)
+	}
+
+	rowsAffected, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("failed to get rows affected: %w", err)
+	}
+
+	if rowsAffected == 0 {
+		return fmt.Errorf("resource update not found: command_id=%s, ksuid=%s, operation=%s", commandID, ksuid, operation)
+	}
+
+	return nil
+}
+
+// BatchUpdateResourceUpdateState updates multiple ResourceUpdates to the same state
+// Used for bulk operations like marking dependent resources as failed
+func (d DatastoreSQLite) BatchUpdateResourceUpdateState(commandID string, refs []datastore.ResourceUpdateRef, state resource_update.ResourceUpdateState, modifiedTs time.Time) error {
+	slog.Debug("SQLite START", "method", "BatchUpdateResourceUpdateState", "commandID", commandID, "count", len(refs), "state", state)
+	start := time.Now()
+	defer func() {
+		slog.Debug("SQLite END", "method", "BatchUpdateResourceUpdateState", "commandID", commandID, "count", len(refs), "duration", time.Since(start))
+	}()
+	_, span := sqliteTracer.Start(context.Background(), "BatchUpdateResourceUpdateState")
+	defer span.End()
+
+	if len(refs) == 0 {
+		return nil
+	}
+
+	slog.Debug("SQLite TX BEGIN", "method", "BatchUpdateResourceUpdateState", "commandID", commandID)
+	txStart := time.Now()
+	tx, err := d.conn.Begin()
+	if err != nil {
+		return fmt.Errorf("failed to begin transaction: %w", err)
+	}
+	defer func() {
+		if err != nil {
+			_ = tx.Rollback()
+		}
+	}()
+
+	stmt, err := tx.Prepare(`
+		UPDATE resource_updates
+		SET state = ?, modified_ts = ?
+		WHERE command_id = ? AND ksuid = ? AND operation = ?
+		  AND state NOT IN ('Success','Failed','Rejected','Canceled')
+	`)
+	if err != nil {
+		return fmt.Errorf("failed to prepare statement: %w", err)
+	}
+	defer func() { _ = stmt.Close() }()
+
+	// Normalize timestamp to UTC for consistent TEXT-based sorting in SQLite
+	modifiedTsUTC := modifiedTs.UTC()
+	for _, ref := range refs {
+		_, err = stmt.Exec(string(state), modifiedTsUTC, commandID, ref.KSUID, string(ref.Operation))
+		if err != nil {
+			return fmt.Errorf("failed to update resource update: %w", err)
+		}
+	}
+
+	slog.Debug("SQLite TX COMMIT", "method", "BatchUpdateResourceUpdateState", "commandID", commandID, "txDuration", time.Since(txStart))
+	if err = tx.Commit(); err != nil {
+		return fmt.Errorf("failed to commit transaction: %w", err)
+	}
+
+	return nil
+}
+
+// UpdateFormaCommandProgress updates only the command-level metadata (state, modified_ts)
+// without re-writing all ResourceUpdates. This is a performance optimization for
+// progress updates where the ResourceUpdate is already updated via UpdateResourceUpdateProgress.
+func (d DatastoreSQLite) UpdateFormaCommandProgress(commandID string, state forma_command.CommandState, modifiedTs time.Time) error {
+	slog.Debug("SQLite START", "method", "UpdateFormaCommandProgress", "commandID", commandID, "state", state)
+	start := time.Now()
+	defer func() {
+		slog.Debug("SQLite END", "method", "UpdateFormaCommandProgress", "commandID", commandID, "duration", time.Since(start))
+	}()
+	_, span := sqliteTracer.Start(context.Background(), "UpdateFormaCommandProgress")
+	defer span.End()
+
+	modifiedTsUTC := modifiedTs.UTC().Format(time.RFC3339Nano)
+
+	slog.Debug("SQLite STMT", "method", "UpdateFormaCommandProgress", "stmt", "Exec-UPDATE", "phase", "before")
+	execStart := time.Now()
+	result, err := d.conn.Exec(
+		`UPDATE forma_commands SET state = ?, modified_ts = ? WHERE command_id = ?`,
+		string(state), modifiedTsUTC, commandID,
+	)
+	slog.Debug("SQLite STMT", "method", "UpdateFormaCommandProgress", "stmt", "Exec-UPDATE", "phase", "after", "duration", time.Since(execStart), "error", err)
+	if err != nil {
+		return fmt.Errorf("failed to update forma command meta: %w", err)
+	}
+
+	rowsAffected, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("failed to get rows affected: %w", err)
+	}
+	if rowsAffected == 0 {
+		return fmt.Errorf("forma command not found: %s", commandID)
+	}
+
+	return nil
+}
+
+func (d DatastoreSQLite) UpdateFormaCommandTargetUpdates(commandID string, targetUpdatesJSON json.RawMessage, state forma_command.CommandState, modifiedTs time.Time) error {
+	slog.Debug("SQLite START", "method", "UpdateFormaCommandTargetUpdates", "commandID", commandID, "state", state)
+	start := time.Now()
+	defer func() {
+		slog.Debug("SQLite END", "method", "UpdateFormaCommandTargetUpdates", "commandID", commandID, "duration", time.Since(start))
+	}()
+
+	var err error
+	targetUpdatesJSON, err = datastore.StripOpaqueRefValues(targetUpdatesJSON)
+	if err != nil {
+		return fmt.Errorf("failed to strip opaque ref values from target updates: %w", err)
+	}
+
+	modifiedTsUTC := modifiedTs.UTC().Format(time.RFC3339Nano)
+
+	result, err := d.conn.Exec(
+		`UPDATE forma_commands SET target_updates = ?, state = ?, modified_ts = ? WHERE command_id = ?`,
+		string(targetUpdatesJSON), string(state), modifiedTsUTC, commandID,
+	)
+	if err != nil {
+		return fmt.Errorf("failed to update forma command target updates: %w", err)
+	}
+
+	rowsAffected, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("failed to get rows affected: %w", err)
+	}
+	if rowsAffected == 0 {
+		return fmt.Errorf("forma command not found: %s", commandID)
+	}
+
+	return nil
+}
+
+// ForceCancelResourceUpdates CAS-terminalizes in-flight resource updates to Canceled in one
+// transaction. For InProgress rows it also writes force-cancel progress. Returns the rows
+// transitioned (split by prior state) and those already terminal (Skipped). Idempotent.
+func (d DatastoreSQLite) ForceCancelResourceUpdates(commandID string, inProgress []datastore.ForceCancelRow, notStarted []datastore.ResourceUpdateRef, modifiedTs time.Time) (datastore.ForceCancelResult, error) {
+	slog.Debug("SQLite START", "method", "ForceCancelResourceUpdates", "commandID", commandID, "inProgressCount", len(inProgress), "notStartedCount", len(notStarted))
+	start := time.Now()
+	defer func() {
+		slog.Debug("SQLite END", "method", "ForceCancelResourceUpdates", "commandID", commandID, "duration", time.Since(start))
+	}()
+	_, span := sqliteTracer.Start(context.Background(), "ForceCancelResourceUpdates")
+	defer span.End()
+
+	var result datastore.ForceCancelResult
+
+	if len(inProgress) == 0 && len(notStarted) == 0 {
+		return result, nil
+	}
+
+	var err error
+	tx, err := d.conn.Begin()
+	if err != nil {
+		return result, fmt.Errorf("failed to begin transaction: %w", err)
+	}
+	defer func() {
+		if err != nil {
+			_ = tx.Rollback()
+		}
+	}()
+
+	modifiedTsUTC := modifiedTs.UTC()
+
+	// InProgress rows: update state + progress columns, but only if still InProgress.
+	inProgressStmt, err := tx.Prepare(`
+		UPDATE resource_updates
+		SET state = 'Canceled', modified_ts = ?, progress_result = ?, most_recent_progress = ?
+		WHERE command_id = ? AND ksuid = ? AND operation = ? AND state = 'InProgress'
+	`)
+	if err != nil {
+		return result, fmt.Errorf("failed to prepare inProgress statement: %w", err)
+	}
+	defer func() { _ = inProgressStmt.Close() }()
+
+	for _, row := range inProgress {
+		ref := datastore.ResourceUpdateRef{KSUID: row.KSUID, Operation: row.Operation}
+		res, execErr := inProgressStmt.Exec(modifiedTsUTC, []byte(row.ProgressJSON), []byte(row.MostRecentProgressJSON), commandID, row.KSUID, string(row.Operation))
+		if execErr != nil {
+			err = execErr
+			return result, fmt.Errorf("failed to force-cancel InProgress row %s: %w", row.KSUID, err)
+		}
+		n, _ := res.RowsAffected()
+		if n > 0 {
+			result.CanceledInProgress = append(result.CanceledInProgress, ref)
+		} else {
+			result.Skipped = append(result.Skipped, ref)
+		}
+	}
+
+	// NotStarted rows: update state only, but only if still NotStarted.
+	notStartedStmt, err := tx.Prepare(`
+		UPDATE resource_updates
+		SET state = 'Canceled', modified_ts = ?
+		WHERE command_id = ? AND ksuid = ? AND operation = ? AND state = 'NotStarted'
+	`)
+	if err != nil {
+		return result, fmt.Errorf("failed to prepare notStarted statement: %w", err)
+	}
+	defer func() { _ = notStartedStmt.Close() }()
+
+	for _, ref := range notStarted {
+		res, execErr := notStartedStmt.Exec(modifiedTsUTC, commandID, ref.KSUID, string(ref.Operation))
+		if execErr != nil {
+			err = execErr
+			return result, fmt.Errorf("failed to force-cancel NotStarted row %s: %w", ref.KSUID, err)
+		}
+		n, _ := res.RowsAffected()
+		if n > 0 {
+			result.CanceledNotStarted = append(result.CanceledNotStarted, ref)
+		} else {
+			result.Skipped = append(result.Skipped, ref)
+		}
+	}
+
+	if err = tx.Commit(); err != nil {
+		return result, fmt.Errorf("failed to commit transaction: %w", err)
+	}
+
+	return result, nil
+}
+
+func (d DatastoreSQLite) CleanUp() error {
+	// No cleanup needed for SQLite, this is only used in the Postgres integration tests
+	return nil
+}
+
+// Conn returns the underlying database connection. Used by test helpers that
+// need direct SQL access (e.g. forcing health_state for guard assertions).
+func (d DatastoreSQLite) Conn() *sql.DB { return d.conn }
+
+// RecordAgentBoot appends one agent_boots row for this process start.
+// agentBootTimestampLayout is RFC 3339 with a fixed-width nanosecond fraction.
+// SQLite stores booted_at as text and the reader orders by it, so the format
+// has to sort lexicographically in chronological order. time.RFC3339Nano does
+// not qualify: it strips trailing zeros, so ".5Z" compares greater than the
+// later ".500000001Z".
+const agentBootTimestampLayout = "2006-01-02T15:04:05.000000000Z07:00"
+
+// agentBootTimestamp renders a boot time for storage and comparison in SQLite.
+func agentBootTimestamp(t time.Time) string {
+	return t.UTC().Format(agentBootTimestampLayout)
+}
+
+func (d DatastoreSQLite) RecordAgentBoot(version string) error {
+	ctx, cancel := datastore.AgentBootContext(d.ctx)
+	defer cancel()
+	ctx, span := sqliteTracer.Start(ctx, "RecordAgentBoot")
+	defer span.End()
+
+	_, err := d.conn.ExecContext(
+		ctx,
+		`INSERT INTO agent_boots (boot_id, version, booted_at) VALUES (?, ?, ?)`,
+		mksuid.New().String(), version, agentBootTimestamp(time.Now().UTC()),
+	)
+	if err != nil {
+		return fmt.Errorf("failed to record agent boot: %w", err)
+	}
+	return nil
+}
+
+func (d DatastoreSQLite) GetDesiredOwnership(stack string) (map[string]pkgmodel.OwnedMembers, error) {
+	return datastore.ReadDesiredOwnership(d, stack)
+}

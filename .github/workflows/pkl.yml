@@ -1,0 +1,24 @@
+name: formae-pkl
+
+on:
+  push:
+    branches: [ "**" ]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+        fetch-tags: true
+
+    - name: Install Pkl
+      run: |
+        bash -c "$(curl -fsSL https://hub.platform.engineering/get/setup.sh)" -- install --yes pkl@0.31.0
+
+    - name: Add PEL to PATH
+      run: echo "/opt/pel/bin" >> $GITHUB_PATH
+
+    - name: Test pkl
+      run: make test-pkl

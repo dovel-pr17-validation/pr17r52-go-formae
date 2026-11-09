@@ -1,0 +1,1596 @@
+// © 2025 Platform Engineering Labs Inc.
+//
+// SPDX-License-Identifier: FSL-1.1-ALv2
+
+//go:build unit
+
+package dstest
+
+import (
+	"encoding/json"
+	"fmt"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/platform-engineering-labs/formae/internal/datastore"
+	"github.com/platform-engineering-labs/formae/internal/metastructure/config"
+	"github.com/platform-engineering-labs/formae/internal/metastructure/forma_command"
+	"github.com/platform-engineering-labs/formae/internal/metastructure/resource_update"
+	"github.com/platform-engineering-labs/formae/internal/metastructure/util"
+	pkgmodel "github.com/platform-engineering-labs/formae/pkg/model"
+	"github.com/stretchr/testify/assert"
+)
+
+func RunStoreResource(t *testing.T, newDS func(t *testing.T) TestDatastore) {
+	t.Run("StoreResource", func(t *testing.T) {
+		td := newDS(t)
+		ds := td.Datastore
+		defer td.CleanUpFn() //nolint:errcheck
+
+		target := &pkgmodel.Target{
+			Label:     "target-1",
+			Namespace: "default",
+			Config:    json.RawMessage(`{}`),
+		}
+		_, err := ds.CreateTarget(target)
+		assert.NoError(t, err)
+
+		resource := &pkgmodel.Resource{
+			NativeID: "native-1",
+			Stack:    "stack-1",
+			Type:     "type-1",
+			Label:    "label-1",
+			Target:   "target-1",
+			Properties: json.RawMessage(`{
+			"key": "value"
+			}`),
+			Managed: false,
+		}
+
+		_, err = ds.StoreResource(resource, "test-command")
+		assert.NoError(t, err)
+
+		query := &datastore.ResourceQuery{
+			NativeID: &datastore.QueryItem[string]{
+				Item:       "native-1",
+				Constraint: datastore.Required,
+			},
+		}
+		results, err := ds.QueryResources(query)
+		assert.NoError(t, err)
+		assert.Len(t, results, 1)
+
+		assert.NotEmpty(t, results[0].Ksuid)
+		assert.Equal(t, resource.URI(), results[0].URI())
+
+		assert.Equal(t, resource.NativeID, results[0].NativeID)
+		assert.Equal(t, resource.Stack, results[0].Stack)
+		assert.Equal(t, resource.Type, results[0].Type)
+		assert.Equal(t, resource.Label, results[0].Label)
+		assert.Equal(t, resource.Target, results[0].Target)
+		assert.Equal(t, resource.Managed, results[0].Managed)
+	})
+}
+
+func RunUpdateResource(t *testing.T, newDS func(t *testing.T) TestDatastore) {
+	t.Run("UpdateResource", func(t *testing.T) {
+		t.Run("Should create a new version if the resource properties changed", func(t *testing.T) {
+			td := newDS(t)
+			ds := td.Datastore
+			defer td.CleanUpFn() //nolint:errcheck
+
+			originalResource := &pkgmodel.Resource{
+				Ksuid:    util.NewID(),
+				NativeID: "native-1",
+				Stack:    "stack-1",
+				Type:     "type-1",
+				Label:    "label-1",
+				Properties: json.RawMessage(`{
+				"key": "value"
+				}`),
+			}
+			originalVersion, err := ds.StoreResource(originalResource, "test-command-1")
+			assert.NoError(t, err)
+
+			newVersion, err := ds.StoreResource(&pkgmodel.Resource{
+				Ksuid:    originalResource.Ksuid,
+				NativeID: "native-1",
+				Stack:    "stack-1",
+				Type:     "type-1",
+				Label:    "label-1",
+				Properties: json.RawMessage(`{
+				"key": "new-value"
+				}`),
+			}, "test-command-2")
+			assert.NoError(t, err)
+
+			newFromDb, err := ds.LoadResourceById(originalResource.Ksuid)
+			assert.NoError(t, err)
+
+			assert.NotEqual(t, originalVersion, newVersion)
+			assert.JSONEq(t, `{"key": "new-value"}`, string(newFromDb.Properties))
+		})
+
+		t.Run("Should not create a new version if the read-only properties changed", func(t *testing.T) {
+			td := newDS(t)
+			ds := td.Datastore
+			defer td.CleanUpFn() //nolint:errcheck
+
+			originalResource := &pkgmodel.Resource{
+				Ksuid:    util.NewID(),
+				NativeID: "native-1",
+				Stack:    "stack-1",
+				Type:     "type-1",
+				Label:    "label-1",
+				Properties: json.RawMessage(`{
+				"key": "value"
+				}`),
+				ReadOnlyProperties: json.RawMessage(`{
+				"ro-key": "ro-value"
+				}`),
+			}
+			originalVersion, err := ds.StoreResource(originalResource, "test-command-1")
+			assert.NoError(t, err)
+
+			newVersion, err := ds.StoreResource(&pkgmodel.Resource{
+				Ksuid:    originalResource.Ksuid,
+				NativeID: "native-1",
+				Stack:    "stack-1",
+				Type:     "type-1",
+				Label:    "label-1",
+				Properties: json.RawMessage(`{
+				"key": "value"
+				}`),
+				ReadOnlyProperties: json.RawMessage(`{
+				"ro-key": "new-ro-value"
+				}`),
+			}, "test-command-2")
+			assert.NoError(t, err)
+
+			newFromDb, err := ds.LoadResourceById(originalResource.Ksuid)
+			assert.NoError(t, err)
+
+			assert.Equal(t, originalVersion, newVersion)
+			assert.JSONEq(t, `{"ro-key": "new-ro-value"}`, string(newFromDb.ReadOnlyProperties))
+		})
+	})
+}
+
+func RunDeleteResource(t *testing.T, newDS func(t *testing.T) TestDatastore) {
+	t.Run("DeleteResource", func(t *testing.T) {
+		td := newDS(t)
+		ds := td.Datastore
+		defer td.CleanUpFn() //nolint:errcheck
+
+		resource := &pkgmodel.Resource{
+			NativeID: "native-1",
+			Stack:    "stack-1",
+			Type:     "type-1",
+			Label:    "label-1",
+			Properties: json.RawMessage(`{
+			"key": "value"
+			}`),
+		}
+
+		_, err := ds.StoreResource(resource, "test-command")
+		assert.NoError(t, err)
+
+		_, err = ds.DeleteResource(resource, "test-command")
+		assert.NoError(t, err)
+
+		query := &datastore.ResourceQuery{
+			NativeID: &datastore.QueryItem[string]{
+				Item:       "native-1",
+				Constraint: datastore.Required,
+			},
+		}
+		results, err := ds.QueryResources(query)
+		assert.NoError(t, err)
+		assert.Empty(t, results)
+	})
+}
+
+func RunQueryResources(t *testing.T, newDS func(t *testing.T) TestDatastore) {
+	t.Run("QueryResources", func(t *testing.T) {
+		td := newDS(t)
+		ds := td.Datastore
+		defer td.CleanUpFn() //nolint:errcheck
+
+		for i := range 7 {
+			target := &pkgmodel.Target{
+				Label:     fmt.Sprintf("target-%d", i),
+				Namespace: "default",
+				Config:    json.RawMessage(`{}`),
+			}
+			_, err := ds.CreateTarget(target)
+			assert.NoError(t, err)
+		}
+
+		for i := range 10 {
+			resource := &pkgmodel.Resource{
+				NativeID: fmt.Sprintf("native-%d", i),
+				Stack:    fmt.Sprintf("stack-%d", i%3),
+				Type:     fmt.Sprintf("type-%d", i%4),
+				Label:    fmt.Sprintf("label-%d", i%5),
+				Target:   fmt.Sprintf("target-%d", i%7),
+				Managed:  i%2 == 0,
+				Properties: json.RawMessage(fmt.Sprintf(`{
+				"key": "value-%d"
+				}`, i)),
+			}
+			_, err := ds.StoreResource(resource, "test-command")
+			assert.NoError(t, err)
+		}
+
+		query := &datastore.ResourceQuery{
+			NativeID: &datastore.QueryItem[string]{
+				Item:       "native-1",
+				Constraint: datastore.Required,
+			},
+		}
+		results, err := ds.QueryResources(query)
+		assert.NoError(t, err)
+		assert.Len(t, results, 1)
+		for _, result := range results {
+			assert.Equal(t, "native-1", result.NativeID)
+		}
+
+		query = &datastore.ResourceQuery{
+			Stack: &datastore.QueryItem[string]{
+				Item:       "stack-2",
+				Constraint: datastore.Required,
+			},
+		}
+		results, err = ds.QueryResources(query)
+		assert.NoError(t, err)
+		assert.NotEmpty(t, results)
+		for _, result := range results {
+			assert.Equal(t, "stack-2", result.Stack)
+		}
+
+		query = &datastore.ResourceQuery{
+			Type: &datastore.QueryItem[string]{
+				Item:       "type-3",
+				Constraint: datastore.Required,
+			},
+		}
+		results, err = ds.QueryResources(query)
+		assert.NoError(t, err)
+		assert.NotEmpty(t, results)
+		for _, result := range results {
+			assert.Equal(t, "type-3", result.Type)
+		}
+
+		query = &datastore.ResourceQuery{
+			Label: &datastore.QueryItem[string]{
+				Item:       "label-4",
+				Constraint: datastore.Required,
+			},
+		}
+		results, err = ds.QueryResources(query)
+		assert.NoError(t, err)
+		assert.NotEmpty(t, results)
+		for _, result := range results {
+			assert.Equal(t, "label-4", result.Label)
+		}
+
+		query = &datastore.ResourceQuery{
+			Target: &datastore.QueryItem[string]{
+				Item:       "target-4",
+				Constraint: datastore.Required,
+			},
+		}
+		results, err = ds.QueryResources(query)
+		assert.NoError(t, err)
+		assert.NotEmpty(t, results)
+		for _, result := range results {
+			assert.Equal(t, "target-4", result.Target)
+		}
+
+		query = &datastore.ResourceQuery{}
+		results, err = ds.QueryResources(query)
+		assert.NoError(t, err)
+		assert.NotEmpty(t, results)
+		assert.Len(t, results, 10)
+
+		query = &datastore.ResourceQuery{
+			Managed: &datastore.QueryItem[bool]{
+				Item:       true,
+				Constraint: datastore.Required,
+			},
+		}
+		results, err = ds.QueryResources(query)
+		assert.NoError(t, err)
+		assert.Len(t, results, 5)
+
+		query = &datastore.ResourceQuery{
+			Managed: &datastore.QueryItem[bool]{
+				Item:       false,
+				Constraint: datastore.Required,
+			},
+		}
+		results, err = ds.QueryResources(query)
+		assert.NoError(t, err)
+		assert.NotEmpty(t, results)
+		assert.Len(t, results, 5)
+
+		// Multi-value (Item + ExtraItems): stack:stack-0 stack:stack-2 → IN.
+		// stack-0 has rows for i=0,3,6,9 (4 rows); stack-2 has rows for i=2,5,8
+		// (3 rows); union = 7 rows.
+		query = &datastore.ResourceQuery{
+			Stack: &datastore.QueryItem[string]{
+				Item:       "stack-0",
+				ExtraItems: []string{"stack-2"},
+				Constraint: datastore.Optional,
+			},
+		}
+		results, err = ds.QueryResources(query)
+		assert.NoError(t, err)
+		assert.Len(t, results, 7)
+		for _, r := range results {
+			assert.Contains(t, []string{"stack-0", "stack-2"}, r.Stack)
+		}
+
+		// Multi-value with Excluded: -stack:stack-0 -stack:stack-2 →
+		// rows where stack is neither. Only stack-1 remains: i=1,4,7 (3 rows).
+		query = &datastore.ResourceQuery{
+			Stack: &datastore.QueryItem[string]{
+				Item:       "stack-0",
+				ExtraItems: []string{"stack-2"},
+				Constraint: datastore.Excluded,
+			},
+		}
+		results, err = ds.QueryResources(query)
+		assert.NoError(t, err)
+		assert.Len(t, results, 3)
+		for _, r := range results {
+			assert.Equal(t, "stack-1", r.Stack)
+		}
+
+		// Wildcard prefix: type starts with "type-1" (4 type-buckets exist,
+		// so type-1 alone is rows for i=1,5,9 — 3 rows). Use "type-1*" to
+		// confirm trailing-wildcard works.
+		query = &datastore.ResourceQuery{
+			Type: &datastore.QueryItem[string]{
+				Item:       "type-1*",
+				Constraint: datastore.Optional,
+			},
+		}
+		results, err = ds.QueryResources(query)
+		assert.NoError(t, err)
+		assert.Len(t, results, 3)
+		for _, r := range results {
+			assert.Equal(t, "type-1", r.Type)
+		}
+
+		// Wildcard suffix: native_id ends with "-7" (single row, i=7).
+		query = &datastore.ResourceQuery{
+			NativeID: &datastore.QueryItem[string]{
+				Item:       "*-7",
+				Constraint: datastore.Optional,
+			},
+		}
+		results, err = ds.QueryResources(query)
+		assert.NoError(t, err)
+		assert.Len(t, results, 1)
+		assert.Equal(t, "native-7", results[0].NativeID)
+	})
+}
+
+// RunQueryResources_LikeMetacharsAreLiteral verifies that `_` and `%` in
+// user-supplied values are matched literally rather than acting as SQL LIKE
+// wildcards. Without explicit escape handling, `label:my_svc*` would match
+// rows whose label contains `my<anychar>svc...` because `_` is the LIKE
+// single-char wildcard in every supported backend.
+func RunQueryResources_LikeMetacharsAreLiteral(t *testing.T, newDS func(t *testing.T) TestDatastore) {
+	t.Run("QueryResources_LikeMetacharsAreLiteral", func(t *testing.T) {
+		td := newDS(t)
+		ds := td.Datastore
+		defer td.CleanUpFn() //nolint:errcheck
+
+		// Two labels, distinguished only by the literal `_` vs `X` between
+		// `my` and `svc`. A correctly-escaped query for `my_svc*` should
+		// only match the underscore variant.
+		resources := []*pkgmodel.Resource{
+			{NativeID: "n-literal", Stack: "s", Type: "t", Label: "my_svc-prod", Properties: json.RawMessage(`{}`)},
+			{NativeID: "n-wildcard", Stack: "s", Type: "t", Label: "myXsvc-prod", Properties: json.RawMessage(`{}`)},
+		}
+		for _, r := range resources {
+			_, err := ds.StoreResource(r, "test-cmd")
+			assert.NoError(t, err)
+		}
+
+		query := &datastore.ResourceQuery{
+			Label: &datastore.QueryItem[string]{
+				Item:       "my_svc*",
+				Constraint: datastore.Optional,
+			},
+		}
+		results, err := ds.QueryResources(query)
+		assert.NoError(t, err)
+		assert.Len(t, results, 1, "underscore should match literally, not as a single-char wildcard")
+		if len(results) == 1 {
+			assert.Equal(t, "my_svc-prod", results[0].Label)
+		}
+	})
+}
+
+func RunStoreResourceSameResourceTwice(t *testing.T, newDS func(t *testing.T) TestDatastore) {
+	t.Run("StoreResource_SameResourceTwiceReturnsSameVersionId", func(t *testing.T) {
+		td := newDS(t)
+		ds := td.Datastore
+		defer td.CleanUpFn() //nolint:errcheck
+
+		target := &pkgmodel.Target{
+			Label:     "test-target",
+			Namespace: "default",
+			Config:    json.RawMessage(`{}`),
+		}
+		_, err := ds.CreateTarget(target)
+		assert.NoError(t, err)
+
+		resource := &pkgmodel.Resource{
+			NativeID: "native-1",
+			Stack:    "stack-1",
+			Type:     "type-1",
+			Label:    "label-1",
+			Target:   "test-target",
+			Managed:  true,
+			Properties: json.RawMessage(`{
+			"key": "value"
+			}`),
+		}
+
+		firstVersionId, err := ds.StoreResource(resource, "test-command")
+		assert.NoError(t, err)
+
+		secondVersionId, err := ds.StoreResource(resource, "test-command")
+		assert.NoError(t, err)
+
+		assert.Equal(t, firstVersionId, secondVersionId)
+
+		query := &datastore.ResourceQuery{
+			NativeID: &datastore.QueryItem[string]{
+				Item:       "native-1",
+				Constraint: datastore.Required,
+			},
+		}
+		results, err := ds.QueryResources(query)
+		assert.NoError(t, err)
+		assert.Len(t, results, 1)
+		assert.Equal(t, resource.URI(), results[0].URI())
+	})
+}
+
+func RunLoadResourceByNativeID(t *testing.T, newDS func(t *testing.T) TestDatastore) {
+	t.Run("LoadResourceByNativeID", func(t *testing.T) {
+		td := newDS(t)
+		ds := td.Datastore
+		defer td.CleanUpFn() //nolint:errcheck
+
+		resource := &pkgmodel.Resource{
+			NativeID: "native-123",
+			Stack:    "stack-1",
+			Type:     "type-1",
+			Label:    "label-1",
+			Properties: json.RawMessage(`{
+			"key": "value"
+		}`),
+			Managed: false,
+		}
+
+		_, err := ds.StoreResource(resource, "test-command")
+		assert.NoError(t, err)
+
+		loadedResource, err := ds.LoadResourceByNativeID("native-123", "type-1")
+		assert.NoError(t, err)
+		assert.NotNil(t, loadedResource)
+		assert.Equal(t, resource.NativeID, loadedResource.NativeID)
+		assert.Equal(t, resource.Stack, loadedResource.Stack)
+		assert.Equal(t, resource.Type, loadedResource.Type)
+
+		// Negative test - wrong type
+		nonExistentResource, err := ds.LoadResourceByNativeID("native-123", "wrong-type")
+		assert.NoError(t, err)
+		assert.Nil(t, nonExistentResource)
+
+		// Negative test - non-existent native ID
+		nonExistentResource2, err := ds.LoadResourceByNativeID("non-existent", "type-1")
+		assert.NoError(t, err)
+		assert.Nil(t, nonExistentResource2)
+
+		_, err = ds.DeleteResource(resource, "test-delete-command")
+		assert.NoError(t, err)
+
+		deletedResource, err := ds.LoadResourceByNativeID("native-123", "type-1")
+		assert.NoError(t, err)
+		assert.Nil(t, deletedResource, "Deleted resource should not be found")
+	})
+}
+
+func RunLoadResourceByNativeIDDifferentTypes(t *testing.T, newDS func(t *testing.T) TestDatastore) {
+	t.Run("LoadResourceByNativeID_DifferentTypes", func(t *testing.T) {
+		td := newDS(t)
+		ds := td.Datastore
+		defer td.CleanUpFn() //nolint:errcheck
+
+		// Store two resources with same native ID but different types
+		resource1 := &pkgmodel.Resource{
+			NativeID: "shared-id-123",
+			Type:     "AWS::S3::Bucket",
+			Stack:    "stack-1",
+			Label:    "bucket-1",
+			Properties: json.RawMessage(`{
+				"BucketName": "my-bucket"
+			}`),
+			Managed: false,
+		}
+		resource2 := &pkgmodel.Resource{
+			NativeID: "shared-id-123",
+			Type:     "AWS::IAM::Role",
+			Stack:    "stack-1",
+			Label:    "role-1",
+			Properties: json.RawMessage(`{
+				"RoleName": "my-role"
+			}`),
+			Managed: false,
+		}
+
+		_, err := ds.StoreResource(resource1, "cmd-1")
+		assert.NoError(t, err)
+		_, err = ds.StoreResource(resource2, "cmd-2")
+		assert.NoError(t, err)
+
+		// Should return bucket when querying for bucket type
+		loaded1, err := ds.LoadResourceByNativeID("shared-id-123", "AWS::S3::Bucket")
+		assert.NoError(t, err)
+		assert.NotNil(t, loaded1, "Bucket should be found")
+		assert.Equal(t, "AWS::S3::Bucket", loaded1.Type)
+		assert.Equal(t, "bucket-1", loaded1.Label)
+
+		// Should return role when querying for role type
+		loaded2, err := ds.LoadResourceByNativeID("shared-id-123", "AWS::IAM::Role")
+		assert.NoError(t, err)
+		assert.NotNil(t, loaded2, "Role should be found")
+		assert.Equal(t, "AWS::IAM::Role", loaded2.Type)
+		assert.Equal(t, "role-1", loaded2.Label)
+
+		// Should return nil for wrong type
+		loaded3, err := ds.LoadResourceByNativeID("shared-id-123", "AWS::EC2::Instance")
+		assert.NoError(t, err)
+		assert.Nil(t, loaded3, "Non-existent type should return nil")
+	})
+}
+
+func RunBatchGetKSUIDsByTriplets(t *testing.T, newDS func(t *testing.T) TestDatastore) {
+	t.Run("BatchGetKSUIDsByTriplets", func(t *testing.T) {
+		td := newDS(t)
+		ds := td.Datastore
+		defer td.CleanUpFn() //nolint:errcheck
+
+		resource1 := &pkgmodel.Resource{
+			Stack:      "test-stack",
+			Label:      "resource-1",
+			Type:       "AWS::S3::Bucket",
+			NativeID:   "bucket-1",
+			Properties: json.RawMessage(`{"BucketName": "test-bucket-1"}`),
+			Managed:    true,
+		}
+
+		resource2 := &pkgmodel.Resource{
+			Stack:      "test-stack",
+			Label:      "resource-2",
+			Type:       "AWS::EC2::VPC",
+			NativeID:   "vpc-1",
+			Properties: json.RawMessage(`{"CidrBlock": "10.0.0.0/16"}`),
+			Managed:    true,
+		}
+
+		resource3 := &pkgmodel.Resource{
+			Stack:      "other-stack",
+			Label:      "resource-3",
+			Type:       "AWS::IAM::Role",
+			NativeID:   "role-1",
+			Properties: json.RawMessage(`{"RoleName": "test-role"}`),
+			Managed:    true,
+		}
+
+		// Store the resources
+		_, err := ds.StoreResource(resource1, "test-command-1")
+		assert.NoError(t, err)
+		_, err = ds.StoreResource(resource2, "test-command-2")
+		assert.NoError(t, err)
+		_, err = ds.StoreResource(resource3, "test-command-3")
+		assert.NoError(t, err)
+
+		// Get the actual KSUIDs from the stored resources by querying them back
+		storedResource1, err := ds.LoadResourceByNativeID("bucket-1", "AWS::S3::Bucket")
+		assert.NoError(t, err)
+		assert.NotNil(t, storedResource1)
+
+		storedResource2, err := ds.LoadResourceByNativeID("vpc-1", "AWS::EC2::VPC")
+		assert.NoError(t, err)
+		assert.NotNil(t, storedResource2)
+
+		storedResource3, err := ds.LoadResourceByNativeID("role-1", "AWS::IAM::Role")
+		assert.NoError(t, err)
+		assert.NotNil(t, storedResource3)
+
+		// Test basic batch lookup
+		triplets := []pkgmodel.TripletKey{
+			{Stack: "test-stack", Label: "resource-1", Type: "AWS::S3::Bucket"},
+			{Stack: "test-stack", Label: "resource-2", Type: "AWS::EC2::VPC"},
+			{Stack: "other-stack", Label: "resource-3", Type: "AWS::IAM::Role"},
+		}
+
+		results, err := ds.BatchGetKSUIDsByTriplets(triplets)
+		assert.NoError(t, err)
+		assert.Len(t, results, 3)
+
+		// Verify the correct KSUIDs are returned
+		assert.Equal(t, storedResource1.Ksuid, results[triplets[0]])
+		assert.Equal(t, storedResource2.Ksuid, results[triplets[1]])
+		assert.Equal(t, storedResource3.Ksuid, results[triplets[2]])
+
+		// Test with non-existent triplets
+		mixedTriplets := []pkgmodel.TripletKey{
+			{Stack: "test-stack", Label: "resource-1", Type: "AWS::S3::Bucket"},         // exists
+			{Stack: "non-existent", Label: "resource-x", Type: "AWS::Lambda::Function"}, // doesn't exist
+			{Stack: "other-stack", Label: "resource-3", Type: "AWS::IAM::Role"},         // exists
+		}
+
+		mixedResults, err := ds.BatchGetKSUIDsByTriplets(mixedTriplets)
+		assert.NoError(t, err)
+		assert.Len(t, mixedResults, 2) // Only 2 should be found
+
+		// Verify existing resources are found
+		assert.Equal(t, storedResource1.Ksuid, mixedResults[mixedTriplets[0]])
+		assert.Equal(t, storedResource3.Ksuid, mixedResults[mixedTriplets[2]])
+
+		// Verify non-existent resource is not in results
+		_, exists := mixedResults[mixedTriplets[1]]
+		assert.False(t, exists, "Non-existent triplet should not be in results")
+
+		// Test with empty input
+		emptyResults, err := ds.BatchGetKSUIDsByTriplets([]pkgmodel.TripletKey{})
+		assert.NoError(t, err)
+		assert.Empty(t, emptyResults)
+
+		// Test that deleted resources are NOT returned (they should be filtered out)
+		_, err = ds.DeleteResource(storedResource1, "delete-command")
+		assert.NoError(t, err)
+
+		afterDeleteResults, err := ds.BatchGetKSUIDsByTriplets(triplets)
+		assert.NoError(t, err)
+		assert.Len(t, afterDeleteResults, 2, "Deleted resources should not be returned")
+
+		// Verify deleted resource is NOT in results
+		_, exists = afterDeleteResults[triplets[0]]
+		assert.False(t, exists, "Deleted resource should not be in results")
+
+		// Verify other resources are still there
+		assert.Equal(t, storedResource2.Ksuid, afterDeleteResults[triplets[1]])
+		assert.Equal(t, storedResource3.Ksuid, afterDeleteResults[triplets[2]])
+	})
+}
+
+// GetKSUIDByTriplet must agree with BatchGetKSUIDsByTriplets on liveness: a
+// resource whose latest version is a delete tombstone is gone, and its triplet
+// must not resolve to the ksuid of an older version. A re-created resource
+// resolves to the new row's ksuid.
+func RunGetKSUIDByTriplet(t *testing.T, newDS func(t *testing.T) TestDatastore) {
+	t.Run("GetKSUIDByTriplet", func(t *testing.T) {
+		td := newDS(t)
+		ds := td.Datastore
+		defer td.CleanUpFn() //nolint:errcheck
+
+		resource := &pkgmodel.Resource{
+			Stack:      "test-stack",
+			Label:      "resource-1",
+			Type:       "AWS::S3::Bucket",
+			NativeID:   "bucket-1",
+			Properties: json.RawMessage(`{"BucketName": "test-bucket-1"}`),
+			Managed:    true,
+		}
+		_, err := ds.StoreResource(resource, "test-command-1")
+		assert.NoError(t, err)
+
+		stored, err := ds.LoadResourceByNativeID("bucket-1", "AWS::S3::Bucket")
+		assert.NoError(t, err)
+		assert.NotNil(t, stored)
+
+		ksuid, err := ds.GetKSUIDByTriplet("test-stack", "resource-1", "AWS::S3::Bucket")
+		assert.NoError(t, err)
+		assert.Equal(t, stored.Ksuid, ksuid)
+
+		// Missing triplet resolves to nothing.
+		ksuid, err = ds.GetKSUIDByTriplet("test-stack", "no-such-resource", "AWS::S3::Bucket")
+		assert.NoError(t, err)
+		assert.Empty(t, ksuid)
+
+		// A deleted resource's triplet resolves to nothing: the latest version
+		// is the tombstone, and the older live version must not resurrect.
+		_, err = ds.DeleteResource(stored, "delete-command")
+		assert.NoError(t, err)
+
+		ksuid, err = ds.GetKSUIDByTriplet("test-stack", "resource-1", "AWS::S3::Bucket")
+		assert.NoError(t, err)
+		assert.Empty(t, ksuid, "a deleted resource must not resolve via an older version")
+
+		// Re-creating the triplet resolves to the new row's ksuid.
+		recreated := &pkgmodel.Resource{
+			Stack:      "test-stack",
+			Label:      "resource-1",
+			Type:       "AWS::S3::Bucket",
+			NativeID:   "bucket-2",
+			Properties: json.RawMessage(`{"BucketName": "test-bucket-2"}`),
+			Managed:    true,
+		}
+		_, err = ds.StoreResource(recreated, "recreate-command")
+		assert.NoError(t, err)
+
+		restored, err := ds.LoadResourceByNativeID("bucket-2", "AWS::S3::Bucket")
+		assert.NoError(t, err)
+		assert.NotNil(t, restored)
+
+		ksuid, err = ds.GetKSUIDByTriplet("test-stack", "resource-1", "AWS::S3::Bucket")
+		assert.NoError(t, err)
+		assert.Equal(t, restored.Ksuid, ksuid)
+	})
+}
+
+func RunBatchGetKSUIDsByTripletsPatchScenario(t *testing.T, newDS func(t *testing.T) TestDatastore) {
+	t.Run("BatchGetKSUIDsByTriplets_PatchScenario", func(t *testing.T) {
+		td := newDS(t)
+		ds := td.Datastore
+		defer td.CleanUpFn() //nolint:errcheck
+
+		initialResource := &pkgmodel.Resource{
+			Stack:      "test-stack",
+			Label:      "test-resource",
+			Type:       "FakeAWS::S3::Bucket",
+			NativeID:   "bucket-123",
+			Properties: json.RawMessage(`{"foo":"bar","baz":"qux","a":[3,4,2]}`),
+			Managed:    true,
+		}
+
+		// Store the initial resource
+		_, err := ds.StoreResource(initialResource, "initial-command")
+		assert.NoError(t, err)
+
+		// Get the stored resource to see what KSUID it got
+		storedResource, err := ds.LoadResourceByNativeID("bucket-123", "FakeAWS::S3::Bucket")
+		assert.NoError(t, err)
+		assert.NotNil(t, storedResource)
+		assert.NotEmpty(t, storedResource.Ksuid)
+
+		t.Logf("Initial resource stored with KSUID: %s", storedResource.Ksuid)
+
+		// Now simulate the patch scenario - try to look up the same triplet
+		triplet := pkgmodel.TripletKey{
+			Stack: "test-stack",
+			Label: "test-resource",
+			Type:  "FakeAWS::S3::Bucket",
+		}
+
+		t.Logf("Looking up triplet: %+v", triplet)
+
+		results, err := ds.BatchGetKSUIDsByTriplets([]pkgmodel.TripletKey{triplet})
+		assert.NoError(t, err)
+
+		t.Logf("Batch lookup results: %+v", results)
+
+		// Verify the lookup found the resource
+		ksuid, exists := results[triplet]
+		assert.True(t, exists, "Batch lookup should find the existing resource")
+		assert.Equal(t, storedResource.Ksuid, ksuid, "Should return the same KSUID")
+	})
+}
+
+func RunDifferentResourceTypesSameNativeId(t *testing.T, newDS func(t *testing.T) TestDatastore) {
+	t.Run("DifferentResourceTypesSameNativeId", func(t *testing.T) {
+		td := newDS(t)
+		ds := td.Datastore
+		defer td.CleanUpFn() //nolint:errcheck
+
+		bucket := &pkgmodel.Resource{
+			Stack:    "static-website-stack",
+			Label:    "WebsiteBucket",
+			Type:     "AWS::S3::Bucket",
+			NativeID: "my-unique-bucket-name",
+			Target:   "aws-target",
+			Properties: json.RawMessage(`{
+				"BucketName": "my-unique-bucket-name",
+				"WebsiteConfiguration": {"IndexDocument": "index.html"}
+			}`),
+			Managed: true,
+		}
+
+		bucketPolicy := &pkgmodel.Resource{
+			Stack:    "static-website-stack",
+			Label:    "WebsiteBucketPolicy",
+			Type:     "AWS::S3::BucketPolicy",
+			NativeID: "my-unique-bucket-name", // Same NativeId as bucket!
+			Target:   "aws-target",
+			Properties: json.RawMessage(`{
+				"Bucket": "my-unique-bucket-name",
+				"PolicyDocument": {"Version": "2012-10-17", "Statement": []}
+			}`),
+			Managed: true,
+		}
+
+		_, err := ds.StoreResource(bucket, "test-command-1")
+		assert.NoError(t, err)
+		assert.NotEmpty(t, bucket.Ksuid, "Bucket should have a KSUID assigned")
+
+		_, err = ds.StoreResource(bucketPolicy, "test-command-1")
+		assert.NoError(t, err)
+		assert.NotEmpty(t, bucketPolicy.Ksuid, "BucketPolicy should have a KSUID assigned")
+
+		assert.NotEqual(t, bucket.Ksuid, bucketPolicy.Ksuid,
+			"Bucket and BucketPolicy should have different KSUIDs even though they share the same NativeId")
+
+		loadedBucket, err := ds.LoadResource(bucket.URI())
+		assert.NoError(t, err)
+		assert.NotNil(t, loadedBucket)
+		assert.Equal(t, "AWS::S3::Bucket", loadedBucket.Type)
+		assert.Equal(t, "WebsiteBucket", loadedBucket.Label)
+		assert.Equal(t, bucket.Ksuid, loadedBucket.Ksuid)
+
+		loadedBucketPolicy, err := ds.LoadResource(bucketPolicy.URI())
+		assert.NoError(t, err)
+		assert.NotNil(t, loadedBucketPolicy)
+		assert.Equal(t, "AWS::S3::BucketPolicy", loadedBucketPolicy.Type)
+		assert.Equal(t, "WebsiteBucketPolicy", loadedBucketPolicy.Label)
+		assert.Equal(t, bucketPolicy.Ksuid, loadedBucketPolicy.Ksuid)
+
+		bucket.Properties = json.RawMessage(`{
+			"BucketName": "my-unique-bucket-name",
+			"WebsiteConfiguration": {"IndexDocument": "index.html", "ErrorDocument": "error.html"}
+		}`)
+		_, err = ds.StoreResource(bucket, "test-command-2")
+		assert.NoError(t, err)
+
+		reloadedBucketPolicy, err := ds.LoadResource(bucketPolicy.URI())
+		assert.NoError(t, err)
+		assert.NotNil(t, reloadedBucketPolicy)
+		assert.JSONEq(t, string(bucketPolicy.Properties), string(reloadedBucketPolicy.Properties),
+			"BucketPolicy should remain unchanged after Bucket update")
+
+		_, err = ds.DeleteResource(bucketPolicy, "test-delete-command")
+		assert.NoError(t, err)
+
+		query := &datastore.ResourceQuery{
+			NativeID: &datastore.QueryItem[string]{
+				Item:       "my-unique-bucket-name",
+				Constraint: datastore.Required,
+			},
+		}
+		results, err := ds.QueryResources(query)
+		assert.NoError(t, err)
+		assert.Equal(t, 1, len(results), "Should find only the Bucket after BucketPolicy deletion")
+		assert.Equal(t, "AWS::S3::Bucket", results[0].Type, "Remaining resource should be the Bucket")
+	})
+}
+
+func RunGetResourceModificationsSinceLastReconcile(t *testing.T, newDS func(t *testing.T) TestDatastore) {
+	RunPendingDeletion(t, newDS)
+	RunExplicitDestroyDrift(t, newDS)
+	t.Run("GetResourceModificationsSinceLastReconcile_AcceptedNilProperties", func(t *testing.T) {
+		td := newDS(t)
+		defer func(cleanup func() error) { _ = cleanup() }(td.CleanUpFn)
+		_, err := td.CreateStack(&pkgmodel.Stack{Label: "accepted-nil-stack"}, "stack-create")
+		assert.NoError(t, err)
+		stack, err := td.GetStackByLabel("accepted-nil-stack")
+		assert.NoError(t, err)
+		observed := pkgmodel.Resource{Ksuid: util.NewID(), Stack: stack.Label, Label: "accepted", Type: "Test::Resource", Target: "default", NativeID: "native", Managed: true}
+		before := reconcileBuilder(forma_command.CommandStateSuccess, pkgmodel.FormaApplyModePatch, -10*time.Minute, nil)
+		assert.NoError(t, td.StoreFormaCommand(before, before.ID))
+		version, err := td.StoreResource(&observed, before.ID)
+		assert.NoError(t, err)
+		accepted := resourceUpdate(stack.Label, observed.Ksuid, observed.Label, `{}`, resource_update.OperationAccept, resource_update.FormaCommandSourceUser)
+		accepted.Version = strings.TrimPrefix(version, observed.Ksuid+"_")
+		cmd := reconcileBuilder(forma_command.CommandStateSuccess, pkgmodel.FormaApplyModeReconcile, -5*time.Minute, []resource_update.ResourceUpdate{accepted})
+		cmd.Stacks = []forma_command.CommandStack{{ID: stack.ID, Label: stack.Label}}
+		assert.NoError(t, td.StoreFormaCommand(cmd, cmd.ID))
+		after := reconcileBuilder(forma_command.CommandStateSuccess, pkgmodel.FormaApplyModePatch, -time.Minute, nil)
+		assert.NoError(t, td.StoreFormaCommand(after, after.ID))
+		observed.Properties = json.RawMessage(`{"foo":"v2"}`)
+		_, err = td.StoreResource(&observed, after.ID)
+		assert.NoError(t, err)
+		mods, err := td.GetResourceModificationsSinceLastReconcile(stack.Label)
+		assert.NoError(t, err)
+		if assert.NotEmpty(t, mods) {
+			assert.Nil(t, mods[0].OldProperties, "a present nil-properties observation is a valid baseline")
+		}
+		cmd.ResourceUpdates[0].Version = "missing-observation"
+		assert.NoError(t, td.StoreFormaCommand(cmd, cmd.ID))
+		_, err = td.GetResourceModificationsSinceLastReconcile(stack.Label)
+		assert.ErrorContains(t, err, "accepted observation version missing")
+	})
+
+	t.Run("GetResourceModificationsSinceLastReconcile_AcceptedObservation", func(t *testing.T) {
+		td := newDS(t)
+		defer func(cleanup func() error) { _ = cleanup() }(td.CleanUpFn)
+		_, err := td.CreateStack(&pkgmodel.Stack{Label: "accepted-stack"}, "stack-create")
+		assert.NoError(t, err)
+		stack, err := td.GetStackByLabel("accepted-stack")
+		assert.NoError(t, err)
+		observed := pkgmodel.Resource{Ksuid: util.NewID(), Stack: stack.Label, Label: "accepted", Type: "Test::Resource", Target: "default", NativeID: "native", Managed: true, Properties: json.RawMessage(`{"endpoint":"resolved-value","readonly":"provider-field","foo":"v1"}`)}
+		before := reconcileBuilder(forma_command.CommandStateSuccess, pkgmodel.FormaApplyModePatch, -10*time.Minute, nil)
+		assert.NoError(t, td.StoreFormaCommand(before, before.ID))
+		version, err := td.StoreResource(&observed, before.ID)
+		assert.NoError(t, err)
+		accepted := resourceUpdate(stack.Label, observed.Ksuid, observed.Label, `{"endpoint":{"$ref":"resource://other#/value"},"foo":"v1"}`, resource_update.OperationAccept, resource_update.FormaCommandSourceUser)
+		accepted.Version = strings.TrimPrefix(version, observed.Ksuid+"_")
+		cmd := reconcileBuilder(forma_command.CommandStateSuccess, pkgmodel.FormaApplyModeReconcile, -5*time.Minute, []resource_update.ResourceUpdate{accepted})
+		cmd.Stacks = []forma_command.CommandStack{{ID: stack.ID, Label: stack.Label}}
+		historyBefore, err := td.LoadAllResourceVersions()
+		assert.NoError(t, err)
+		assert.NoError(t, td.StoreFormaCommand(cmd, cmd.ID))
+		historyAfter, err := td.LoadAllResourceVersions()
+		assert.NoError(t, err)
+		assert.Equal(t, historyBefore, historyAfter, "acceptance must not create or rewrite inventory versions")
+		mods, err := td.GetResourceModificationsSinceLastReconcile(stack.Label)
+		assert.NoError(t, err)
+		assert.Empty(t, mods)
+		after := reconcileBuilder(forma_command.CommandStateSuccess, pkgmodel.FormaApplyModePatch, -time.Minute, nil)
+		assert.NoError(t, td.StoreFormaCommand(after, after.ID))
+		observed.Properties = json.RawMessage(`{"endpoint":"resolved-value","readonly":"provider-field","foo":"v2"}`)
+		_, err = td.StoreResource(&observed, after.ID)
+		assert.NoError(t, err)
+		mods, err = td.GetResourceModificationsSinceLastReconcile(stack.Label)
+		assert.NoError(t, err)
+		if assert.NotEmpty(t, mods) {
+			assert.JSONEq(t, `{"endpoint":"resolved-value","readonly":"provider-field","foo":"v1"}`, string(mods[0].OldProperties))
+		}
+		cmd.ResourceUpdates[0].Version = "missing-observation"
+		assert.NoError(t, td.StoreFormaCommand(cmd, cmd.ID))
+		_, err = td.GetResourceModificationsSinceLastReconcile(stack.Label)
+		assert.ErrorContains(t, err, "accepted observation version missing")
+		deletedVersion, err := td.DeleteResource(&observed, after.ID)
+		assert.NoError(t, err)
+		deletion := resourceUpdate(stack.Label, observed.Ksuid, observed.Label, `{}`, resource_update.OperationAcceptDelete, resource_update.FormaCommandSourceUser)
+		deletion.Version = strings.TrimPrefix(deletedVersion, observed.Ksuid+"_")
+		deletionCommand := reconcileBuilder(forma_command.CommandStateSuccess, pkgmodel.FormaApplyModeReconcile, 0, []resource_update.ResourceUpdate{deletion})
+		deletionCommand.Stacks = cmd.Stacks
+		historyBefore, err = td.LoadAllResourceVersions()
+		assert.NoError(t, err)
+		assert.NoError(t, td.StoreFormaCommand(deletionCommand, deletionCommand.ID))
+		historyAfter, err = td.LoadAllResourceVersions()
+		assert.NoError(t, err)
+		assert.Equal(t, historyBefore, historyAfter)
+		baseline, err := td.GetResourcesAtLastReconcile(stack.Label)
+		assert.NoError(t, err)
+		assert.Empty(t, baseline)
+		mods, err = td.GetResourceModificationsSinceLastReconcile(stack.Label)
+		assert.NoError(t, err)
+		assert.Empty(t, mods)
+
+	})
+
+	t.Run("GetResourceModificationsSinceLastReconcile_MixedMembershipUsesPerStackFallback", func(t *testing.T) {
+		td := newDS(t)
+		ds := td.Datastore
+		defer td.CleanUpFn() //nolint:errcheck
+		baseline := &forma_command.FormaCommand{ID: "mixed-baseline", Command: pkgmodel.CommandApply,
+			Config: config.FormaCommandConfig{Mode: pkgmodel.FormaApplyModeReconcile}, StartTs: util.TimeNow().Add(-10 * time.Minute),
+			Stacks: []forma_command.CommandStack{{ID: "stack-a-id", Label: "stack-a"}}}
+		_, err := ds.StoreResource(&pkgmodel.Resource{Ksuid: "mixed-resource", NativeID: "mixed", Stack: "stack-b", Type: "Test::Resource", Label: "mixed", Target: "default"}, baseline.ID)
+		assert.NoError(t, err)
+		assert.NoError(t, ds.StoreFormaCommand(baseline, baseline.ID))
+		patch := &forma_command.FormaCommand{ID: "mixed-patch", Command: pkgmodel.CommandApply,
+			Config: config.FormaCommandConfig{Mode: pkgmodel.FormaApplyModePatch}, StartTs: util.TimeNow().Add(-time.Minute)}
+		_, err = ds.StoreResource(&pkgmodel.Resource{Ksuid: "mixed-resource-2", NativeID: "after", Stack: "stack-b", Type: "Test::Resource", Label: "after", Target: "default"}, patch.ID)
+		assert.NoError(t, err)
+		assert.NoError(t, ds.StoreFormaCommand(patch, patch.ID))
+		mods, err := ds.GetResourceModificationsSinceLastReconcile("stack-b")
+		assert.NoError(t, err)
+		if assert.Len(t, mods, 1) {
+			assert.Equal(t, "after", mods[0].Label)
+		}
+	})
+
+	t.Run("GetResourceModificationsSinceLastReconcile_ZeroWriteMembershipIsBoundary", func(t *testing.T) {
+		td := newDS(t)
+		ds := td.Datastore
+		defer td.CleanUpFn() //nolint:errcheck
+
+		stackReconcile := &forma_command.FormaCommand{
+			ID:              "stack-reconcile-id",
+			Command:         pkgmodel.CommandApply,
+			Config:          config.FormaCommandConfig{Mode: pkgmodel.FormaApplyModeReconcile},
+			StartTs:         util.TimeNow().Add(-10 * time.Minute),
+			Stacks:          []forma_command.CommandStack{{ID: "other-stack-id", Label: "other-stack"}},
+			ResourceUpdates: []resource_update.ResourceUpdate{{StackLabel: "test-stack"}},
+		}
+		_, err := ds.StoreResource(&pkgmodel.Resource{
+			NativeID: "bucket-1",
+			Stack:    "test-stack",
+			Type:     "AWS::S3::Bucket",
+			Label:    "bucket-1",
+			Target:   "default-target",
+		}, stackReconcile.ID)
+		assert.NoError(t, err)
+		err = ds.StoreFormaCommand(stackReconcile, stackReconcile.ID)
+		assert.NoError(t, err)
+
+		stackPatchA := &forma_command.FormaCommand{
+			ID:              "stack-patch-a-id",
+			Command:         pkgmodel.CommandApply,
+			Config:          config.FormaCommandConfig{Mode: pkgmodel.FormaApplyModePatch},
+			StartTs:         util.TimeNow().Add(-8 * time.Minute),
+			ResourceUpdates: []resource_update.ResourceUpdate{{StackLabel: "test-stack"}},
+		}
+		_, err = ds.StoreResource(&pkgmodel.Resource{
+			NativeID: "bucket-2",
+			Stack:    "test-stack",
+			Type:     "AWS::S3::Bucket",
+			Label:    "bucket-2",
+			Target:   "default-target",
+		}, stackPatchA.ID)
+		assert.NoError(t, err)
+		err = ds.StoreFormaCommand(stackPatchA, stackPatchA.ID)
+		assert.NoError(t, err)
+
+		_, err = ds.CreateStack(&pkgmodel.Stack{Label: "test-stack"}, "stack-create")
+		assert.NoError(t, err)
+		currentStack, err := ds.GetStackByLabel("test-stack")
+		assert.NoError(t, err)
+
+		intermediateReconcile := &forma_command.FormaCommand{
+			ID:              "intermediate-reconcile-id",
+			Command:         pkgmodel.CommandApply,
+			Config:          config.FormaCommandConfig{Mode: pkgmodel.FormaApplyModeReconcile},
+			StartTs:         util.TimeNow().Add(-6 * time.Minute),
+			State:           forma_command.CommandStateSuccess,
+			Stacks:          []forma_command.CommandStack{{ID: currentStack.ID, Label: "test-stack"}},
+			ResourceUpdates: []resource_update.ResourceUpdate{},
+		}
+		err = ds.StoreFormaCommand(intermediateReconcile, intermediateReconcile.ID)
+		assert.NoError(t, err)
+
+		stackPatchB := &forma_command.FormaCommand{
+			ID:              "stack-patch-b-id",
+			Command:         pkgmodel.CommandApply,
+			Config:          config.FormaCommandConfig{Mode: pkgmodel.FormaApplyModePatch},
+			StartTs:         util.TimeNow().Add(-4 * time.Minute),
+			ResourceUpdates: []resource_update.ResourceUpdate{{StackLabel: "test-stack"}},
+		}
+		_, err = ds.StoreResource(&pkgmodel.Resource{
+			NativeID: "bucket-3",
+			Stack:    "test-stack",
+			Type:     "AWS::S3::Bucket",
+			Label:    "bucket-3",
+			Target:   "default-target",
+		}, stackPatchB.ID)
+		assert.NoError(t, err)
+		err = ds.StoreFormaCommand(stackPatchB, stackPatchB.ID)
+		assert.NoError(t, err)
+
+		modifications, err := ds.GetResourceModificationsSinceLastReconcile("test-stack")
+		assert.NoError(t, err)
+
+		assert.Len(t, modifications, 1, "zero-write reconcile membership must establish the new boundary")
+		labels := make(map[string]bool)
+		for _, mod := range modifications {
+			labels[mod.Label] = true
+		}
+		assert.False(t, labels["bucket-2"], "patch before the explicit boundary must be excluded")
+		assert.True(t, labels["bucket-3"], "Should include second patch")
+		for _, state := range []forma_command.CommandState{forma_command.CommandStateCanceled, forma_command.CommandStateInProgress, forma_command.CommandStateFailed, forma_command.CommandStateSuccess} {
+			intermediateReconcile.State = state
+			assert.NoError(t, ds.StoreFormaCommand(intermediateReconcile, intermediateReconcile.ID))
+			mods, err := ds.GetResourceModificationsSinceLastReconcile("test-stack")
+			assert.NoError(t, err)
+			expected := 2
+			if state == forma_command.CommandStateSuccess || state == forma_command.CommandStateFailed {
+				expected = 1
+			}
+			assert.Len(t, mods, expected, "boundary eligibility for %s", state)
+		}
+		for _, source := range []forma_command.Source{forma_command.SourceGeneratorRotator, forma_command.SourceSynchronizer, forma_command.SourceDiscovery, forma_command.SourceUser, forma_command.SourceAutoReconciler, ""} {
+			intermediateReconcile.Source = source
+			assert.NoError(t, ds.StoreFormaCommand(intermediateReconcile, intermediateReconcile.ID))
+			mods, err := ds.GetResourceModificationsSinceLastReconcile("test-stack")
+			assert.NoError(t, err)
+			expected := 1
+			if source == forma_command.SourceGeneratorRotator || source == forma_command.SourceSynchronizer || source == forma_command.SourceDiscovery {
+				expected = 2
+			}
+			assert.Len(t, mods, expected, "partial source %s must not clear unrelated drift", source)
+		}
+		_, err = ds.DeleteStack("test-stack", "delete-stack")
+		assert.NoError(t, err)
+		_, err = ds.CreateStack(&pkgmodel.Stack{Label: "test-stack"}, "recreate-stack")
+		assert.NoError(t, err)
+		mods, err := ds.GetResourceModificationsSinceLastReconcile("test-stack")
+		assert.NoError(t, err)
+		assert.Empty(t, mods, "a new stack incarnation must not inherit an old explicit boundary or ambiguous legacy drift")
+		newStack, err := ds.GetStackByLabel("test-stack")
+		assert.NoError(t, err)
+		newBaseline := reconcileBuilder(forma_command.CommandStateSuccess, pkgmodel.FormaApplyModeReconcile, -3*time.Minute, nil)
+		newBaseline.Stacks = []forma_command.CommandStack{{ID: newStack.ID, Label: newStack.Label}}
+		assert.NoError(t, ds.StoreFormaCommand(newBaseline, newBaseline.ID))
+		newPatch := reconcileBuilder(forma_command.CommandStateSuccess, pkgmodel.FormaApplyModePatch, -time.Minute, nil)
+		newPatch.Stacks = newBaseline.Stacks
+		assert.NoError(t, ds.StoreFormaCommand(newPatch, newPatch.ID))
+		newResource := pkgmodel.Resource{Ksuid: util.NewID(), NativeID: "new-incarnation", Stack: newStack.Label, Type: "Test::Resource", Label: "new-incarnation", Target: "default", Managed: true, Properties: json.RawMessage(`{"x":1}`)}
+		_, err = ds.StoreResource(&newResource, newPatch.ID)
+		assert.NoError(t, err)
+		mods, err = ds.GetResourceModificationsSinceLastReconcile("test-stack")
+		assert.NoError(t, err)
+		if assert.Len(t, mods, 1) {
+			assert.Equal(t, newResource.Ksuid, mods[0].Ksuid)
+		}
+		observation, err := ds.(datastore.ResourceObservationReader).GetResourceObservation(newResource.Ksuid)
+		assert.NoError(t, err)
+		if assert.NotNil(t, observation) {
+			assert.Equal(t, newStack.ID, observation.StackID)
+		}
+
+	})
+
+	t.Run("GetResourceModificationsSinceLastReconcile_UpdateOpHasProperties", func(t *testing.T) {
+		td := newDS(t)
+		ds := td.Datastore
+		defer td.CleanUpFn() //nolint:errcheck
+
+		// 1. Store a reconcile command that creates a resource with props {"foo":"v1"}
+		reconcileCmd := &forma_command.FormaCommand{
+			ID:              "props-reconcile-id",
+			Command:         pkgmodel.CommandApply,
+			Config:          config.FormaCommandConfig{Mode: pkgmodel.FormaApplyModeReconcile},
+			StartTs:         util.TimeNow().Add(-10 * time.Minute),
+			ResourceUpdates: []resource_update.ResourceUpdate{{StackLabel: "test-stack"}},
+		}
+		resourceKsuid := util.NewID()
+		_, err := ds.StoreResource(&pkgmodel.Resource{
+			Ksuid:      resourceKsuid,
+			NativeID:   "res-update-1",
+			Stack:      "test-stack",
+			Type:       "AWS::S3::Bucket",
+			Label:      "update-bucket",
+			Target:     "default-target",
+			Properties: json.RawMessage(`{"foo":"v1"}`),
+			Managed:    true,
+		}, reconcileCmd.ID)
+		assert.NoError(t, err)
+		err = ds.StoreFormaCommand(reconcileCmd, reconcileCmd.ID)
+		assert.NoError(t, err)
+
+		// 2. Store a patch command (update op) with new props {"foo":"v2"}
+		// Use the same ksuid so StoreResource creates a new version for the same resource.
+		patchCmd := &forma_command.FormaCommand{
+			ID:              "props-patch-id",
+			Command:         pkgmodel.CommandApply,
+			Config:          config.FormaCommandConfig{Mode: pkgmodel.FormaApplyModePatch},
+			StartTs:         util.TimeNow().Add(-5 * time.Minute),
+			ResourceUpdates: []resource_update.ResourceUpdate{{StackLabel: "test-stack"}},
+		}
+		_, err = ds.StoreResource(&pkgmodel.Resource{
+			Ksuid:      resourceKsuid,
+			NativeID:   "res-update-1",
+			Stack:      "test-stack",
+			Type:       "AWS::S3::Bucket",
+			Label:      "update-bucket",
+			Target:     "default-target",
+			Properties: json.RawMessage(`{"foo":"v2"}`),
+			Managed:    true,
+		}, patchCmd.ID)
+		assert.NoError(t, err)
+		err = ds.StoreFormaCommand(patchCmd, patchCmd.ID)
+		assert.NoError(t, err)
+
+		// 3. The patch command also brings a brand-new resource under management
+		// (created out-of-band since the last reconcile — no version existed at
+		// reconcile time) and deletes another pre-existing resource.
+		_, err = ds.StoreResource(&pkgmodel.Resource{
+			Ksuid:      util.NewID(),
+			NativeID:   "res-created-1",
+			Stack:      "test-stack",
+			Type:       "AWS::S3::Bucket",
+			Label:      "created-bucket",
+			Target:     "default-target",
+			Properties: json.RawMessage(`{"foo":"new"}`),
+			Managed:    true,
+		}, patchCmd.ID)
+		assert.NoError(t, err)
+		_, err = ds.DeleteResource(&pkgmodel.Resource{
+			Ksuid:    util.NewID(),
+			NativeID: "res-deleted-1",
+			Stack:    "test-stack",
+			Type:     "AWS::S3::Bucket",
+			Label:    "deleted-bucket",
+			Target:   "default-target",
+			Managed:  true,
+		}, patchCmd.ID)
+		assert.NoError(t, err)
+
+		// 4. Call GetResourceModificationsSinceLastReconcile
+		modifications, err := ds.GetResourceModificationsSinceLastReconcile("test-stack")
+		assert.NoError(t, err)
+		assert.Len(t, modifications, 3)
+
+		byLabel := make(map[string]datastore.ResourceModification, len(modifications))
+		for _, m := range modifications {
+			byLabel[m.Label] = m
+		}
+
+		// 5. The update op carries both property documents:
+		// OldProperties is the at-last-reconcile state, Properties the current one.
+		mod, ok := byLabel["update-bucket"]
+		if !ok {
+			t.Fatal("update-bucket modification not returned")
+		}
+		assert.Equal(t, "update", mod.Operation)
+		assert.NotEmpty(t, mod.Properties, "Properties (current) should be populated for update ops")
+		assert.NotEmpty(t, mod.OldProperties, "OldProperties should be populated for update ops")
+		assert.JSONEq(t, `{"foo":"v1"}`, string(mod.OldProperties))
+		assert.JSONEq(t, `{"foo":"v2"}`, string(mod.Properties))
+
+		// 6. A resource with no version at the last reconcile carries only the
+		// current properties; OldProperties stays empty so no patch can (or
+		// should) be computed for it.
+		created, ok := byLabel["created-bucket"]
+		if !ok {
+			t.Fatal("created-bucket modification not returned")
+		}
+		assert.NotEmpty(t, created.Properties, "current properties should be populated")
+		assert.Empty(t, created.OldProperties, "no at-reconcile version exists — OldProperties must stay empty")
+
+		// 7. Delete ops stay label-only.
+		deleted, ok := byLabel["deleted-bucket"]
+		if !ok {
+			t.Fatal("deleted-bucket modification not returned")
+		}
+		assert.Equal(t, "delete", deleted.Operation)
+		assert.Empty(t, deleted.Properties, "delete ops must not carry Properties")
+		assert.Empty(t, deleted.OldProperties, "delete ops must not carry OldProperties")
+	})
+
+	t.Run("GetResourceModificationsSinceLastReconcile_OldPropertiesPredateLastReconcile", func(t *testing.T) {
+		td := newDS(t)
+		ds := td.Datastore
+		defer td.CleanUpFn() //nolint:errcheck
+
+		// Reconcile #1 creates two resources.
+		reconcile1 := &forma_command.FormaCommand{
+			ID:              "predates-reconcile-1",
+			Command:         pkgmodel.CommandApply,
+			Config:          config.FormaCommandConfig{Mode: pkgmodel.FormaApplyModeReconcile},
+			StartTs:         util.TimeNow().Add(-20 * time.Minute),
+			ResourceUpdates: []resource_update.ResourceUpdate{{StackLabel: "test-stack"}},
+		}
+		driftKsuid := util.NewID()
+		otherKsuid := util.NewID()
+		_, err := ds.StoreResource(&pkgmodel.Resource{
+			Ksuid:      driftKsuid,
+			NativeID:   "res-drift",
+			Stack:      "test-stack",
+			Type:       "AWS::S3::Bucket",
+			Label:      "drift-bucket",
+			Target:     "default-target",
+			Properties: json.RawMessage(`{"foo":"v1"}`),
+			Managed:    true,
+		}, reconcile1.ID)
+		assert.NoError(t, err)
+		_, err = ds.StoreResource(&pkgmodel.Resource{
+			Ksuid:      otherKsuid,
+			NativeID:   "res-other",
+			Stack:      "test-stack",
+			Type:       "AWS::S3::Bucket",
+			Label:      "other-bucket",
+			Target:     "default-target",
+			Properties: json.RawMessage(`{"bar":"b1"}`),
+			Managed:    true,
+		}, reconcile1.ID)
+		assert.NoError(t, err)
+		assert.NoError(t, ds.StoreFormaCommand(reconcile1, reconcile1.ID))
+
+		// Reconcile #2 only touches the other resource — the drifting resource
+		// gets no new version row from it. This is the common case: a reconcile
+		// only writes rows for resources it actually changed.
+		reconcile2 := &forma_command.FormaCommand{
+			ID:              "predates-reconcile-2",
+			Command:         pkgmodel.CommandApply,
+			Config:          config.FormaCommandConfig{Mode: pkgmodel.FormaApplyModeReconcile},
+			StartTs:         util.TimeNow().Add(-10 * time.Minute),
+			ResourceUpdates: []resource_update.ResourceUpdate{{StackLabel: "test-stack"}},
+		}
+		_, err = ds.StoreResource(&pkgmodel.Resource{
+			Ksuid:      otherKsuid,
+			NativeID:   "res-other",
+			Stack:      "test-stack",
+			Type:       "AWS::S3::Bucket",
+			Label:      "other-bucket",
+			Target:     "default-target",
+			Properties: json.RawMessage(`{"bar":"b2"}`),
+			Managed:    true,
+		}, reconcile2.ID)
+		assert.NoError(t, err)
+		assert.NoError(t, ds.StoreFormaCommand(reconcile2, reconcile2.ID))
+
+		// An out-of-band patch updates the drifting resource after reconcile #2.
+		patchCmd := &forma_command.FormaCommand{
+			ID:              "predates-patch-id",
+			Command:         pkgmodel.CommandApply,
+			Config:          config.FormaCommandConfig{Mode: pkgmodel.FormaApplyModePatch},
+			StartTs:         util.TimeNow().Add(-5 * time.Minute),
+			ResourceUpdates: []resource_update.ResourceUpdate{{StackLabel: "test-stack"}},
+		}
+		_, err = ds.StoreResource(&pkgmodel.Resource{
+			Ksuid:      driftKsuid,
+			NativeID:   "res-drift",
+			Stack:      "test-stack",
+			Type:       "AWS::S3::Bucket",
+			Label:      "drift-bucket",
+			Target:     "default-target",
+			Properties: json.RawMessage(`{"foo":"v2"}`),
+			Managed:    true,
+		}, patchCmd.ID)
+		assert.NoError(t, err)
+		assert.NoError(t, ds.StoreFormaCommand(patchCmd, patchCmd.ID))
+
+		modifications, err := ds.GetResourceModificationsSinceLastReconcile("test-stack")
+		assert.NoError(t, err)
+		assert.Len(t, modifications, 1)
+		if len(modifications) == 0 {
+			t.Fatal("no modifications returned, cannot proceed")
+		}
+		mod := modifications[0]
+		assert.Equal(t, "drift-bucket", mod.Label)
+		assert.Equal(t, "update", mod.Operation)
+		// The drifting resource's version at the last reconcile predates that
+		// reconcile (it was written by reconcile #1) — it must still resolve.
+		assert.JSONEq(t, `{"foo":"v1"}`, string(mod.OldProperties))
+		assert.JSONEq(t, `{"foo":"v2"}`, string(mod.Properties))
+	})
+}
+
+// RunStoreResourceAfterDeleteWithSameNativeID verifies that when a resource is deleted
+// and then recreated with the same NativeID but a different KSUID (as happens during destroy → re-apply),
+// the new resource is stored under the new KSUID, not the old one.
+//
+// This is a regression test for a bug where storeResource's NativeID lookup did not filter out deleted
+// resources, causing the new resource to inherit the old (deleted) resource's KSUID.
+func RunStoreResourceAfterDeleteWithSameNativeID(t *testing.T, newDS func(t *testing.T) TestDatastore) {
+	t.Run("StoreResource_AfterDeleteWithSameNativeID", func(t *testing.T) {
+		td := newDS(t)
+		ds := td.Datastore
+		defer td.CleanUpFn() //nolint:errcheck
+
+		nativeID := "/subscriptions/test-sub/resourceGroups/test-rg"
+		resourceType := "AZURE::Resources::ResourceGroup"
+
+		target := &pkgmodel.Target{
+			Label:     "target-1",
+			Namespace: "AZURE",
+			Config:    json.RawMessage(`{}`),
+		}
+		_, err := ds.CreateTarget(target)
+		assert.NoError(t, err)
+
+		// Step 1: Create the resource with KSUID-A
+		ksuidA := util.NewID()
+		resourceA := &pkgmodel.Resource{
+			Ksuid:      ksuidA,
+			NativeID:   nativeID,
+			Stack:      "test-stack",
+			Type:       resourceType,
+			Label:      "rg",
+			Target:     "target-1",
+			Managed:    true,
+			Properties: json.RawMessage(`{"name": "test-rg", "location": "eastus"}`),
+		}
+		_, err = ds.StoreResource(resourceA, "cmd-create-1")
+		assert.NoError(t, err)
+
+		// Verify the resource is stored under KSUID-A
+		loaded, err := ds.LoadResourceById(ksuidA)
+		assert.NoError(t, err)
+		assert.NotNil(t, loaded, "resource should exist under KSUID-A after create")
+
+		// Step 2: Delete the resource (simulating destroy)
+		_, err = ds.DeleteResource(resourceA, "cmd-delete")
+		assert.NoError(t, err)
+
+		// Step 3: Recreate with the SAME NativeID but a NEW KSUID-B (simulating re-apply)
+		time.Sleep(1100 * time.Millisecond) // KSUID has 1-second precision
+		ksuidB := util.NewID()
+		resourceB := &pkgmodel.Resource{
+			Ksuid:      ksuidB,
+			NativeID:   nativeID,
+			Stack:      "test-stack",
+			Type:       resourceType,
+			Label:      "rg",
+			Target:     "target-1",
+			Managed:    true,
+			Properties: json.RawMessage(`{"name": "test-rg", "location": "eastus"}`),
+		}
+		versionB, err := ds.StoreResource(resourceB, "cmd-create-2")
+		assert.NoError(t, err)
+
+		// Step 4: Verify the return value of StoreResource contains the NEW KSUID-B, not the old KSUID-A.
+		assert.True(t, strings.HasPrefix(versionB, ksuidB+"_"),
+			"StoreResource version should start with KSUID-B (%s), got: %s", ksuidB, versionB)
+		assert.False(t, strings.HasPrefix(versionB, ksuidA+"_"),
+			"StoreResource version must NOT start with old KSUID-A (%s), got: %s", ksuidA, versionB)
+
+		// Step 5: Verify the new resource is stored under KSUID-B, not the old KSUID-A.
+		loaded, err = ds.LoadResourceById(ksuidB)
+		assert.NoError(t, err)
+		assert.NotNil(t, loaded, "resource should be loadable under KSUID-B after recreate")
+		assert.Equal(t, ksuidB, loaded.Ksuid, "resource should have KSUID-B, not the old KSUID-A")
+		assert.Equal(t, nativeID, loaded.NativeID)
+	})
+}
+
+// RunStoreResourceWithDifferentKSUIDSameData reproduces the KSUID mismatch bug.
+//
+// The scenario:
+//  1. User deploys chart A (e.g. keycloak) — a namespace gets KSUID-A in the DB
+//  2. User switches to chart B (e.g. nginx) via reconcile — chart A's resources get deleted
+//  3. User switches back to chart A — the SAME namespace is re-created
+//
+// What goes wrong on step 3:
+//   - Formae assigns a new KSUID-B to the namespace (the old one was deleted from its bookkeeping)
+//   - The K8S plugin creates the namespace successfully (same name, but K8S gives it a new UID)
+//   - storeResource looks up the DB by native_id + type and finds the OLD row with KSUID-A
+//   - The data hasn't changed (same namespace name, same properties)
+//   - So storeResource says "nothing changed, skip the write" and returns early
+//   - But it skipped writing a row for KSUID-B — so KSUID-B doesn't exist in the DB
+//   - The configmap in chart A has a resolvable ref pointing to KSUID-B (e.g. formae://KSUID-B#/metadata/name)
+//   - That ref can't be resolved because KSUID-B was never stored → crash
+//
+// Why this test doesn't use delete+recreate:
+//
+//	DeleteResource stores data as "{}", so the next store always sees different data
+//	and the early return never fires. The bug only triggers when the native_id+type lookup
+//	finds a row with IDENTICAL data but a DIFFERENT KSUID — which is what this test sets up
+//	directly by storing twice with different KSUIDs.
+func RunStoreResourceWithDifferentKSUIDSameData(t *testing.T, newDS func(t *testing.T) TestDatastore) {
+	t.Run("StoreResource_WithDifferentKSUIDSameData", func(t *testing.T) {
+		td := newDS(t)
+		ds := td.Datastore
+		defer td.CleanUpFn() //nolint:errcheck
+
+		target := &pkgmodel.Target{
+			Label:     "target-1",
+			Namespace: "default",
+			Config:    json.RawMessage(`{}`),
+		}
+		_, err := ds.CreateTarget(target)
+		assert.NoError(t, err)
+
+		nativeID := "test-ns/my-configmap"
+		resourceType := "K8S::Core::ConfigMap"
+		properties := json.RawMessage(`{"metadata":{"name":"my-configmap","namespace":"test-ns"}}`)
+
+		// Step 1: Store resource with KSUID-A
+		ksuidA := util.NewID()
+		resourceA := &pkgmodel.Resource{
+			Ksuid:      ksuidA,
+			NativeID:   nativeID,
+			Stack:      "test-stack",
+			Type:       resourceType,
+			Label:      "cm",
+			Target:     "target-1",
+			Managed:    true,
+			Properties: properties,
+		}
+		_, err = ds.StoreResource(resourceA, "cmd-1")
+		assert.NoError(t, err)
+
+		// Verify resource exists under KSUID-A
+		loaded, err := ds.LoadResourceById(ksuidA)
+		assert.NoError(t, err)
+		assert.NotNil(t, loaded, "resource should exist under KSUID-A")
+
+		// Step 2: Store same native_id+type+data with a new KSUID-B
+		// This is the state after assignKSUIDs generates a new KSUID for a re-created resource
+		time.Sleep(1100 * time.Millisecond) // KSUID has 1-second precision
+		ksuidB := util.NewID()
+		resourceB := &pkgmodel.Resource{
+			Ksuid:      ksuidB,
+			NativeID:   nativeID,
+			Stack:      "test-stack",
+			Type:       resourceType,
+			Label:      "cm",
+			Target:     "target-1",
+			Managed:    true,
+			Properties: properties,
+		}
+		versionB, err := ds.StoreResource(resourceB, "cmd-2")
+		assert.NoError(t, err)
+
+		// Step 3: Verify the returned version contains KSUID-B
+		assert.True(t, strings.HasPrefix(versionB, ksuidB+"_"),
+			"StoreResource version should start with KSUID-B (%s), got: %s", ksuidB, versionB)
+
+		// Step 4: Verify the resource is loadable under KSUID-B (fails before fix)
+		loaded, err = ds.LoadResourceById(ksuidB)
+		assert.NoError(t, err)
+		if assert.NotNil(t, loaded, "resource should be loadable under KSUID-B") {
+			assert.Equal(t, ksuidB, loaded.Ksuid, "loaded resource should have KSUID-B")
+			assert.Equal(t, nativeID, loaded.NativeID)
+		}
+	})
+}
+
+// RunStoreResourceRenamePreservesKsuidAndAddsNewVersion verifies the
+// invariant: a rename writes a NEW VERSION ROW under the same
+// KSUID, never a second row with a fresh KSUID. The previous version
+// remains in history; the latest visible row carries the new label.
+// QueryResources for the native id returns exactly one current row.
+func RunStoreResourceRenamePreservesKsuidAndAddsNewVersion(t *testing.T, newDS func(t *testing.T) TestDatastore) {
+	t.Run("StoreResource_RenamePreservesKsuidAndAddsNewVersion", func(t *testing.T) {
+		td := newDS(t)
+		ds := td.Datastore
+		defer td.CleanUpFn() //nolint:errcheck
+
+		target := &pkgmodel.Target{
+			Label:     "test-target",
+			Namespace: "default",
+			Config:    json.RawMessage(`{}`),
+		}
+		_, err := ds.CreateTarget(target)
+		assert.NoError(t, err)
+
+		ksuid := util.NewID()
+		nativeID := "vpc-rfc0041-rename"
+
+		original := &pkgmodel.Resource{
+			Ksuid:      ksuid,
+			NativeID:   nativeID,
+			Stack:      "test-stack",
+			Type:       "AWS::EC2::VPC",
+			Label:      "plugin-sdk-test-vpc",
+			Target:     "test-target",
+			Managed:    true,
+			Properties: json.RawMessage(`{"CidrBlock": "10.0.0.0/16"}`),
+		}
+		versionOriginal, err := ds.StoreResource(original, "cmd-create")
+		assert.NoError(t, err)
+		assert.NotEmpty(t, versionOriginal)
+
+		// Simulate the rename apply: the persister writes with the SAME ksuid,
+		// the SAME native id, but the NEW label. This is what the
+		// persist path does after a successful update.
+		time.Sleep(1100 * time.Millisecond) // KSUID has 1-second precision
+		renamed := *original
+		renamed.Label = "new-vpc"
+		versionRenamed, err := ds.StoreResource(&renamed, "cmd-rename")
+		assert.NoError(t, err)
+		assert.NotEmpty(t, versionRenamed)
+
+		assert.NotEqual(t, versionOriginal, versionRenamed,
+			"rename must produce a NEW version row, not collapse into the prior version")
+		assert.True(t, strings.HasPrefix(versionRenamed, ksuid+"_"),
+			"new version must be under the same KSUID; got version=%s ksuid=%s",
+			versionRenamed, ksuid)
+
+		// Latest visible row for this NativeID is exactly one — the renamed row.
+		// Before the ksuid-preservation fix, this query returned TWO
+		// rows (one per ksuid) because the rename minted a fresh ksuid.
+		results, err := ds.QueryResources(&datastore.ResourceQuery{
+			NativeID: &datastore.QueryItem[string]{Item: nativeID, Constraint: datastore.Required},
+		})
+		assert.NoError(t, err)
+		assert.Len(t, results, 1, "inventory must show exactly one current row per NativeID after rename")
+		if len(results) == 1 {
+			assert.Equal(t, ksuid, results[0].Ksuid, "current row must carry the original KSUID")
+			assert.Equal(t, "new-vpc", results[0].Label, "current row must carry the new label")
+			assert.Equal(t, nativeID, results[0].NativeID)
+		}
+
+		// The original row is still loadable by KSUID (history preserved).
+		loaded, err := ds.LoadResourceById(ksuid)
+		assert.NoError(t, err)
+		if assert.NotNil(t, loaded, "resource should be loadable by KSUID after rename") {
+			assert.Equal(t, ksuid, loaded.Ksuid)
+			assert.Equal(t, "new-vpc", loaded.Label, "latest-version load returns the new label")
+		}
+	})
+}

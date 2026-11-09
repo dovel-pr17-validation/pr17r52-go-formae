@@ -1,0 +1,2400 @@
+// © 2025 Platform Engineering Labs Inc.
+//
+// SPDX-License-Identifier: FSL-1.1-ALv2
+
+package conformance
+
+import (
+	"bytes"
+	"context"
+	"crypto/rand"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"mime/multipart"
+	"net"
+	"net/http"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strconv"
+	"strings"
+	"syscall"
+	"testing"
+	"time"
+
+	"ergo.services/ergo"
+	"ergo.services/ergo/gen"
+	"ergo.services/ergo/net/registrar"
+	"github.com/tidwall/gjson"
+	"github.com/tidwall/sjson"
+
+	"github.com/platform-engineering-labs/formae/pkg/api/model"
+	pkgmodel "github.com/platform-engineering-labs/formae/pkg/model"
+	"github.com/platform-engineering-labs/formae/pkg/plugin"
+	"github.com/platform-engineering-labs/formae/pkg/plugin-conformance-tests/testutil"
+	plugindiscovery "github.com/platform-engineering-labs/formae/pkg/plugin/discovery"
+	"github.com/platform-engineering-labs/formae/pkg/plugin/resource"
+)
+
+// CreatedResourceInfo tracks a resource that was created during multi-resource test setup
+type CreatedResourceInfo struct {
+	ResourceType string
+	Label        string
+	NativeID     string
+	Properties   json.RawMessage // Properties from the plugin after creation
+}
+
+// TestHarness manages the lifecycle of formae agent and CLI commands for testing
+type TestHarness struct {
+	t                       *testing.T
+	formaeBinary            string
+	cliTimeout              time.Duration // bound for a single CLI invocation; 0 means getCLIInvocationTimeout()
+	agentCmd                *exec.Cmd
+	agentCtx                context.Context
+	agentCancel             context.CancelFunc
+	cleanupFuncs            []func()
+	agentStarted            bool
+	tempDir                 string
+	configFile              string
+	logFile                 string
+	networkCookie           string // Network cookie for distributed plugin communication
+	testRunID               string // Unique ID for this test run, used by PKL files for resource naming
+	agentPort               int    // Random port for agent API
+	ergoPort                int    // Random port for Ergo actor framework (enables parallel test execution)
+	registrarPort           int    // Random port for Ergo registrar (isolates parallel agents)
+	externalResourcePlugins []plugin.ResourcePluginInfo
+
+	// Ergo actor system for direct plugin communication (discovery tests)
+	ergoNode          gen.Node
+	ergoNodeName      gen.Atom
+	testHelperPID     gen.PID
+	pluginCoordinator gen.PID
+	ergoNodeStarted   bool
+
+	// Plugin info for cleanup operations
+	lastPluginBinaryPath string
+	lastPluginNamespace  string
+
+	// retrySleep is injectable so retry policy tests do not wait in real time.
+	// Production harnesses leave it nil and use time.Sleep.
+	retrySleep func(time.Duration)
+}
+
+// getFreePort asks the kernel for a free open port that is ready to use.
+func getFreePort() (int, error) {
+	addr, err := net.ResolveTCPAddr("tcp", "localhost:0")
+	if err != nil {
+		return 0, err
+	}
+
+	l, err := net.ListenTCP("tcp", addr)
+	if err != nil {
+		return 0, err
+	}
+	defer func() { _ = l.Close() }()
+	return l.Addr().(*net.TCPAddr).Port, nil
+}
+
+// sanitizeForPath converts an arbitrary string (typically a *testing.T name,
+// which may contain "/" from subtests or "::" from a resource type, e.g.
+// "TestCRUD/AWS::s3-bucket") into a string safe to embed in an
+// os.MkdirTemp pattern: only [A-Za-z0-9._-] survive, every other rune becomes
+// "_", runs of "_" collapse to one, leading and trailing "_" are trimmed, and
+// the result is capped at 40 runes.
+func sanitizeForPath(name string) string {
+	var b strings.Builder
+	b.Grow(len(name))
+	prevUnderscore := false
+	for _, r := range name {
+		out := r
+		switch {
+		case r >= 'A' && r <= 'Z', r >= 'a' && r <= 'z', r >= '0' && r <= '9', r == '.', r == '_', r == '-':
+			// keep as-is
+		default:
+			out = '_'
+		}
+		if out == '_' && prevUnderscore {
+			continue
+		}
+		b.WriteRune(out)
+		prevUnderscore = out == '_'
+	}
+
+	trimmed := strings.Trim(b.String(), "_")
+	runes := []rune(trimmed)
+	if len(runes) > 40 {
+		runes = runes[:40]
+	}
+	return string(runes)
+}
+
+// keepTempDirRequested reports whether FORMAE_TEST_KEEP_TEMP asks the harness to
+// retain the per-test temp directory even when the test passes.
+func keepTempDirRequested(r testReporter) bool {
+	raw := strings.TrimSpace(os.Getenv("FORMAE_TEST_KEEP_TEMP"))
+	if raw == "" {
+		return false
+	}
+	keep, err := strconv.ParseBool(raw)
+	if err != nil {
+		r.Logf("Ignoring FORMAE_TEST_KEEP_TEMP=%q: want a boolean such as 1, true, 0 or false", raw)
+		return false
+	}
+	return keep
+}
+
+// cleanupTempDir removes the harness temp directory, unless the test failed or
+// FORMAE_TEST_KEEP_TEMP asks for retention — in which case the directory is left
+// in place and its path reported so CI can collect the agent log.
+func cleanupTempDir(r testReporter, tempDir, logPath string, failed bool) {
+	if failed || keepTempDirRequested(r) {
+		r.Logf("Retaining test temp directory for diagnostics: %s (agent log: %s)", tempDir, logPath)
+		return
+	}
+	r.Logf("Cleaning up temp directory: %s", tempDir)
+	if err := os.RemoveAll(tempDir); err != nil {
+		r.Logf("Failed to remove temp directory %s: %v", tempDir, err)
+	}
+}
+
+// registerDiagnosticsCleanup arranges for the per-test temp directory to be
+// removed after the test, or retained when the test failed so its agent log and
+// datastore can be collected. Registered before any other cleanup so that it
+// runs last, and a no-op if setup never got as far as creating the directory.
+func (h *TestHarness) registerDiagnosticsCleanup() {
+	h.t.Cleanup(func() {
+		if h.tempDir == "" {
+			return
+		}
+		cleanupTempDir(h.t, h.tempDir, h.logFile, h.t.Failed())
+	})
+}
+
+// NewTestHarness creates a new test harness instance
+func NewTestHarness(t *testing.T) *TestHarness {
+	h := &TestHarness{
+		t:            t,
+		cleanupFuncs: []func(){},
+		agentStarted: false,
+	}
+
+	// Registered first so that it runs last: the temp directory outlives every
+	// other cleanup, including a t.Fatalf during the rest of this constructor.
+	h.registerDiagnosticsCleanup()
+
+	// Acquire the formae binary, downloading via orbital if needed
+	formaeBinary, binaryCleanup := EnsureFormaeBinary(t)
+	h.formaeBinary = formaeBinary
+
+	ctx, cancel := context.WithCancel(context.Background())
+	h.agentCtx = ctx
+	h.agentCancel = cancel
+
+	// Register binary cleanup so any temp download directory is removed on teardown
+	h.RegisterCleanup(binaryCleanup)
+
+	// Resolve PKL dependencies for the plugin under test
+	pluginDir, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("failed to get working directory: %v", err)
+	}
+	schemaDir := filepath.Join(pluginDir, "schema", "pkl")
+	testdataDir := ResolveTestDataDir(pluginDir)
+	// Find the nearest PklProject for the testdata dir. When a custom
+	// FORMAE_TEST_TESTDATA_DIR points at a subdir without its own PklProject,
+	// walk up to the parent project root (typically <pluginDir>/testdata) so
+	// `pkl project resolve` runs against the correct project.
+	testdataProject := FindPklProjectRoot(testdataDir)
+	if testdataProject == "" {
+		testdataProject = testdataDir
+	}
+	restorePKL := ResolvePKLDependencies(t, "", schemaDir, testdataProject)
+	t.Cleanup(restorePKL)
+
+	// Set up test environment (temp dir and config)
+	if err := h.setupTestEnvironment(); err != nil {
+		t.Fatalf("failed to setup test environment: %v", err)
+	}
+
+	// Discover external plugins
+	if err := h.setupPluginDiscovery(); err != nil {
+		t.Fatalf("failed to discover plugins: %v", err)
+	}
+
+	return h
+}
+
+// setupTestEnvironment creates a temporary directory and config file for testing
+func (h *TestHarness) setupTestEnvironment() error {
+	// Create temp directory, named after the test so a retained directory is
+	// traceable back to the case that produced it
+	tempDir, err := os.MkdirTemp("", fmt.Sprintf("formae-test-%s-*", sanitizeForPath(h.t.Name())))
+	if err != nil {
+		return fmt.Errorf("failed to create temp directory: %w", err)
+	}
+	h.tempDir = tempDir
+
+	// Create database path in temp directory
+	dbPath := filepath.Join(tempDir, "formae-test.db")
+
+	// Create log file path in temp directory. Recorded before the fallible
+	// steps below so a setup failure still reports the agent log path.
+	logPath := filepath.Join(tempDir, "formae-test.log")
+	h.logFile = logPath
+
+	// Generate a random network cookie for distributed plugin communication
+	cookieBytes := make([]byte, 16)
+	if _, err := rand.Read(cookieBytes); err != nil {
+		return fmt.Errorf("failed to generate network cookie: %w", err)
+	}
+	h.networkCookie = hex.EncodeToString(cookieBytes)
+
+	// Generate a unique test run ID for resource naming consistency within this test run
+	testRunIDBytes := make([]byte, 4)
+	if _, err := rand.Read(testRunIDBytes); err != nil {
+		return fmt.Errorf("failed to generate test run ID: %w", err)
+	}
+	h.testRunID = hex.EncodeToString(testRunIDBytes)
+
+	// Get a random available port for the agent
+	agentPort, err := getFreePort()
+	if err != nil {
+		return fmt.Errorf("failed to get free port: %w", err)
+	}
+	h.agentPort = agentPort
+
+	// Get a random available port for Ergo (enables parallel test execution)
+	ergoPort, err := getFreePort()
+	if err != nil {
+		return fmt.Errorf("failed to get free Ergo port: %w", err)
+	}
+	h.ergoPort = ergoPort
+
+	// Get a random available port for Ergo registrar (isolates parallel agents)
+	registrarPort, err := getFreePort()
+	if err != nil {
+		return fmt.Errorf("failed to get free registrar port: %w", err)
+	}
+	h.registrarPort = registrarPort
+
+	// Generate test config file
+	// Use unique nodename per test to enable parallel test execution
+	configContent := fmt.Sprintf(`/*
+ * © 2025 Platform Engineering Labs Inc.
+ *
+ * SPDX-License-Identifier: FSL-1.1-ALv2
+ */
+
+// Auto-generated test configuration
+amends "formae:/Config.pkl"
+
+agent {
+    server {
+        port = %d
+        ergoPort = %d
+        registrarPort = %d
+        secret = %q
+        nodename = "formae-%s"
+    }
+    datastore {
+        sqlite {
+            filePath = %q
+        }
+    }
+    synchronization {
+        enabled = false
+    }
+    discovery {
+        enabled = false
+    }
+    logging {
+        consoleLogLevel = "debug"
+        filePath = %q
+        fileLogLevel = "debug"
+    }
+}
+
+cli {
+    connection = new Classic {
+        port = %d
+    }
+	disableUsageReporting = true
+}
+
+pluginDir = %q
+`, agentPort, h.ergoPort, h.registrarPort, h.networkCookie, h.testRunID, dbPath, logPath, agentPort, conformancePluginDir())
+
+	// Write config to temp directory
+	configFile := filepath.Join(tempDir, "test-config.pkl")
+	if err := os.WriteFile(configFile, []byte(configContent), 0644); err != nil {
+		return fmt.Errorf("failed to write config file: %w", err)
+	}
+	h.configFile = configFile
+
+	h.t.Logf("Created test environment: tempDir=%s, configFile=%s, dbPath=%s, logPath=%s", tempDir, configFile, dbPath, logPath)
+	return nil
+}
+
+// conformancePluginDir permits hermetic packaged-plugin tests without installing
+// into the developer's home. The unset default preserves existing conformance.
+func conformancePluginDir() string {
+	if path := os.Getenv("FORMAE_TEST_PLUGIN_DIR"); path != "" {
+		return ExpandHomePath(path)
+	}
+	return ExpandHomePath("~/.pel/formae/plugins")
+}
+
+// setupPluginDiscovery discovers external resource plugins from the user
+// plugin directory (~/.pel/formae/plugins).
+func (h *TestHarness) setupPluginDiscovery() error {
+	pluginDir := conformancePluginDir()
+	h.t.Logf("Discovering external plugins from: %s", pluginDir)
+
+	for _, p := range plugindiscovery.DiscoverPlugins(pluginDir, plugindiscovery.Resource) {
+		h.externalResourcePlugins = append(h.externalResourcePlugins, p.ToResourcePluginInfo())
+	}
+
+	h.t.Logf("Discovered %d external resource plugin(s)", len(h.externalResourcePlugins))
+	for _, p := range h.externalResourcePlugins {
+		h.t.Logf("  - %s (namespace=%s, version=%s)", p.Name, p.Namespace, p.Version)
+	}
+	return nil
+}
+
+// InitErgoNode initializes the Ergo actor system for direct plugin communication.
+// This is required for discovery tests to communicate with external plugins.
+func (h *TestHarness) InitErgoNode() error {
+	if h.ergoNodeStarted {
+		return nil // Already initialized
+	}
+
+	h.t.Log("Initializing Ergo node for direct plugin communication")
+
+	// Register EDF types for network serialization before starting node
+	if err := plugin.RegisterSharedEDFTypes(); err != nil {
+		return fmt.Errorf("failed to register EDF types: %w", err)
+	}
+
+	// Generate unique node name for this test run
+	h.ergoNodeName = gen.Atom(fmt.Sprintf("test-harness-%s@localhost", h.testRunID))
+
+	// Setup Ergo node options
+	options := gen.NodeOptions{}
+	options.Network.Mode = gen.NetworkModeEnabled
+	options.Network.Cookie = h.networkCookie
+	options.Log.Level = gen.LogLevelWarning
+
+	// Configure Ergo to use a test-specific port and registrar (enables parallel test execution)
+	// Each test gets its own registrar to avoid sharing the global one.
+	testErgoPort, err := getFreePort()
+	if err != nil {
+		return fmt.Errorf("failed to get test Ergo port: %w", err)
+	}
+	// Set registrar at node level for both incoming registration and outgoing resolution
+	options.Network.Registrar = registrar.Create(registrar.Options{Port: uint16(h.registrarPort)})
+	options.Network.Acceptors = []gen.AcceptorOptions{
+		{
+			Host: "localhost",
+			Port: uint16(testErgoPort),
+		},
+	}
+
+	// Start the Ergo node
+	node, err := ergo.StartNode(h.ergoNodeName, options)
+	if err != nil {
+		return fmt.Errorf("failed to start Ergo node: %w", err)
+	}
+	h.ergoNode = node
+
+	// Spawn TestHelperActor for bridging test code with actor system
+	messages := make(chan any, 100)
+	testHelperPID, err := testutil.StartTestHelperActor(h.ergoNode, messages)
+	if err != nil {
+		h.ergoNode.Stop()
+		return fmt.Errorf("failed to spawn TestHelperActor: %w", err)
+	}
+	h.testHelperPID = testHelperPID
+
+	// Spawn PluginCoordinator to receive plugin announcements
+	// Pass the node name and network cookie so it can spawn plugins
+	coordinatorPID, err := h.ergoNode.SpawnRegister(
+		"PluginCoordinator",
+		NewPluginCoordinator,
+		gen.ProcessOptions{},
+		string(h.ergoNodeName), // agentNodeName
+		h.networkCookie,        // networkCookie
+	)
+	if err != nil {
+		h.ergoNode.Stop()
+		return fmt.Errorf("failed to spawn PluginCoordinator: %w", err)
+	}
+	h.pluginCoordinator = coordinatorPID
+
+	h.ergoNodeStarted = true
+	h.t.Logf("Ergo node initialized: %s", h.ergoNodeName)
+
+	return nil
+}
+
+// StopErgoNode stops the Ergo actor system
+func (h *TestHarness) StopErgoNode() {
+	if h.ergoNodeStarted && h.ergoNode != nil {
+		// First, terminate any spawned plugin processes
+		h.t.Log("Terminating spawned plugins before stopping Ergo node")
+		result, err := testutil.CallWithTimeout(h.ergoNode, "PluginCoordinator", TerminatePluginsRequest{}, 10)
+		if err != nil {
+			h.t.Logf("Warning: failed to terminate plugins: %v", err)
+		} else if r, ok := result.(TerminatePluginsResult); ok {
+			h.t.Logf("Terminated %d plugin(s)", r.Terminated)
+		}
+
+		// Give plugins a moment to shut down
+		time.Sleep(500 * time.Millisecond)
+
+		h.t.Log("Stopping Ergo node")
+		h.ergoNode.Stop()
+		h.ergoNodeStarted = false
+	}
+}
+
+// LaunchPluginDirect spawns an external plugin process and waits for it to announce itself.
+// This is used by discovery tests to create resources without the formae agent.
+func (h *TestHarness) LaunchPluginDirect(pluginBinaryPath, namespace string) error {
+	if !h.ergoNodeStarted {
+		if err := h.InitErgoNode(); err != nil {
+			return fmt.Errorf("failed to initialize Ergo node: %w", err)
+		}
+	}
+
+	h.t.Logf("Launching plugin directly: %s (namespace: %s)", pluginBinaryPath, namespace)
+
+	// Call the PluginCoordinator to launch the plugin via actor message
+	// This is required because SpawnMeta can only be called from within an actor
+	result, err := testutil.Call(h.ergoNode, "PluginCoordinator", LaunchPluginRequest{
+		PluginBinaryPath: pluginBinaryPath,
+		Namespace:        namespace,
+		TestRunID:        h.testRunID,
+		RegistrarPort:    h.registrarPort,
+	})
+	if err != nil {
+		return fmt.Errorf("failed to call PluginCoordinator: %w", err)
+	}
+
+	if launchResult, ok := result.(LaunchPluginResult); ok {
+		if launchResult.Error != "" {
+			return fmt.Errorf("failed to launch plugin: %s", launchResult.Error)
+		}
+	}
+
+	h.t.Logf("Plugin process spawned, waiting for announcement...")
+	return nil
+}
+
+// WaitForPluginReady waits for a plugin to announce itself to the PluginCoordinator.
+func (h *TestHarness) WaitForPluginReady(namespace string, timeout time.Duration) error {
+	if !h.ergoNodeStarted {
+		return fmt.Errorf("Ergo node not started")
+	}
+
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		result, err := testutil.Call(h.ergoNode, "PluginCoordinator", CheckPluginAvailable{Namespace: namespace})
+		if err == nil {
+			if r, ok := result.(CheckPluginAvailableResult); ok && r.Available {
+				h.t.Logf("Plugin %s is ready", namespace)
+				return nil
+			}
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+
+	return fmt.Errorf("timeout waiting for plugin %s to become ready", namespace)
+}
+
+// RegisterTargetForDiscovery registers a target with Discoverable=true via the formae agent API.
+// This must be called after the agent is started.
+func (h *TestHarness) RegisterTargetForDiscovery(evalOutput json.RawMessage) error {
+	// Parse the eval output to get the forma structure
+	var forma pkgmodel.Forma
+	if err := json.Unmarshal(evalOutput, &forma); err != nil {
+		return fmt.Errorf("failed to parse eval output: %w", err)
+	}
+
+	if len(forma.Targets) == 0 {
+		return fmt.Errorf("no targets found in eval output")
+	}
+
+	// Set Discoverable=true on the target
+	discoverableTarget := forma.Targets[0]
+	discoverableTarget.Discoverable = true
+	h.t.Logf("Registering target with Discoverable=true: %s", discoverableTarget.Label)
+
+	targetOnlyForma := pkgmodel.Forma{
+		Targets: []pkgmodel.Target{discoverableTarget},
+	}
+
+	targetJSON, err := json.Marshal(targetOnlyForma)
+	if err != nil {
+		return fmt.Errorf("failed to marshal target-only forma: %w", err)
+	}
+
+	_, err = h.submitForma(targetJSON, "target-registration")
+	if err != nil {
+		return fmt.Errorf("failed to register target for discovery: %w", err)
+	}
+
+	return nil
+}
+
+// waitForOperationProgress polls the PluginCoordinator for operation progress until complete.
+// This is used to wait for async operations (create/delete) to finish.
+func (h *TestHarness) waitForOperationProgress(operatorPID gen.PID, initialProgress resource.ProgressResult, timeout time.Duration) (resource.ProgressResult, error) {
+	deadline := time.Now().Add(timeout)
+	pollInterval := 5 * time.Second
+
+	progress := initialProgress
+
+	for time.Now().Before(deadline) {
+		if progress.OperationStatus != resource.OperationStatusInProgress {
+			return progress, nil
+		}
+
+		time.Sleep(pollInterval)
+
+		// Poll the PluginCoordinator for the latest progress
+		result, err := testutil.Call(h.ergoNode, "PluginCoordinator", GetLatestProgressRequest{
+			OperatorPID: operatorPID,
+		})
+		if err != nil {
+			h.t.Logf("Warning: failed to get progress: %v", err)
+			continue
+		}
+
+		progressResult, ok := result.(GetLatestProgressResult)
+		if !ok {
+			h.t.Logf("Warning: unexpected response type: %T", result)
+			continue
+		}
+
+		if progressResult.Found {
+			h.t.Logf("Progress update: status=%s, nativeID=%s", progressResult.Progress.OperationStatus, progressResult.Progress.NativeID)
+			progress = progressResult.Progress
+		} else {
+			h.t.Logf("No progress update yet, continuing to wait...")
+		}
+	}
+
+	return progress, fmt.Errorf("timeout waiting for operation to complete")
+}
+
+// ConfigureDiscovery updates the config file
+
+// GetPluginBinaryPath returns the path to an external plugin binary.
+// It looks up the binary in the discovered external resource plugins.
+func (h *TestHarness) GetPluginBinaryPath(namespace string) (string, error) {
+	for _, p := range h.externalResourcePlugins {
+		if strings.EqualFold(p.Namespace, namespace) {
+			h.t.Logf("Found plugin binary for %s: %s", namespace, p.BinaryPath)
+			return p.BinaryPath, nil
+		}
+	}
+
+	return "", fmt.Errorf("no plugin binary found for namespace: %s", namespace)
+}
+
+// ConfigureDiscovery updates the config file to enable discovery for specific resource types
+// This must be called before StartAgent() to take effect
+func (h *TestHarness) ConfigureDiscovery(resourceTypes []string) error {
+	if h.agentStarted {
+		return fmt.Errorf("cannot configure discovery after agent has started")
+	}
+
+	h.t.Logf("Configuring discovery for resource types: %v", resourceTypes)
+
+	// Create database path in temp directory
+	dbPath := filepath.Join(h.tempDir, "formae-test.db")
+
+	// Build the resourceTypesToDiscover listing for per-plugin config
+	resourceTypesList := ""
+	for _, rt := range resourceTypes {
+		resourceTypesList += fmt.Sprintf("            %q\n", rt)
+	}
+
+	// Determine plugin name and PascalCase alias from discovered plugins
+	pluginName := ""
+	if len(h.externalResourcePlugins) > 0 {
+		pluginName = h.externalResourcePlugins[0].Name
+	}
+	if pluginName == "" {
+		return fmt.Errorf("no external resource plugins discovered; cannot configure per-plugin discovery")
+	}
+	pluginAlias := pluginNameToPascalCase(pluginName)
+
+	// Generate updated config file with discovery enabled
+	// Use unique nodename per test to enable parallel test execution
+	// resourceTypesToDiscover is configured per-plugin via agent.resourcePlugins
+	// using the typed PluginConfig from the plugin's schema/Config.pkl
+	configContent := fmt.Sprintf(`/*
+ * © 2025 Platform Engineering Labs Inc.
+ *
+ * SPDX-License-Identifier: FSL-1.1-ALv2
+ */
+
+// Auto-generated test configuration
+amends "formae:/Config.pkl"
+
+import "plugins:/%s.pkl" as %s
+
+agent {
+    server {
+        port = %%d
+        ergoPort = %%d
+        registrarPort = %%d
+        secret = %%q
+        nodename = "formae-%%s"
+    }
+    datastore {
+        sqlite {
+            filePath = %%q
+        }
+    }
+    synchronization {
+        enabled = false
+    }
+    discovery {
+        enabled = true
+    }
+    logging {
+        consoleLogLevel = "debug"
+        filePath = %%q
+        fileLogLevel = "debug"
+    }
+    resourcePlugins {
+        new %s.PluginConfig {
+            resourceTypesToDiscover {
+%%s            }
+        }
+    }
+}
+
+cli {
+    connection = new Classic {
+        port = %%d
+    }
+	disableUsageReporting = true
+}
+
+pluginDir = %%q
+`, pluginAlias, pluginAlias, pluginAlias)
+
+	configContent = fmt.Sprintf(configContent, h.agentPort, h.ergoPort, h.registrarPort, h.networkCookie, h.testRunID, dbPath, h.logFile, resourceTypesList, h.agentPort, conformancePluginDir())
+
+	// Overwrite the config file
+	if err := os.WriteFile(h.configFile, []byte(configContent), 0644); err != nil {
+		return fmt.Errorf("failed to write updated config file: %w", err)
+	}
+
+	h.t.Log("Discovery configuration updated successfully")
+	return nil
+}
+
+// setCommandEnv sets the required environment variables for a command
+// This ensures the FORMAE_TEST_RUN_ID is available to all CLI commands
+func (h *TestHarness) setCommandEnv(cmd *exec.Cmd) {
+	cmd.Env = append(os.Environ(), fmt.Sprintf("FORMAE_TEST_RUN_ID=%s", h.testRunID))
+}
+
+// RotateTestRunID generates a new random test run ID. This is used before
+// the OOB re-apply step so that recreated resources get unique names,
+// avoiding conflicts with resources that are still being async-deleted
+// by the cloud provider (e.g., OCI compartments).
+func (h *TestHarness) RotateTestRunID() {
+	newIDBytes := make([]byte, 4)
+	if _, err := rand.Read(newIDBytes); err != nil {
+		h.t.Fatalf("Failed to generate new test run ID: %v", err)
+	}
+	h.testRunID = hex.EncodeToString(newIDBytes)
+	h.t.Logf("Rotated test run ID to: %s", h.testRunID)
+}
+
+// StartAgent starts the formae agent in the background
+func (h *TestHarness) StartAgent() error {
+	if h.agentStarted {
+		return fmt.Errorf("agent already started")
+	}
+
+	// Use a unique PID file per test to allow parallel test execution.
+	// Each test has its own tempDir, so PID files won't conflict.
+	pidFile := filepath.Join(h.tempDir, "formae.pid")
+	_ = os.Remove(pidFile)
+
+	h.t.Log("Starting formae agent...")
+
+	// Start agent with context and custom config so we can cancel it
+	h.agentCmd = exec.CommandContext(h.agentCtx, h.formaeBinary, "agent", "start", "--config", h.configFile)
+	h.setCommandEnv(h.agentCmd)
+	// Set unique PID file path to allow parallel test execution
+	h.agentCmd.Env = append(h.agentCmd.Env, fmt.Sprintf("FORMAE_PID_FILE=%s", pidFile))
+	h.agentCmd.Stdout = os.Stdout
+	h.agentCmd.Stderr = os.Stderr
+
+	if err := h.agentCmd.Start(); err != nil {
+		return fmt.Errorf("failed to start agent: %w", err)
+	}
+
+	h.agentStarted = true
+
+	// Wait for agent to be ready by polling health endpoint
+	if err := h.waitForAgent(); err != nil {
+		h.StopAgent()
+		return err
+	}
+
+	h.t.Log("Formae agent started and ready")
+	return nil
+}
+
+// waitForAgent polls the health endpoint until the agent is ready
+func (h *TestHarness) waitForAgent() error {
+	healthURL := fmt.Sprintf("http://localhost:%d/api/v1/health", h.agentPort)
+	timeout := 30 * time.Second
+	pollInterval := 500 * time.Millisecond
+	deadline := time.Now().Add(timeout)
+
+	h.t.Log("Waiting for agent to be ready...")
+
+	for time.Now().Before(deadline) {
+		resp, err := http.Get(healthURL)
+		if err == nil && resp.StatusCode == http.StatusOK {
+			_ = resp.Body.Close()
+			return nil
+		}
+		if resp != nil {
+			_ = resp.Body.Close()
+		}
+		time.Sleep(pollInterval)
+	}
+
+	return fmt.Errorf("timeout waiting for agent to become ready after %v", timeout)
+}
+
+// StopAgent stops the formae agent
+func (h *TestHarness) StopAgent() {
+	if !h.agentStarted {
+		return
+	}
+
+	h.t.Log("Stopping formae agent...")
+
+	// Send SIGTERM for graceful shutdown instead of using context cancellation.
+	// Context cancellation causes exec.CommandContext to send SIGKILL, which
+	// doesn't allow the HTTP server to close gracefully, leaving the socket
+	// in TIME_WAIT state and causing port conflicts in subsequent tests.
+	if h.agentCmd != nil && h.agentCmd.Process != nil {
+		_ = h.agentCmd.Process.Signal(syscall.SIGTERM)
+
+		// Wait for graceful shutdown with timeout
+		done := make(chan error, 1)
+		go func() {
+			done <- h.agentCmd.Wait()
+		}()
+
+		select {
+		case <-done:
+			// Process exited gracefully
+		case <-time.After(15 * time.Second):
+			// Graceful shutdown timed out, force kill
+			h.t.Log("Graceful shutdown timed out, force killing agent")
+			h.agentCancel()
+			<-done
+		}
+	}
+
+	h.agentStarted = false
+	h.t.Log("Formae agent stopped")
+}
+
+// Cleanup runs all registered cleanup functions and stops the agent
+func (h *TestHarness) Cleanup() {
+	// Run cleanup functions in reverse order
+	for i := len(h.cleanupFuncs) - 1; i >= 0; i-- {
+		h.cleanupFuncs[i]()
+	}
+
+	h.StopAgent()
+	h.StopErgoNode()
+}
+
+// RegisterCleanup adds a cleanup function to be called during Cleanup()
+func (h *TestHarness) RegisterCleanup(f func()) {
+	h.cleanupFuncs = append(h.cleanupFuncs, f)
+}
+
+// GetTempDir returns the temporary directory path used for test files
+func (h *TestHarness) GetTempDir() string {
+	return h.tempDir
+}
+
+// runCLI runs one formae CLI invocation with the given arguments, bounded by
+// the harness CLI timeout so a CLI process that never exits surfaces as an
+// error rather than blocking the suite until the go-test deadline. Stdout and
+// stderr are captured separately so stderr (ANSI codes, warnings) cannot
+// corrupt output a caller parses.
+func (h *TestHarness) runCLI(args ...string) (string, string, error) {
+	timeout := h.cliTimeout
+	if timeout <= 0 {
+		timeout = getCLIInvocationTimeout()
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, h.formaeBinary, args...)
+	h.setCommandEnv(cmd)
+
+	// Without a WaitDelay, a child the CLI spawned (pkl, a shell) that outlives
+	// it holds the stdout/stderr pipes open and Wait blocks on them even after
+	// the deadline killed the CLI itself.
+	cmd.WaitDelay = time.Second
+
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+
+	err := cmd.Run()
+	if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+		err = fmt.Errorf("formae %s timed out after %s", args[0], timeout)
+	}
+	return stdout.String(), stderr.String(), err
+}
+
+// Apply runs `formae apply` with the given PKL file in reconcile mode and returns the command ID
+func (h *TestHarness) Apply(pklFile string) (string, error) {
+	return h.ApplyWithMode(pklFile, "reconcile")
+}
+
+// ApplyWithMode runs `formae apply` with the given PKL file and mode, and returns the command ID
+func (h *TestHarness) ApplyWithMode(pklFile string, mode string) (string, error) {
+	h.t.Logf("Running formae apply with %s (mode: %s)", pklFile, mode)
+
+	stdout, stderr, err := h.runCLI(
+		"apply",
+		pklFile,
+		"--config", h.configFile,
+		"--mode", mode,
+		"--output-consumer", "machine",
+		"--output-schema", "json",
+	)
+	if err != nil {
+		return "", fmt.Errorf("apply command failed: %w\nStderr: %s\nStdout: %s", err, stderr, stdout)
+	}
+
+	// Log stderr if there was any output (for debugging purposes)
+	if stderr != "" {
+		h.t.Logf("Apply stderr (ignored for parsing): %s", stderr)
+	}
+
+	// Parse JSON response from stdout only
+	var response model.SubmitCommandResponse
+	if err := json.Unmarshal([]byte(stdout), &response); err != nil {
+		return "", fmt.Errorf("failed to parse apply response: %w\nStdout: %s", err, stdout)
+	}
+
+	if response.CommandID == "" {
+		return "", fmt.Errorf("no command ID in response: %s", stdout)
+	}
+
+	h.t.Logf("Apply command submitted, CommandID: %s", response.CommandID)
+	return response.CommandID, nil
+}
+
+// SimulateApply runs `formae apply --simulate` with the given PKL file and
+// mode, and returns the agent's simulation of the changes the apply would
+// perform. Nothing is submitted and no state is mutated; a forma that matches
+// current state comes back with ChangesRequired = false.
+func (h *TestHarness) SimulateApply(pklFile string, mode string) (*model.Simulation, error) {
+	h.t.Logf("Running formae apply --simulate with %s (mode: %s)", pklFile, mode)
+
+	stdout, stderr, err := h.runCLI(
+		"apply",
+		pklFile,
+		"--config", h.configFile,
+		"--mode", mode,
+		"--simulate",
+		"--output-consumer", "machine",
+		"--output-schema", "json",
+	)
+	if err != nil {
+		return nil, fmt.Errorf("simulate command failed: %w\nStderr: %s\nStdout: %s", err, stderr, stdout)
+	}
+
+	// Log stderr if there was any output (for debugging purposes)
+	if stderr != "" {
+		h.t.Logf("Simulate stderr (ignored for parsing): %s", stderr)
+	}
+
+	// Parse JSON response from stdout only
+	var simulation model.Simulation
+	if err := json.Unmarshal([]byte(stdout), &simulation); err != nil {
+		return nil, fmt.Errorf("failed to parse simulate response: %w\nStdout: %s", err, stdout)
+	}
+
+	return &simulation, nil
+}
+
+// Destroy runs `formae destroy` with the given PKL file and returns the command ID
+func (h *TestHarness) Destroy(pklFile string) (string, error) {
+	h.t.Logf("Running formae destroy with %s", pklFile)
+
+	stdout, stderr, err := h.runCLI(
+		"destroy",
+		pklFile,
+		"--config", h.configFile,
+		"--output-consumer", "machine",
+		"--output-schema", "json",
+	)
+	if err != nil {
+		return "", fmt.Errorf("destroy command failed: %w\nStderr: %s\nStdout: %s", err, stderr, stdout)
+	}
+
+	// Log stderr if there was any output (for debugging purposes)
+	if stderr != "" {
+		h.t.Logf("Destroy stderr (ignored for parsing): %s", stderr)
+	}
+
+	// Parse JSON response from stdout only
+	var response model.SubmitCommandResponse
+	if err := json.Unmarshal([]byte(stdout), &response); err != nil {
+		return "", fmt.Errorf("failed to parse destroy response: %w\nStdout: %s", err, stdout)
+	}
+
+	if response.CommandID == "" {
+		return "", fmt.Errorf("no command ID in response: %s", stdout)
+	}
+
+	h.t.Logf("Destroy command submitted, CommandID: %s", response.CommandID)
+	return response.CommandID, nil
+}
+
+// Eval runs `formae eval` with the given PKL file and returns the JSON output
+func (h *TestHarness) Eval(pklFile string) (string, error) {
+	h.t.Logf("Running formae eval with %s", pklFile)
+
+	stdout, stderr, err := h.runCLI(
+		"eval",
+		pklFile,
+		"--config", h.configFile,
+		"--output-consumer", "machine",
+		"--output-schema", "json",
+	)
+	if err != nil {
+		return "", fmt.Errorf("eval command failed: %w\nStderr: %s\nStdout: %s", err, stderr, stdout)
+	}
+
+	// Log stderr if there was any output (for debugging purposes)
+	if stderr != "" {
+		h.t.Logf("Eval stderr (ignored for parsing): %s", stderr)
+	}
+
+	return stdout, nil
+}
+
+// Extract runs `formae extract` with the given query and output file.
+//
+// `--schema-location local` is required: the conformance harness installs
+// the plugin under test into the agent's local plugin tree (no published
+// hub package), so versioned schema dispatch
+// (internal/schema/pkl.resolveSchemaVersions) only fires when the CLI is
+// told to read schemas from disk. Without the flag, extract emits an
+// unrestricted `@<ns>/**` glob that matches zero modules under the
+// install's `v*/` subtree layout, and every K8s resource type lookup
+// fails with `Cannot find key "K8S::..."`.
+//
+// TODO: drop this once the formae CLI distinguishes "user passed
+// --schema-location remote" from "no flag, default to remote" so
+// versioned dispatch can keep working in the unset case.
+func (h *TestHarness) Extract(query string, outputFile string) error {
+	h.t.Logf("Running formae extract with query '%s' to %s", query, outputFile)
+
+	stdout, stderr, err := h.runCLI(
+		"extract",
+		"--config", h.configFile,
+		"--schema-location", "local",
+		"--query", query,
+		outputFile,
+	)
+	if err != nil {
+		return fmt.Errorf("extract command failed: %w\nStderr: %s\nStdout: %s", err, stderr, stdout)
+	}
+
+	// Log stderr if there was any output (for debugging purposes)
+	if stderr != "" {
+		h.t.Logf("Extract stderr (ignored): %s", stderr)
+	}
+
+	h.t.Logf("Extract completed successfully")
+	return nil
+}
+
+// InventoryResponse represents the JSON response from formae inventory
+type InventoryResponse struct {
+	Targets   []map[string]any `json:"Targets,omitempty"`
+	Resources []map[string]any `json:"Resources,omitempty"`
+}
+
+// Inventory runs `formae inventory` with the given query and returns the parsed response
+func (h *TestHarness) Inventory(query string) (*InventoryResponse, error) {
+	h.t.Logf("Running formae inventory with query: %s", query)
+
+	stdout, stderr, err := h.runCLI(
+		"inventory",
+		"resources", // Need to specify the subcommand
+		"--config", h.configFile,
+		"--query", query,
+		"--output-consumer", "machine",
+		"--output-schema", "json",
+	)
+	if err != nil {
+		return nil, fmt.Errorf("inventory command failed: %w\nStderr: %s\nStdout: %s", err, stderr, stdout)
+	}
+
+	// Log stderr if there was any output (for debugging purposes)
+	if stderr != "" {
+		h.t.Logf("Inventory stderr (ignored for parsing): %s", stderr)
+	}
+
+	// Parse JSON response from stdout only
+	var response InventoryResponse
+	if err := json.Unmarshal([]byte(stdout), &response); err != nil {
+		return nil, fmt.Errorf("failed to parse inventory response: %w\nStdout: %s", err, stdout)
+	}
+
+	h.t.Logf("Inventory returned %d resource(s)", len(response.Resources))
+	return &response, nil
+}
+
+// Sync triggers a synchronization operation via the admin endpoint
+func (h *TestHarness) Sync() error {
+	h.t.Log("Triggering synchronization via /api/v1/admin/synchronize")
+
+	syncURL := fmt.Sprintf("http://localhost:%d/api/v1/admin/synchronize", h.agentPort)
+
+	resp, err := http.Post(syncURL, "application/json", nil)
+	if err != nil {
+		return fmt.Errorf("failed to trigger sync: %w", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("sync endpoint returned status %d", resp.StatusCode)
+	}
+
+	h.t.Log("Synchronization triggered successfully")
+	return nil
+}
+
+// WaitForSyncCompletion waits for the synchronization to complete by polling the agent log file
+func (h *TestHarness) WaitForSyncCompletion(timeout time.Duration) error {
+	h.t.Log("Waiting for synchronization to complete...")
+
+	deadline := time.Now().Add(timeout)
+	pollInterval := 500 * time.Millisecond
+	syncMessage := "Synchronization finished"
+
+	for time.Now().Before(deadline) {
+		// Read the log file
+		logContent, err := os.ReadFile(h.logFile)
+		if err != nil {
+			// File might not exist yet, continue polling
+			time.Sleep(pollInterval)
+			continue
+		}
+
+		if strings.Contains(string(logContent), syncMessage) {
+			h.t.Log("Synchronization completed")
+			return nil
+		}
+		time.Sleep(pollInterval)
+	}
+
+	return fmt.Errorf("timeout waiting for synchronization to complete after %v", timeout)
+}
+
+// GetStats fetches the agent stats via the /api/v1/stats endpoint
+func (h *TestHarness) GetStats() (*model.Stats, error) {
+	statsURL := fmt.Sprintf("http://localhost:%d/api/v1/stats", h.agentPort)
+
+	resp, err := http.Get(statsURL)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get stats: %w", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("stats endpoint returned status %d", resp.StatusCode)
+	}
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read stats response: %w", err)
+	}
+
+	var stats model.Stats
+	if err := json.Unmarshal(body, &stats); err != nil {
+		return nil, fmt.Errorf("failed to parse stats response: %w", err)
+	}
+
+	return &stats, nil
+}
+
+// WaitForPluginRegistered polls the /stats endpoint until the specified
+// plugin namespace appears in the registered plugins list.
+// This is used to ensure a plugin is fully registered before triggering discovery.
+func (h *TestHarness) WaitForPluginRegistered(namespace string, timeout time.Duration) error {
+	h.t.Logf("Waiting for plugin %s to be registered...", namespace)
+
+	deadline := time.Now().Add(timeout)
+	pollInterval := 500 * time.Millisecond
+
+	for time.Now().Before(deadline) {
+		stats, err := h.GetStats()
+		if err != nil {
+			// Agent might not be fully ready yet, keep polling
+			time.Sleep(pollInterval)
+			continue
+		}
+
+		for _, plugin := range stats.Plugins {
+			if strings.EqualFold(plugin.Namespace, namespace) {
+				h.t.Logf("Plugin %s registered successfully", namespace)
+				return nil
+			}
+		}
+
+		time.Sleep(pollInterval)
+	}
+
+	return fmt.Errorf("timeout waiting for plugin %s to register", namespace)
+}
+
+// TriggerDiscovery triggers a discovery operation via the admin endpoint
+func (h *TestHarness) TriggerDiscovery() error {
+	h.t.Log("Triggering discovery via /api/v1/admin/discover")
+
+	discoverURL := fmt.Sprintf("http://localhost:%d/api/v1/admin/discover", h.agentPort)
+
+	resp, err := http.Post(discoverURL, "application/json", nil)
+	if err != nil {
+		return fmt.Errorf("failed to trigger discovery: %w", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("discover endpoint returned status %d", resp.StatusCode)
+	}
+
+	h.t.Log("Discovery triggered successfully")
+	return nil
+}
+
+// WaitForDiscoveryCompletion waits for the discovery to complete by polling the agent log file
+// Deprecated: Use WaitForResourceInInventory instead for reliable waiting in CI environments.
+// Log file polling is unreliable due to buffering differences between environments.
+func (h *TestHarness) WaitForDiscoveryCompletion(timeout time.Duration) error {
+	h.t.Log("Waiting for discovery to complete...")
+
+	deadline := time.Now().Add(timeout)
+	pollInterval := 500 * time.Millisecond
+	discoveryMessage := "Discovery finished."
+
+	for time.Now().Before(deadline) {
+		// Read the log file
+		logContent, err := os.ReadFile(h.logFile)
+		if err != nil {
+			// File might not exist yet, continue polling
+			time.Sleep(pollInterval)
+			continue
+		}
+
+		if strings.Contains(string(logContent), discoveryMessage) {
+			h.t.Log("Discovery completed")
+			return nil
+		}
+		time.Sleep(pollInterval)
+	}
+
+	return fmt.Errorf("timeout waiting for discovery to complete after %v", timeout)
+}
+
+// WaitForResourceInInventory polls the inventory API until a resource with the specified
+// type and nativeID appears. This is more reliable than log file polling because it
+// directly queries the data store rather than depending on log file buffering.
+// This is the recommended way to wait for discovery completion in tests.
+func (h *TestHarness) WaitForResourceInInventory(resourceType, nativeID string, managed bool, timeout time.Duration) error {
+	managedStr := "true"
+	if !managed {
+		managedStr = "false"
+	}
+	h.t.Logf("Waiting for resource to appear in inventory: type=%s, nativeID=%s, managed=%s", resourceType, nativeID, managedStr)
+
+	deadline := time.Now().Add(timeout)
+	pollInterval := 2 * time.Second
+
+	for time.Now().Before(deadline) {
+		// Query inventory for this specific resource type and managed status
+		inventory, err := h.Inventory(fmt.Sprintf("type: %s managed: %s", resourceType, managedStr))
+		if err != nil {
+			// Inventory query might fail early on, continue polling
+			h.t.Logf("Inventory query failed (will retry): %v", err)
+			time.Sleep(pollInterval)
+			continue
+		}
+
+		// Check if our resource is in the results
+		for _, res := range inventory.Resources {
+			if resNativeID, ok := res["NativeID"].(string); ok {
+				if resNativeID == nativeID {
+					h.t.Logf("Resource found in inventory: NativeID=%s", nativeID)
+					return nil
+				}
+			}
+		}
+
+		h.t.Logf("Resource not yet in inventory (found %d resources of type %s), polling...", len(inventory.Resources), resourceType)
+		time.Sleep(pollInterval)
+	}
+
+	return fmt.Errorf("timeout waiting for resource %s (type: %s) to appear in inventory after %v", nativeID, resourceType, timeout)
+}
+
+// clock abstracts the passage of time for the discovery wait loop so unit tests
+// can drive it deterministically (no real sleeps, no wall-clock assertions).
+type clock interface {
+	Now() time.Time
+	Sleep(d time.Duration)
+}
+
+// realClock is the production clock backed by the standard library.
+type realClock struct{}
+
+func (realClock) Now() time.Time        { return time.Now() }
+func (realClock) Sleep(d time.Duration) { time.Sleep(d) }
+
+// backoffConfig configures the capped exponential backoff between discovery
+// re-triggers in the discovery wait loop.
+type backoffConfig struct {
+	initial time.Duration // interval before the first re-trigger
+	max     time.Duration // ceiling the interval grows toward
+}
+
+// waitForResource drives the discovery wait loop. It triggers a discovery scan
+// at t=0, then polls check on pollInterval, re-triggering discovery on a capped
+// exponential backoff schedule, until check reports the resource is present or
+// the outer timeout elapses. Re-triggering keeps the cloud scan fresh so a
+// resource that propagates into CloudControl's list index after the first scan
+// is still found, instead of polling one frozen scan until timeout.
+//
+// The clock is injected so callers in tests can advance time deterministically.
+// A failing trigger is non-fatal — it is logged and the loop continues, since a
+// transient admin-endpoint hiccup must not abort the wait — but it is tracked:
+// if every trigger attempt fails the returned error is trigger-specific rather
+// than a misleading not-found timeout. No re-trigger is issued once the time
+// remaining before the deadline drops below the poll interval (the scan grace),
+// since a scan started that late has almost no chance of completing in time.
+// waitDescription supplies the nouns waitForResource uses in its log lines and
+// error messages, so one loop can serve both the discovery wait ("discovery" /
+// "appear in inventory") and the out-of-band delete wait ("sync" / "leave
+// inventory") without either reporting the other's vocabulary.
+type waitDescription struct {
+	// trigger names what re-triggering does, e.g. "discovery" or "sync".
+	trigger string
+	// condition names what the check waits for, e.g. "leave inventory".
+	condition string
+}
+
+func waitForResource(
+	clk clock,
+	logf func(format string, args ...any),
+	timeout time.Duration,
+	backoff backoffConfig,
+	pollInterval time.Duration,
+	desc waitDescription,
+	trigger func() error,
+	check func() (bool, error),
+) error {
+	start := clk.Now()
+	deadline := start.Add(timeout)
+
+	var (
+		attempts       int   // discovery triggers issued
+		successes      int   // triggers that returned without error
+		lastTriggerErr error // last non-nil trigger error, for diagnostics
+	)
+
+	interval := backoff.initial
+	nextTriggerAt := start // fire the first trigger immediately
+
+	for {
+		now := clk.Now()
+		if !now.Before(deadline) {
+			break
+		}
+
+		if !now.Before(nextTriggerAt) {
+			// Always issue the first trigger; apply the near-deadline guard only
+			// to re-triggers (a re-scan started that late can't finish in time).
+			if attempts == 0 || deadline.Sub(now) >= pollInterval {
+				attempts++
+				if err := trigger(); err != nil {
+					lastTriggerErr = err
+					logf("%s trigger attempt %d failed (continuing): %v", desc.trigger, attempts, err)
+				} else {
+					successes++
+				}
+				nextTriggerAt = now.Add(interval)
+				if interval *= 2; interval > backoff.max {
+					interval = backoff.max
+				}
+			} else {
+				// Inside the near-deadline guard: stop scheduling re-triggers
+				// and just keep polling for the remaining window.
+				nextTriggerAt = deadline
+			}
+		}
+
+		found, err := check()
+		if err != nil {
+			logf("%s inventory check failed (will retry): %v", desc.trigger, err)
+		} else if found {
+			logf("resource observed to %s after %d %s trigger attempt(s) in %v", desc.condition, attempts, desc.trigger, clk.Now().Sub(start))
+			return nil
+		}
+
+		clk.Sleep(pollInterval)
+	}
+
+	if attempts > 0 && successes == 0 {
+		return fmt.Errorf("could not trigger %s: all %d trigger attempt(s) failed; last error: %v", desc.trigger, attempts, lastTriggerErr)
+	}
+	msg := fmt.Sprintf("timeout after %v: resource did not %s (%d %s trigger attempt(s))", timeout, desc.condition, attempts, desc.trigger)
+	if lastTriggerErr != nil {
+		msg += fmt.Sprintf("; last trigger error: %v", lastTriggerErr)
+	}
+	return errors.New(msg)
+}
+
+// WaitForResourceDiscovered waits for an out-of-band resource to be discovered:
+// it re-triggers discovery on a backoff schedule while polling the inventory for
+// the given type + nativeID (managed=false), until found or the timeout elapses.
+// Unlike WaitForResourceInInventory, this re-scans the cloud across the window so
+// CloudControl eventual-consistency lag on a freshly created resource is
+// tolerated rather than being fatal.
+func (h *TestHarness) WaitForResourceDiscovered(resourceType, nativeID string, timeout time.Duration) error {
+	backoff := getDiscoveryRetriggerBackoff()
+	h.t.Logf("Waiting for resource to be discovered: type=%s, nativeID=%s (timeout=%v, base re-trigger=%v)", resourceType, nativeID, timeout, backoff.initial)
+
+	return waitForResource(
+		realClock{},
+		h.t.Logf,
+		timeout,
+		backoff,
+		discoveryPollInterval,
+		waitDescription{trigger: "discovery", condition: "appear in inventory"},
+		h.TriggerDiscovery,
+		func() (bool, error) {
+			inventory, err := h.Inventory(fmt.Sprintf("type: %s managed: false", resourceType))
+			if err != nil {
+				return false, err
+			}
+			for _, res := range inventory.Resources {
+				if resNativeID, ok := res["NativeID"].(string); ok && resNativeID == nativeID {
+					h.t.Logf("Resource found in inventory: NativeID=%s", nativeID)
+					return true, nil
+				}
+			}
+			h.t.Logf("Resource not yet in inventory (found %d resources of type %s), polling...", len(inventory.Resources), resourceType)
+			return false, nil
+		},
+	)
+}
+
+// CreateUnmanagedResource creates unmanaged resources using the external plugin directly,
+// bypassing formae's validation and database storage. This method handles multi-resource
+// formas by creating all cloud resources in dependency order and resolving references
+// between them. Returns the NativeID of the LAST (main) resource for discovery verification.
+// Use CreateAllUnmanagedResources if you need info about all created resources.
+func (h *TestHarness) CreateUnmanagedResource(evaluatedJSON string) (string, error) {
+	createdResources, err := h.CreateAllUnmanagedResources(evaluatedJSON)
+	if err != nil {
+		return "", err
+	}
+
+	if len(createdResources) == 0 {
+		return "", fmt.Errorf("no resources were created")
+	}
+
+	// Return the last resource's NativeID (the main resource being tested)
+	return createdResources[len(createdResources)-1].NativeID, nil
+}
+
+// CreateAllUnmanagedResources creates ALL cloud resources in a forma using the external plugin
+// directly, handling dependencies and resolvable references between resources.
+// Resources are created in dependency order (resources without resolvables first).
+// Returns a slice of CreatedResourceInfo for all created resources (for cleanup).
+// pluginNamespaceFromForma returns the plugin namespace shared by the forma's
+// cloud resources (the segment before the first "::"), e.g. "AWS" for
+// "AWS::RDS::Database".
+func pluginNamespaceFromForma(evaluatedJSON string) (string, error) {
+	var forma pkgmodel.Forma
+	if err := json.Unmarshal([]byte(evaluatedJSON), &forma); err != nil {
+		return "", fmt.Errorf("failed to parse forma JSON: %w", err)
+	}
+
+	for i := range forma.Resources {
+		if strings.Contains(forma.Resources[i].Type, "::") {
+			return strings.Split(forma.Resources[i].Type, "::")[0], nil
+		}
+	}
+
+	return "", fmt.Errorf("no cloud resources found in forma")
+}
+
+// EnsurePluginLaunched launches the resource plugin for the forma's namespace on
+// the harness's own Ergo node and waits for it to announce itself, so the plugin
+// can be queried before any resource is created. It is idempotent: once the
+// plugin is running, further calls return immediately.
+//
+// The discovery test relies on this to read a resource descriptor — and skip a
+// type that is not discoverable — before provisioning the fixture's
+// infrastructure out of band.
+func (h *TestHarness) EnsurePluginLaunched(evaluatedJSON string) error {
+	if h.lastPluginNamespace != "" {
+		return nil
+	}
+
+	namespace, err := pluginNamespaceFromForma(evaluatedJSON)
+	if err != nil {
+		return err
+	}
+	h.t.Logf("Using plugin namespace: %s", namespace)
+
+	pluginBinaryPath, err := h.GetPluginBinaryPath(namespace)
+	if err != nil {
+		return fmt.Errorf("failed to get plugin binary path: %w", err)
+	}
+
+	if err := h.InitErgoNode(); err != nil {
+		return fmt.Errorf("failed to initialize Ergo node: %w", err)
+	}
+
+	if err := h.LaunchPluginDirect(pluginBinaryPath, namespace); err != nil {
+		return fmt.Errorf("failed to launch plugin: %w", err)
+	}
+
+	if err := h.WaitForPluginReady(namespace, 30*time.Second); err != nil {
+		return fmt.Errorf("plugin not ready: %w", err)
+	}
+
+	// Recorded only once the plugin is ready, so a failed launch does not make a
+	// retry look like an already-running plugin.
+	h.lastPluginBinaryPath = pluginBinaryPath
+	h.lastPluginNamespace = namespace
+
+	return nil
+}
+
+func (h *TestHarness) CreateAllUnmanagedResources(evaluatedJSON string) ([]CreatedResourceInfo, error) {
+	h.t.Log("Creating unmanaged resources via external plugin")
+
+	// Parse the evaluated JSON into a Forma object
+	var forma pkgmodel.Forma
+	if err := json.Unmarshal([]byte(evaluatedJSON), &forma); err != nil {
+		return nil, fmt.Errorf("failed to parse forma JSON: %w", err)
+	}
+
+	// Collect all cloud resources (those with "::" in the type)
+	var cloudResources []*pkgmodel.Resource
+	for i := range forma.Resources {
+		if strings.Contains(forma.Resources[i].Type, "::") {
+			// Make a copy to avoid modifying the original
+			res := forma.Resources[i]
+			cloudResources = append(cloudResources, &res)
+		}
+	}
+
+	if len(cloudResources) == 0 {
+		return nil, fmt.Errorf("no cloud resources found in forma")
+	}
+
+	h.t.Logf("Found %d cloud resource(s) to create", len(cloudResources))
+
+	// Sort resources by dependency order (resources without resolvables first)
+	sortedResources := h.sortResourcesByDependency(cloudResources)
+
+	if err := h.EnsurePluginLaunched(evaluatedJSON); err != nil {
+		return nil, err
+	}
+	namespace := h.lastPluginNamespace
+
+	// Find the target
+	if len(forma.Targets) == 0 {
+		return nil, fmt.Errorf("no targets found in forma")
+	}
+	target := forma.Targets[0]
+
+	// Create each resource in dependency order, tracking what was created
+	var createdResources []CreatedResourceInfo
+
+	for _, res := range sortedResources {
+		h.t.Logf("Creating resource: type=%s, label=%s", res.Type, res.Label)
+
+		// Strip Formae metadata tags from the resource properties
+		h.stripFormaeTags(res)
+
+		// Resolve any resolvable references using previously created resources.
+		// This must happen BEFORE stripNestedEmptyCollections to match the
+		// agent's order of operations (resolver.ConvertToPluginFormat then
+		// patch.StripNestedEmptyCollections). The resolvable markers ($res,
+		// $label, etc.) must be intact when the resolver runs; stripping first
+		// can corrupt the resolvable objects through the json round-trip.
+		resolvedProps, err := h.resolveResolvablesInProperties(res.Properties, createdResources)
+		if err != nil {
+			return createdResources, fmt.Errorf("failed to resolve resolvables for %s: %w", res.Label, err)
+		}
+		res.Properties = resolvedProps
+
+		// Strip nested empty collections ({}/[]) that PKL renders for unset
+		// nullable Listing/Mapping fields. Without this, K8S rejects resources
+		// with empty probe objects (e.g. livenessProbe: {}).
+		h.stripNestedEmptyCollections(res)
+
+		// Create the resource with retry on recoverable errors
+		label := fmt.Sprintf("create %s", res.Label)
+		finalProgress, err := h.retryOnRecoverable(label, func() (*pluginOperationResult, error) {
+			result, err := testutil.CallWithTimeout(h.ergoNode, "PluginCoordinator", CreateResourceRequest{
+				ResourceType: res.Type,
+				Namespace:    namespace,
+				Label:        res.Label,
+				Properties:   res.Properties,
+				Target:       target,
+			}, 120)
+			if err != nil {
+				return nil, fmt.Errorf("CreateResource call failed for %s: %w", res.Label, err)
+			}
+			createResult, ok := result.(CreateResourceResult)
+			if !ok {
+				return nil, fmt.Errorf("unexpected response type for %s: %T", res.Label, result)
+			}
+			return &pluginOperationResult{
+				operatorPID:     createResult.OperatorPID,
+				initialProgress: createResult.InitialProgress,
+				err:             createResult.Error,
+			}, nil
+		})
+		if err != nil {
+			return createdResources, err
+		}
+
+		h.t.Logf("Resource %s created successfully, NativeID: %s", res.Label, finalProgress.NativeID)
+
+		// Track the created resource for cleanup and for resolving subsequent resolvables
+		createdResources = append(createdResources, CreatedResourceInfo{
+			ResourceType: res.Type,
+			Label:        res.Label,
+			NativeID:     finalProgress.NativeID,
+			Properties:   finalProgress.ResourceProperties,
+		})
+
+		// Register the deletion as soon as the resource exists, not once the
+		// whole set does: a later resource can fail to create or to resolve its
+		// references, and anything already created is a real cloud resource that
+		// must still be cleaned up. Cleanups run in reverse registration order,
+		// so dependents are deleted before what they depend on.
+		created := createdResources[len(createdResources)-1]
+		h.RegisterCleanup(func() {
+			h.t.Logf("Deleting unmanaged resource: type=%s, label=%s, nativeID=%s", created.ResourceType, created.Label, created.NativeID)
+			if err := h.DeleteUnmanagedResource(created.ResourceType, created.NativeID, &target); err != nil {
+				h.t.Logf("Warning: failed to delete unmanaged resource %s: %v", created.Label, err)
+			}
+		})
+	}
+
+	h.t.Logf("Successfully created %d resource(s)", len(createdResources))
+	return createdResources, nil
+}
+
+// sortResourcesByDependency performs a topological sort on resources based on their
+// resolvable dependencies. Resources are ordered so that dependencies come before
+// the resources that depend on them. This handles arbitrary nesting depths.
+func (h *TestHarness) sortResourcesByDependency(resources []*pkgmodel.Resource) []*pkgmodel.Resource {
+	// Build a map of label -> resource for quick lookup
+	byLabel := make(map[string]*pkgmodel.Resource)
+	for _, res := range resources {
+		byLabel[res.Label] = res
+	}
+
+	// Build dependency graph: for each resource, find which other resources it depends on
+	// Dependencies are identified by the $label field in resolvable objects
+	dependencies := make(map[string][]string) // resource label -> labels of resources it depends on
+	for _, res := range resources {
+		deps := h.extractDependencyLabels(res.Properties)
+		dependencies[res.Label] = deps
+	}
+
+	// Perform topological sort using Kahn's algorithm
+	// Calculate in-degree (number of dependencies) for each resource
+	inDegree := make(map[string]int)
+	for _, res := range resources {
+		if _, exists := inDegree[res.Label]; !exists {
+			inDegree[res.Label] = 0
+		}
+		for _, depLabel := range dependencies[res.Label] {
+			// Only count dependencies that are in our resource set
+			if _, exists := byLabel[depLabel]; exists {
+				inDegree[res.Label]++
+			}
+		}
+	}
+
+	// Build reverse dependency map: which resources depend on each resource
+	dependents := make(map[string][]string)
+	for _, res := range resources {
+		for _, depLabel := range dependencies[res.Label] {
+			if _, exists := byLabel[depLabel]; exists {
+				dependents[depLabel] = append(dependents[depLabel], res.Label)
+			}
+		}
+	}
+
+	// Start with resources that have no dependencies (in-degree 0)
+	var queue []string
+	for _, res := range resources {
+		if inDegree[res.Label] == 0 {
+			queue = append(queue, res.Label)
+		}
+	}
+
+	// Process queue, adding resources to result as their dependencies are satisfied
+	var sortedLabels []string
+	for len(queue) > 0 {
+		// Pop from queue
+		label := queue[0]
+		queue = queue[1:]
+		sortedLabels = append(sortedLabels, label)
+
+		// Decrease in-degree for all resources that depend on this one
+		for _, dependentLabel := range dependents[label] {
+			inDegree[dependentLabel]--
+			if inDegree[dependentLabel] == 0 {
+				queue = append(queue, dependentLabel)
+			}
+		}
+	}
+
+	// Check for cycles (if we didn't process all resources, there's a cycle)
+	if len(sortedLabels) != len(resources) {
+		h.t.Logf("Warning: dependency cycle detected, falling back to original order")
+		return resources
+	}
+
+	// Convert sorted labels back to resources
+	result := make([]*pkgmodel.Resource, 0, len(resources))
+	for _, label := range sortedLabels {
+		result = append(result, byLabel[label])
+	}
+
+	return result
+}
+
+// extractDependencyLabels finds all resource labels that a resource depends on
+// by examining the $label fields in resolvable objects within its properties.
+func (h *TestHarness) extractDependencyLabels(properties json.RawMessage) []string {
+	if len(properties) == 0 {
+		return nil
+	}
+
+	resolvables := pkgmodel.FindResolvablesFromProperties(string(properties))
+
+	// Extract unique labels
+	labelSet := make(map[string]struct{})
+	for _, res := range resolvables {
+		if res.Label != "" {
+			labelSet[res.Label] = struct{}{}
+		}
+	}
+
+	labels := make([]string, 0, len(labelSet))
+	for label := range labelSet {
+		labels = append(labels, label)
+	}
+	return labels
+}
+
+// resolveResolvablesInProperties replaces resolvable references with actual values
+// from previously created resources.
+func (h *TestHarness) resolveResolvablesInProperties(properties json.RawMessage, createdResources []CreatedResourceInfo) (json.RawMessage, error) {
+	if len(properties) == 0 {
+		return properties, nil
+	}
+
+	propsStr := string(properties)
+
+	// Find all resolvables in the properties
+	resolvables := pkgmodel.FindResolvablesFromProperties(propsStr)
+
+	if len(resolvables) == 0 {
+		return properties, nil
+	}
+
+	// Build a map of created resources by label and type for quick lookup
+	createdByKey := make(map[string]CreatedResourceInfo)
+	for _, created := range createdResources {
+		key := created.Label + "::" + created.ResourceType
+		createdByKey[key] = created
+	}
+
+	// Resolve each resolvable. A reference that cannot be resolved is fatal:
+	// leaving it in place hands the plugin the envelope itself where it expects
+	// a value, and the plugin then fails for a reason unrelated to the actual
+	// problem.
+	for _, res := range resolvables {
+		// Look up the created resource by label and type
+		key := res.Label + "::" + res.Type
+		created, found := createdByKey[key]
+		if !found {
+			return properties, fmt.Errorf(
+				"could not resolve reference at %s: no created resource with label %q and type %q",
+				res.Path, res.Label, res.Type)
+		}
+
+		// Extract the property value from the created resource's properties
+		resolvedValue, err := h.extractPropertyValue(created.Properties, res.Property)
+		if err != nil {
+			return properties, fmt.Errorf(
+				"could not resolve reference at %s: property %q of resource %q: %w",
+				res.Path, res.Property, res.Label, err)
+		}
+
+		// Read off the envelope before it is replaced by the value.
+		opaque := referenceIsOpaque(propsStr, res)
+
+		// A $json reference names a path INTO the resolved value, so the field
+		// takes the scalar at that path rather than the document holding it.
+		if res.JSONPath != "" {
+			resolvedValue, err = extractJSONPath(resolvedValue, res.JSONPath)
+			if err != nil {
+				return properties, fmt.Errorf(
+					"could not resolve reference at %s: property %q of resource %q: %w",
+					res.Path, res.Property, res.Label, err)
+			}
+		}
+
+		// A resolved secret must never reach the test log, so an opaque
+		// reference is reported by what it points at and never by its value.
+		if opaque {
+			h.t.Logf("Resolved %s.%s -> (redacted)", res.Label, res.Property)
+		} else {
+			h.t.Logf("Resolved %s.%s -> %s", res.Label, res.Property, resolvedValue)
+		}
+
+		// Replace the resolvable object with the resolved value in the properties JSON
+		propsStr, err = sjson.Set(propsStr, res.Path, resolvedValue)
+		if err != nil {
+			return properties, fmt.Errorf("failed to set resolved value at path %s: %w", res.Path, err)
+		}
+	}
+
+	// Nothing may reach a plugin still carrying an envelope: a resolvable that
+	// survived the loop above would be presented as a value.
+	if remaining := pkgmodel.FindResolvablesFromProperties(propsStr); len(remaining) > 0 {
+		paths := make([]string, 0, len(remaining))
+		for _, r := range remaining {
+			paths = append(paths, r.Path)
+		}
+		return properties, fmt.Errorf("unresolved reference(s) remain after resolution at: %s",
+			strings.Join(paths, ", "))
+	}
+
+	return json.RawMessage(propsStr), nil
+}
+
+// referenceIsOpaque reports whether what a reference resolves to is a secret,
+// read from the envelope still standing at its path in properties. A reference
+// declares its own visibility — the resolvable itself carries none — and a
+// $json path counts regardless, because only a secret's value is addressed
+// that way.
+func referenceIsOpaque(properties string, res pkgmodel.ResolvableObject) bool {
+	if res.JSONPath != "" {
+		return true
+	}
+	return gjson.Get(properties, res.Path).Get("$visibility").String() == pkgmodel.VisibilityOpaque
+}
+
+// extractJSONPath returns the scalar at a gjson dotted path within resolved,
+// which must itself be a JSON document. Errors name only the path and the JSON
+// type — never the value, which for a $json reference is typically a secret.
+func extractJSONPath(resolved, path string) (string, error) {
+	if !gjson.Valid(resolved) {
+		return "", fmt.Errorf("$json path %q: resolved value is not valid JSON", path)
+	}
+	result := gjson.Get(resolved, path)
+	if !result.Exists() {
+		return "", fmt.Errorf("$json path %q not found", path)
+	}
+	switch result.Type {
+	case gjson.Null:
+		return "", fmt.Errorf("$json path %q resolved to null", path)
+	case gjson.String, gjson.Number, gjson.True, gjson.False:
+		return result.String(), nil
+	default:
+		kind := "object"
+		if result.IsArray() {
+			kind = "array"
+		}
+		return "", fmt.Errorf("$json path %q resolved to a JSON %s, expected a scalar", path, kind)
+	}
+}
+
+// extractPropertyValue extracts a property value from resource properties JSON.
+// The property path can be a simple name like "Id" or a nested path like "Arn".
+func (h *TestHarness) extractPropertyValue(properties json.RawMessage, propertyPath string) (string, error) {
+	if len(properties) == 0 {
+		return "", fmt.Errorf("empty properties")
+	}
+
+	result := gjson.GetBytes(properties, propertyPath)
+	if !result.Exists() {
+		// Try case-insensitive search for common property names
+		// AWS often returns Id but we might be looking for id
+		propsStr := string(properties)
+		parsed := gjson.Parse(propsStr)
+
+		var foundValue string
+		parsed.ForEach(func(key, val gjson.Result) bool {
+			if strings.EqualFold(key.String(), propertyPath) {
+				foundValue = val.String()
+				return false // stop iteration
+			}
+			return true
+		})
+
+		if foundValue != "" {
+			return foundValue, nil
+		}
+
+		return "", fmt.Errorf("property %s not found in resource properties", propertyPath)
+	}
+
+	return result.String(), nil
+}
+
+// DeleteUnmanagedResource deletes a resource directly via the external plugin, bypassing formae.
+// This method handles the full workflow: initializing the Ergo node, launching the plugin,
+// waiting for it to be ready, and deleting the resource via the actor system.
+// Uses the plugin binary path and namespace stored from the last CreateUnmanagedResource call.
+func (h *TestHarness) DeleteUnmanagedResource(resourceType, nativeID string, target *pkgmodel.Target) error {
+	h.t.Logf("Deleting unmanaged resource via external plugin: type=%s, nativeID=%s", resourceType, nativeID)
+
+	// Extract namespace from resource type (e.g., "AWS::S3::Bucket" -> "AWS")
+	namespace := strings.Split(resourceType, "::")[0]
+	h.t.Logf("Using plugin namespace: %s", namespace)
+
+	// Use stored plugin binary path, or try to look it up
+	pluginBinaryPath := h.lastPluginBinaryPath
+	if pluginBinaryPath == "" {
+		var err error
+		pluginBinaryPath, err = h.GetPluginBinaryPath(namespace)
+		if err != nil {
+			return fmt.Errorf("failed to get plugin binary path: %w", err)
+		}
+	}
+
+	// Initialize Ergo node if needed
+	if err := h.InitErgoNode(); err != nil {
+		return fmt.Errorf("failed to initialize Ergo node: %w", err)
+	}
+
+	// Launch the plugin
+	if err := h.LaunchPluginDirect(pluginBinaryPath, namespace); err != nil {
+		return fmt.Errorf("failed to launch plugin: %w", err)
+	}
+
+	// Wait for plugin to be ready
+	if err := h.WaitForPluginReady(namespace, 30*time.Second); err != nil {
+		return fmt.Errorf("plugin not ready: %w", err)
+	}
+
+	// Delete with retry on recoverable errors (e.g., IncorrectState when a dependency is still detaching)
+	_, err := h.retryOnRecoverable("delete", func() (*pluginOperationResult, error) {
+		result, err := testutil.CallWithTimeout(h.ergoNode, "PluginCoordinator", DeleteResourceRequest{
+			ResourceType: resourceType,
+			Namespace:    namespace,
+			NativeID:     nativeID,
+			Target:       *target,
+		}, 120)
+		if err != nil {
+			return nil, fmt.Errorf("DeleteResource call failed: %w", err)
+		}
+		deleteResult, ok := result.(DeleteResourceResult)
+		if !ok {
+			return nil, fmt.Errorf("unexpected response type: %T", result)
+		}
+		return &pluginOperationResult{
+			operatorPID:     deleteResult.OperatorPID,
+			initialProgress: deleteResult.InitialProgress,
+			err:             deleteResult.Error,
+		}, nil
+	})
+	if err != nil {
+		return err
+	}
+
+	h.t.Logf("Resource deleted successfully")
+	return nil
+}
+
+// pluginOperationResult holds the common fields from Create/Delete result types.
+type pluginOperationResult struct {
+	operatorPID     gen.PID
+	initialProgress resource.ProgressResult
+	err             string // non-empty if the coordinator returned an error
+}
+
+// oobOperationTimeout caps how long retryOnRecoverable will wait on a single
+// OOB Create or Delete RPC attempt to the plugin (via waitForOperationProgress).
+// Slow cloud resources — AWS::EKS::Cluster is ~10–15 min to reach ACTIVE,
+// RDS clusters and managed Kubernetes clusters on other providers are
+// similar — need a generous budget, so the default is 30 min. Plugin
+// authors can override via FORMAE_TEST_OOB_TIMEOUT (integer minutes,
+// matching FORMAE_TEST_TIMEOUT / FORMAE_TEST_DISCOVERY_TIMEOUT).
+//
+// This is distinct from FORMAE_TEST_OOB_DELETE_TIMEOUT, which bounds the
+// *post-sync inventory tombstone wait* after an OOB delete has already
+// returned from the plugin — a separate, much shorter wait handled in
+// runner.go's Step 24.
+const defaultOOBOperationTimeoutMinutes = 30
+
+func oobOperationTimeout() time.Duration {
+	if val := os.Getenv("FORMAE_TEST_OOB_TIMEOUT"); val != "" {
+		if minutes, err := strconv.Atoi(val); err == nil && minutes > 0 {
+			return time.Duration(minutes) * time.Minute
+		}
+	}
+	return defaultOOBOperationTimeoutMinutes * time.Minute
+}
+
+// retryOnRecoverable executes a plugin operation (create/delete) with retries on recoverable errors.
+// The opFn performs the actor call and returns the initial result. The caller's label is used for logging.
+func (h *TestHarness) retryOnRecoverable(label string, opFn func() (*pluginOperationResult, error)) (resource.ProgressResult, error) {
+	const maxRetries = 6
+	retryStrategy := resource.RetryStrategy{
+		MaxRetries: maxRetries,
+		BaseDelay:  10 * time.Second,
+	}
+	sleep := time.Sleep
+	if h.retrySleep != nil {
+		sleep = h.retrySleep
+	}
+
+	for attempt := 0; attempt <= maxRetries; attempt++ {
+		res, err := opFn()
+		if err != nil {
+			return resource.ProgressResult{}, err
+		}
+		if res.err != "" {
+			return resource.ProgressResult{}, fmt.Errorf("%s failed: %s", label, res.err)
+		}
+
+		progress := res.initialProgress
+		if progress.OperationStatus == resource.OperationStatusInProgress {
+			h.t.Logf("%s in progress, waiting for completion (timeout %s)...", label, oobOperationTimeout())
+			progress, err = h.waitForOperationProgress(res.operatorPID, progress, oobOperationTimeout())
+			if err != nil {
+				return resource.ProgressResult{}, fmt.Errorf("waiting for %s to complete: %w", label, err)
+			}
+		}
+
+		if progress.OperationStatus == resource.OperationStatusFailure {
+			if resource.IsRecoverable(progress.ErrorCode) && attempt < maxRetries {
+				delay := retryStrategy.Backoff(attempt + 1)
+				h.t.Logf("%s failed with recoverable error (code: %s), retry %d/%d after %s: %s",
+					label, progress.ErrorCode, attempt+1, maxRetries, delay, progress.StatusMessage)
+				sleep(delay)
+				continue
+			}
+			return resource.ProgressResult{}, fmt.Errorf("%s failed: %s (code: %s)", label, progress.StatusMessage, progress.ErrorCode)
+		}
+
+		return progress, nil
+	}
+
+	return resource.ProgressResult{}, fmt.Errorf("%s failed: exhausted %d retries", label, maxRetries)
+}
+
+// stripFormaeTags removes FormaeStackLabel and FormaeResourceLabel from resource tags
+func (h *TestHarness) stripFormaeTags(resource *pkgmodel.Resource) {
+	if len(resource.Properties) == 0 {
+		return
+	}
+
+	// Parse Properties into a map
+	var properties map[string]any
+	if err := json.Unmarshal(resource.Properties, &properties); err != nil {
+		h.t.Logf("Failed to unmarshal Properties for resource %s: %v", resource.Type, err)
+		return
+	}
+
+	// Check if Properties contains Tags
+	tagsInterface, hasTags := properties["Tags"]
+	if !hasTags {
+		return
+	}
+
+	// Tags could be an array of tag objects with Key/Value fields
+	tags, ok := tagsInterface.([]any)
+	if !ok {
+		h.t.Logf("Tags field is not an array, skipping tag stripping for resource %s", resource.Type)
+		return
+	}
+
+	// Filter out Formae metadata tags
+	filteredTags := make([]any, 0, len(tags))
+	for _, tagInterface := range tags {
+		tag, ok := tagInterface.(map[string]any)
+		if !ok {
+			// Keep non-map tags as-is
+			filteredTags = append(filteredTags, tagInterface)
+			continue
+		}
+
+		key, hasKey := tag["Key"].(string)
+		if !hasKey {
+			// Keep tags without a Key field
+			filteredTags = append(filteredTags, tagInterface)
+			continue
+		}
+
+		// Skip Formae metadata tags
+		if key == "FormaeStackLabel" || key == "FormaeResourceLabel" {
+			h.t.Logf("Stripping tag %s from resource %s", key, resource.Type)
+			continue
+		}
+
+		// Keep all other tags
+		filteredTags = append(filteredTags, tagInterface)
+	}
+
+	// Update properties with filtered tags
+	properties["Tags"] = filteredTags
+
+	// Marshal back to Properties
+	modifiedProperties, err := json.Marshal(properties)
+	if err != nil {
+		h.t.Logf("Failed to marshal modified Properties for resource %s: %v", resource.Type, err)
+		return
+	}
+
+	resource.Properties = modifiedProperties
+}
+
+// stripNestedEmptyCollections removes empty objects ({}) and arrays ([]) from
+// nested positions in resource properties. PKL renders unset nullable
+// Listing/Mapping fields as empty collections. The agent does this in
+// convertResourceForPlugin; the discovery test path bypasses the agent so we
+// must replicate it here.
+func (h *TestHarness) stripNestedEmptyCollections(resource *pkgmodel.Resource) {
+	if len(resource.Properties) == 0 {
+		return
+	}
+
+	var doc map[string]any
+	if err := json.Unmarshal(resource.Properties, &doc); err != nil {
+		return
+	}
+
+	for k, v := range doc {
+		doc[k] = stripEmptyNested(v)
+	}
+
+	cleaned, err := json.Marshal(doc)
+	if err != nil {
+		return
+	}
+	resource.Properties = cleaned
+}
+
+func stripEmptyNested(val any) any {
+	switch v := val.(type) {
+	case map[string]any:
+		cleaned := make(map[string]any, len(v))
+		for k, elem := range v {
+			if isEmptyCollection(elem) {
+				continue
+			}
+			cleaned[k] = stripEmptyNested(elem)
+		}
+		return cleaned
+	case []any:
+		cleaned := make([]any, 0, len(v))
+		for _, elem := range v {
+			cleaned = append(cleaned, stripEmptyNested(elem))
+		}
+		return cleaned
+	default:
+		return val
+	}
+}
+
+func isEmptyCollection(val any) bool {
+	switch v := val.(type) {
+	case map[string]any:
+		return len(v) == 0
+	case []any:
+		return len(v) == 0
+	default:
+		return false
+	}
+}
+
+// submitForma is a helper to submit forma JSON to the API
+func (h *TestHarness) submitForma(formaJSON []byte, filename string) (string, error) {
+	commandsURL := fmt.Sprintf("http://localhost:%d/api/v1/commands", h.agentPort)
+
+	// Create multipart writer
+	body := &bytes.Buffer{}
+	writer := multipart.NewWriter(body)
+
+	// Add form fields
+	_ = writer.WriteField("command", "apply")
+	_ = writer.WriteField("mode", "reconcile")
+
+	// Add file field with forma JSON
+	fileWriter, err := writer.CreateFormFile("file", filename+".json")
+	if err != nil {
+		return "", fmt.Errorf("failed to create form file: %w", err)
+	}
+	if _, err := fileWriter.Write(formaJSON); err != nil {
+		return "", fmt.Errorf("failed to write forma JSON: %w", err)
+	}
+
+	// Close the multipart writer
+	if err := writer.Close(); err != nil {
+		return "", fmt.Errorf("failed to close multipart writer: %w", err)
+	}
+
+	// Create the HTTP request
+	req, err := http.NewRequest("POST", commandsURL, body)
+	if err != nil {
+		return "", fmt.Errorf("failed to create request: %w", err)
+	}
+	req.Header.Set("Content-Type", writer.FormDataContentType())
+	req.Header.Set("Client-ID", "plugin-sdk-test")
+
+	// Send the request
+	client := &http.Client{}
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("failed to send request: %w", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	// Read response
+	respBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", fmt.Errorf("failed to read response: %w", err)
+	}
+
+	if resp.StatusCode != http.StatusAccepted {
+		return "", fmt.Errorf("unexpected status code %d: %s", resp.StatusCode, string(respBody))
+	}
+
+	// Parse response to get command ID
+	var submitResponse model.SubmitCommandResponse
+	if err := json.Unmarshal(respBody, &submitResponse); err != nil {
+		return "", fmt.Errorf("failed to parse response: %w", err)
+	}
+
+	return submitResponse.CommandID, nil
+}
+
+// GetResourceDescriptorFromCoordinator returns the ResourceDescriptor for a given resource type
+// by querying the TestPluginCoordinator. This requires the Ergo node to be started and the
+// plugin to have announced itself (e.g., after CreateUnmanagedResource has been called).
+func (h *TestHarness) GetResourceDescriptorFromCoordinator(resourceType string) (*plugin.ResourceDescriptor, error) {
+	if !h.ergoNodeStarted {
+		return nil, fmt.Errorf("Ergo node not started - call CreateUnmanagedResource first")
+	}
+
+	// Extract namespace from resource type (e.g., "AWS::S3::Bucket" -> "aws")
+	parts := strings.Split(resourceType, "::")
+	if len(parts) < 2 {
+		return nil, fmt.Errorf("invalid resource type format: %s", resourceType)
+	}
+	namespace := parts[0] // Keep original case - plugin announces with original case (e.g., "AWS")
+
+	// Query the TestPluginCoordinator for plugin info
+	result, err := testutil.Call(h.ergoNode, "PluginCoordinator", GetPluginInfoRequest{
+		Namespace: namespace,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("failed to query PluginCoordinator: %w", err)
+	}
+
+	pluginInfo, ok := result.(GetPluginInfoResult)
+	if !ok {
+		return nil, fmt.Errorf("unexpected response type from PluginCoordinator: %T", result)
+	}
+	if !pluginInfo.Found {
+		return nil, fmt.Errorf("plugin not found for namespace %s: %s", namespace, pluginInfo.Error)
+	}
+
+	// Find the descriptor for the requested resource type
+	for i := range pluginInfo.SupportedResources {
+		if pluginInfo.SupportedResources[i].Type == resourceType {
+			return &pluginInfo.SupportedResources[i], nil
+		}
+	}
+
+	return nil, fmt.Errorf("resource type %s not found in plugin %s", resourceType, namespace)
+}
+
+// PollStatus polls the command status until it reaches a terminal state or times out
+func (h *TestHarness) PollStatus(commandID string, timeout time.Duration) (string, error) {
+	h.t.Logf("Polling status for command %s", commandID)
+
+	deadline := time.Now().Add(timeout)
+	pollInterval := 2 * time.Second
+
+	for time.Now().Before(deadline) {
+		cmd, err := h.getCommand(commandID)
+		if err != nil {
+			// Retry on all errors — the command may not be visible yet (e.g.,
+			// the agent is still processing the apply request). Permanent
+			// failures (wrong URL, auth) are bounded by the poll timeout.
+			h.t.Logf("Status query error (retrying): %v", err)
+			time.Sleep(pollInterval)
+			continue
+		}
+
+		status := cmd.State
+		h.t.Logf("Command %s state: %s", commandID, status)
+
+		// Check for terminal states
+		switch status {
+		case "Success", "Completed":
+			return status, nil
+		case "Failed", "Canceled":
+			return status, commandFailureError(cmd)
+		case "NotStarted", "InProgress", "Pending", "Canceling":
+			// Continue polling
+			time.Sleep(pollInterval)
+		default:
+			return status, fmt.Errorf("unknown command state: %s", status)
+		}
+	}
+
+	return "", fmt.Errorf("timeout waiting for command %s to complete", commandID)
+}
+
+// GetStatus gets the current state of a command
+func (h *TestHarness) GetStatus(commandID string) (string, error) {
+	cmd, err := h.getCommand(commandID)
+	if err != nil {
+		return "", err
+	}
+	return cmd.State, nil
+}
+
+// getCommand fetches a command's full status record, including the per-update
+// error messages that explain a failure.
+func (h *TestHarness) getCommand(commandID string) (model.Command, error) {
+	stdout, stderr, err := h.runCLI(
+		"status",
+		"command",
+		"--config", h.configFile,
+		"--query", fmt.Sprintf("id:%s", commandID),
+		"--output-consumer", "machine",
+		"--output-schema", "json",
+	)
+	if err != nil {
+		return model.Command{}, fmt.Errorf("status command failed: %w\nStderr: %s\nStdout: %s", err, stderr, stdout)
+	}
+
+	// Parse JSON response from stdout only
+	var response model.ListCommandStatusResponse
+	if err := json.Unmarshal([]byte(stdout), &response); err != nil {
+		return model.Command{}, fmt.Errorf("failed to parse status response: %w\nStdout: %s", err, stdout)
+	}
+
+	if len(response.Commands) == 0 {
+		return model.Command{}, fmt.Errorf("no commands in status response")
+	}
+
+	return response.Commands[0], nil
+}
+
+// DeleteResourceOOB deletes a resource directly via the plugin, bypassing formae.
+// This simulates an out-of-band deletion (e.g., user deletes resource in the cloud console).
+func (h *TestHarness) DeleteResourceOOB(resourceType, nativeID string, target *pkgmodel.Target) error {
+	return h.DeleteUnmanagedResource(resourceType, nativeID, target)
+}
+
+// WaitForResourceRemovedFromInventory waits for a resource deleted out-of-band
+// to be tombstoned: it re-triggers sync on a backoff schedule while polling the
+// inventory for the given type + nativeID, until the resource is gone or the
+// timeout elapses.
+//
+// The re-trigger is the point. A single sync can start inside the cloud
+// provider's propagation window for the delete, read the resource as still
+// present, and persist that. Polling the inventory alone after that point can
+// never observe the tombstone, because nothing goes back out to the cloud, so
+// the wait burns its whole budget on state that is frozen and stale. Re-syncing
+// across the window is what makes eventual consistency tolerable here, exactly
+// as re-scanning does for WaitForResourceDiscovered.
+func (h *TestHarness) WaitForResourceRemovedFromInventory(resourceType, nativeID string, timeout time.Duration) error {
+	backoff := getOOBSyncRetriggerBackoff()
+	h.t.Logf("Waiting for resource to be removed from inventory: type=%s, nativeID=%s (timeout=%v, base re-trigger=%v)", resourceType, nativeID, timeout, backoff.initial)
+
+	return waitForResource(
+		realClock{},
+		h.t.Logf,
+		timeout,
+		backoff,
+		oobSyncPollInterval,
+		waitDescription{trigger: "sync", condition: "leave inventory"},
+		h.Sync,
+		func() (bool, error) {
+			inventory, err := h.Inventory(fmt.Sprintf("type: %s", resourceType))
+			if err != nil {
+				return false, err
+			}
+			for _, res := range inventory.Resources {
+				if resNativeID, ok := res["NativeID"].(string); ok && resNativeID == nativeID {
+					h.t.Logf("Resource still in inventory, polling...")
+					return false, nil
+				}
+			}
+			h.t.Logf("Resource removed from inventory: NativeID=%s", nativeID)
+			return true, nil
+		},
+	)
+}
+
+// pluginNameToPascalCase converts a hyphenated plugin name to PascalCase
+// for use in PKL import aliases. For example: "aws" -> "Aws", "auth-basic" -> "AuthBasic".
+func pluginNameToPascalCase(name string) string {
+	parts := strings.Split(name, "-")
+	var b strings.Builder
+	for _, part := range parts {
+		if len(part) == 0 {
+			continue
+		}
+		b.WriteString(strings.ToUpper(part[:1]))
+		if len(part) > 1 {
+			b.WriteString(part[1:])
+		}
+	}
+	return b.String()
+}

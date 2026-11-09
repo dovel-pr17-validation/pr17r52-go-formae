@@ -1,0 +1,388 @@
+// © 2025 Platform Engineering Labs Inc.
+//
+// SPDX-License-Identifier: FSL-1.1-ALv2
+
+package target_update
+
+import (
+	"encoding/json"
+	"fmt"
+	"log/slog"
+	"time"
+
+	"github.com/tidwall/gjson"
+
+	"github.com/platform-engineering-labs/formae/internal/metastructure/reaping"
+	"github.com/platform-engineering-labs/formae/internal/metastructure/resolver"
+	"github.com/platform-engineering-labs/formae/internal/metastructure/util"
+	"github.com/platform-engineering-labs/formae/pkg/api/model"
+	pkgmodel "github.com/platform-engineering-labs/formae/pkg/model"
+)
+
+type TargetDatastore interface {
+	LoadTarget(label string) (*pkgmodel.Target, error)
+	CountResourcesInTarget(targetLabel string) (int, error)
+	LoadResourceById(ksuid string) (*pkgmodel.Resource, error)
+}
+
+type TargetUpdateGenerator struct {
+	datastore TargetDatastore
+	// manifestDefaultReap is the plugin-manifest default reaping behaviour used
+	// when a target declares none. It is nil when no manifest default is wired,
+	// in which case admission falls through to the global reaping default.
+	manifestDefaultReap pkgmodel.ReapingBehaviour
+	// minReapDuration is the floor enforced on any target's explicit reap-after
+	// duration (see resolveTargetReaping). It defaults to reaping.MinReapDuration
+	// (derived from the nominal/default sync interval); WithMinReapDuration lets
+	// the caller align it with the agent's actual configured interval.
+	minReapDuration time.Duration
+}
+
+// NewTargetUpdateGenerator creates a new target update generator
+func NewTargetUpdateGenerator(ds TargetDatastore) *TargetUpdateGenerator {
+	return &TargetUpdateGenerator{
+		datastore:       ds,
+		minReapDuration: reaping.MinReapDuration,
+	}
+}
+
+// WithMinReapDuration overrides the reap-after admission floor. Production
+// wiring (FormaCommandFromForma) uses this to derive the floor from the
+// agent's actual configured synchronization interval rather than the
+// package's nominal default.
+func (tp *TargetUpdateGenerator) WithMinReapDuration(d time.Duration) *TargetUpdateGenerator {
+	tp.minReapDuration = d
+	return tp
+}
+
+// GenerateTargetUpdates determines what target changes are needed.
+// formaHasResources indicates whether the forma also declares resources;
+// on destroy, plain targets (no $ref) are only preserved when the forma
+// has resources (i.e., it's an application forma). Target-only formae
+// always delete their targets — this is how users explicitly remove targets.
+func (tp *TargetUpdateGenerator) GenerateTargetUpdates(targets []pkgmodel.Target, command pkgmodel.Command, formaHasResources bool) ([]TargetUpdate, error) {
+	var updates []TargetUpdate
+
+	for _, target := range targets {
+		update, hasUpdate, err := tp.determineTargetUpdate(target, command, formaHasResources)
+		if err != nil {
+			return nil, fmt.Errorf("failed to determine target update for %s: %w", target.Label, err)
+		}
+
+		if !hasUpdate {
+			slog.Debug("No target update needed", "label", target.Label)
+			continue
+		}
+
+		updates = append(updates, update)
+		slog.Debug("Generated target update",
+			"label", target.Label,
+			"operation", update.Operation)
+	}
+
+	return updates, nil
+}
+
+func (tp *TargetUpdateGenerator) determineTargetUpdate(target pkgmodel.Target, command pkgmodel.Command, formaHasResources bool) (TargetUpdate, bool, error) {
+	now := util.TimeNow()
+
+	existing, err := tp.datastore.LoadTarget(target.Label)
+	if err != nil {
+		return TargetUpdate{}, false, fmt.Errorf("failed to load target: %w", err)
+	}
+
+	// Handle destroy command. When the forma also has resources, only delete
+	// targets with $ref dependencies — plain targets (docker, us-east-1)
+	// survive because they exist independently. When the forma is target-only,
+	// always delete: the user is explicitly removing the target.
+	if command == pkgmodel.CommandDestroy {
+		if existing == nil {
+			slog.Debug("Target does not exist, nothing to delete", "label", target.Label)
+			return TargetUpdate{}, false, nil
+		}
+
+		if formaHasResources {
+			resolvables := resolver.ExtractResolvableURIsFromJSON(existing.Config)
+			if len(resolvables) == 0 {
+				slog.Debug("Target has no $ref dependencies, skipping delete", "label", target.Label)
+				return TargetUpdate{}, false, nil
+			}
+		}
+
+		// Cross-target DAG dependencies are built from ExistingTarget.Config
+		// by the DAG — not from RemainingResolvables, which would cause the
+		// target updater to attempt resolution during delete.
+		return TargetUpdate{
+			Target:         target,
+			ExistingTarget: existing,
+			Operation:      TargetOperationDelete,
+			State:          TargetUpdateStateNotStarted,
+			StartTs:        now,
+			ModifiedTs:     now,
+		}, true, nil
+	}
+
+	// Extract resolvables from target config
+	resolvables := resolver.ExtractResolvableURIsFromJSON(target.Config)
+	slog.Debug("Target resolvables extracted", "label", target.Label, "count", len(resolvables), "uris", resolvables)
+
+	// A target whose current row has been reaped is recovered on re-declare.
+	// Recovery must produce an update even when config/discoverable/schema are
+	// unchanged; otherwise an identical re-apply dedupes to no update, the
+	// datastore's UpdateTarget never runs, and the target stays reaped forever.
+	isReaped := existing != nil && existing.Health != nil &&
+		existing.Health.State == pkgmodel.TargetHealthStateReaped
+
+	// Handle apply command (create or update)
+	var operation TargetOperation
+	if existing == nil {
+		operation = TargetOperationCreate
+	} else {
+		// Namespace change is always an error
+		if existing.Namespace != target.Namespace {
+			return TargetUpdate{}, false, model.TargetAlreadyExistsError{
+				TargetLabel:       target.Label,
+				ExistingNamespace: existing.Namespace,
+				FormaNamespace:    target.Namespace,
+				MismatchType:      "namespace",
+			}
+		}
+
+		// Determine which configs to compare. When the new config contains
+		// $ref resolvables, resolve them first so we compare actual values.
+		existingResolved, newResolved, _, anyRefDangling, err := tp.resolvedConfigs(existing.Config, target.Config, resolvables)
+		if err != nil {
+			return TargetUpdate{}, false, fmt.Errorf("failed to resolve target configs: %w", err)
+		}
+
+		// Always prefer the incoming schema — it represents the current plugin
+		// version and may have new or updated hints. Fall back to the existing
+		// schema only when the incoming has none (e.g., plugin removed annotations).
+		schema := target.ConfigSchema
+		if len(schema.Hints) == 0 {
+			schema = existing.ConfigSchema
+		}
+		configChange := ClassifyConfigChange(existingResolved, newResolved, schema)
+		switch configChange {
+		case ConfigImmutableChange:
+			operation = TargetOperationReplace
+		case ConfigMutableChange:
+			operation = TargetOperationUpdate
+		case ConfigNoChange:
+			// Resolved values are identical, but we still need to update if:
+			// - The raw config format changed (e.g., plain value ↔ $ref wrapper)
+			// - The discoverable flag changed
+			// - The ConfigSchema changed (e.g., plugin annotations updated)
+			//
+			// Two configs with the same $refs are the same config: strip the
+			// cached $value and the derived $visibility/$strategy so identity
+			// alone drives the comparison. The one exception is a DANGLING ref
+			// (its source is gone): keep its stale cached $value so it surfaces
+			// as an update rather than being silently fed to a plugin. A ref that
+			// merely exposes no readable value (an opaque hash, an unsynced
+			// status) is not dangling and must not trigger a spurious update on
+			// every re-apply.
+			var existingForRaw, desiredForRaw json.RawMessage
+			if anyRefDangling {
+				existingForRaw = stripDerivedRefMetadataRaw(existing.Config)
+				desiredForRaw = stripDerivedRefMetadataRaw(target.Config)
+			} else {
+				existingForRaw = stripResolvableValuesRaw(existing.Config)
+				desiredForRaw = stripResolvableValuesRaw(target.Config)
+			}
+			if !util.JsonEqualRaw(existingForRaw, desiredForRaw) {
+				operation = TargetOperationUpdate
+			} else if existing.Discoverable != target.Discoverable {
+				operation = TargetOperationUpdate
+			} else if len(target.ConfigSchema.Hints) > 0 && !configSchemasEqual(existing.ConfigSchema, target.ConfigSchema) {
+				// Only update for schema changes when the incoming schema has hints.
+				// An empty incoming schema means the plugin/agent doesn't emit one —
+				// don't wipe existing metadata.
+				operation = TargetOperationUpdate
+			} else if isReaped {
+				// Config/discoverable/schema are all unchanged, but the target is
+				// reaped — force a recover update so UpdateTarget mints a fresh
+				// incarnation and resets health.
+				operation = TargetOperationUpdate
+			} else {
+				return TargetUpdate{}, false, nil
+			}
+		}
+	}
+
+	// Preserve existing ConfigSchema when the incoming target doesn't provide one.
+	// Without this, persistTargetUpdate would write an empty schema, silently
+	// clearing mutability metadata for future applies.
+	if len(target.ConfigSchema.Hints) == 0 && existing != nil && len(existing.ConfigSchema.Hints) > 0 {
+		target.ConfigSchema = existing.ConfigSchema
+	}
+
+	// Resolve the reaping behaviour at admission: explicit per-target > plugin
+	// manifest default > global default. Write the resolved behaviour back onto
+	// the target so the datastore persists the concrete reap_kind /
+	// reap_max_unreachable_seconds columns.
+	if err := tp.resolveTargetReaping(&target); err != nil {
+		return TargetUpdate{}, false, err
+	}
+
+	return TargetUpdate{
+		Target:               target,
+		ExistingTarget:       existing,
+		Operation:            operation,
+		State:                TargetUpdateStateNotStarted,
+		StartTs:              now,
+		ModifiedTs:           now,
+		RemainingResolvables: resolvables,
+	}, true, nil
+}
+
+// resolveTargetReaping applies the reaping precedence (explicit > manifest
+// default > global default), enforces the reap-after duration floor, and writes
+// the resolved behaviour back onto target.Reaping.
+func (tp *TargetUpdateGenerator) resolveTargetReaping(target *pkgmodel.Target) error {
+	explicit, err := pkgmodel.ParseReaping(target.Reaping)
+	if err != nil {
+		return fmt.Errorf("invalid reaping for target %s: %w", target.Label, err)
+	}
+
+	resolved := pkgmodel.ResolveReaping(explicit, tp.manifestDefaultReap)
+
+	if after, ok := resolved.(*pkgmodel.ReapAfter); ok {
+		floor := int64(tp.minReapDuration.Seconds())
+		if after.MaxUnreachableSeconds < floor {
+			return fmt.Errorf("target %s reap-after of %ds is below the minimum of %ds",
+				target.Label, after.MaxUnreachableSeconds, floor)
+		}
+	}
+
+	raw, err := pkgmodel.MarshalReaping(resolved)
+	if err != nil {
+		return fmt.Errorf("failed to marshal resolved reaping for target %s: %w", target.Label, err)
+	}
+	target.Reaping = raw
+	return nil
+}
+
+// isHashedAtRest reports whether a property value read from the datastore is an
+// opaque envelope whose $value is a SHA-256 digest rather than the plaintext.
+// Only a top-level envelope counts: a container that merely holds a hashed value
+// somewhere inside still has clear fields whose change must be detected, so it
+// is resolved normally.
+func isHashedAtRest(raw string) bool {
+	parsed := gjson.Parse(raw)
+	if !parsed.IsObject() {
+		return false
+	}
+	return parsed.Get("$hashed").Bool()
+}
+
+// configSchemasEqual returns true if two ConfigSchemas have identical hints.
+func configSchemasEqual(a, b pkgmodel.ConfigSchema) bool {
+	if len(a.Hints) != len(b.Hints) {
+		return false
+	}
+	for k, hintA := range a.Hints {
+		hintB, ok := b.Hints[k]
+		if !ok || hintA != hintB {
+			return false
+		}
+	}
+	return true
+}
+
+// resolvedConfigs returns the existing and new configs in a form suitable for
+// field-level comparison. Both configs are stripped of $ref metadata so that
+// ClassifyConfigChange compares plain values. When the new config contains
+// $ref resolvables, they are resolved from the DB first.
+// resolvedConfigs resolves the $refs in newConfig against the datastore and
+// returns both configs with $ref metadata stripped for comparison. The third
+// return reports whether ALL refs resolved to a value; the fourth reports
+// whether any ref is DANGLING — its source resource could not be loaded at all,
+// as opposed to loading fine but exposing no readable value at the path (e.g. an
+// opaque credential stored as a hash, or a status field not yet synced). A
+// dangling ref means a stale cached $value must surface as an update; a
+// present-but-unresolvable ref does not, because the reference identity is
+// unchanged.
+func (tp *TargetUpdateGenerator) resolvedConfigs(existingConfig, newConfig json.RawMessage, resolvables []pkgmodel.FormaeURI) (json.RawMessage, json.RawMessage, bool, bool, error) {
+	if len(resolvables) == 0 {
+		// No resolvables in new config, but existing config may still have
+		// $ref metadata from a previous apply. Strip it for comparison.
+		existingValues, err := resolver.ConvertToPluginFormat(existingConfig)
+		if err != nil {
+			return existingConfig, newConfig, true, false, nil
+		}
+		return existingValues, newConfig, true, false, nil
+	}
+
+	// Resolve $ref values from DB for comparison
+	resolvedConfig := make([]byte, len(newConfig))
+	copy(resolvedConfig, newConfig)
+
+	allResolved := true
+	anyDangling := false
+	for _, uri := range resolvables {
+		ksuid := uri.KSUID()
+		propertyPath := uri.PropertyPath()
+
+		resource, err := tp.datastore.LoadResourceById(ksuid)
+		if err != nil || resource == nil {
+			// The source resource is gone — a genuinely dangling ref.
+			slog.Debug("Cannot load $ref source from DB, treating as dangling",
+				"uri", uri, "error", err)
+			anyDangling = true
+			allResolved = false
+			continue
+		}
+
+		strVal, ok := resource.GetProperty(propertyPath)
+		if !ok {
+			// The source is present but exposes no readable value at this path
+			// (e.g. an opaque credential nested inside a hashed envelope, or an
+			// unsynced status field). The reference is valid, so this is not a
+			// change — compare by $ref identity rather than treating it as
+			// dangling.
+			slog.Debug("Referenced property not readable, comparing by ref identity",
+				"uri", uri, "propertyPath", propertyPath)
+			allResolved = false
+			continue
+		}
+
+		if isHashedAtRest(strVal) {
+			// The property IS readable, but what it holds is a digest, not the
+			// value: an opaque field is persisted as a whole hashed envelope, so
+			// GetProperty hands back that envelope's raw JSON. Resolving it would
+			// compare the desired side's digest against a stored side that carries
+			// no $value at all (reference-don't-store strips it), so a target with
+			// a secret-sourced credential would report a change on every re-apply.
+			// A digest can never participate in a value comparison, so fall back to
+			// $ref identity — the same treatment as an unreadable property, and
+			// explicitly NOT dangling.
+			slog.Debug("Referenced property is hashed at rest, comparing by ref identity",
+				"uri", uri, "propertyPath", propertyPath)
+			allResolved = false
+			continue
+		}
+
+		resolvedConfig, err = resolver.ResolvePropertyReferences(uri, resolvedConfig, strVal)
+		if err != nil {
+			allResolved = false
+			continue
+		}
+	}
+
+	if !allResolved {
+		return existingConfig, newConfig, false, anyDangling, nil
+	}
+
+	// Strip $ref metadata from both sides so ClassifyConfigChange sees plain values
+	existingValues, err := resolver.ConvertToPluginFormat(existingConfig)
+	if err != nil {
+		return existingConfig, json.RawMessage(resolvedConfig), true, false, nil
+	}
+	newValues, err := resolver.ConvertToPluginFormat(resolvedConfig)
+	if err != nil {
+		return existingConfig, json.RawMessage(resolvedConfig), true, false, nil
+	}
+
+	return existingValues, newValues, true, false, nil
+}

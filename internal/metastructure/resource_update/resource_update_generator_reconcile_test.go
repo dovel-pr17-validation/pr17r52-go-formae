@@ -1,0 +1,2091 @@
+// © 2025 Platform Engineering Labs Inc.
+//
+// SPDX-License-Identifier: FSL-1.1-ALv2
+
+//go:build unit
+
+package resource_update
+
+import (
+	"encoding/json"
+	"fmt"
+	"testing"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	"github.com/tidwall/gjson"
+
+	"github.com/platform-engineering-labs/formae/internal/metastructure/util"
+	apimodel "github.com/platform-engineering-labs/formae/pkg/api/model"
+	pkgmodel "github.com/platform-engineering-labs/formae/pkg/model"
+)
+
+func TestGenerateResourceUpdatesForReconcile(t *testing.T) {
+	tests := []struct {
+		name           string
+		forma          *pkgmodel.Forma
+		mode           pkgmodel.FormaApplyMode
+		existingStacks []*pkgmodel.Stack
+		setupDatastore func(*mockDatastore)
+		expectedCount  int
+		expectedError  string
+		validate       func(t *testing.T, updates []ResourceUpdate)
+	}{
+		{
+			name: "create new stack - all resources should be created",
+			mode: pkgmodel.FormaApplyModeReconcile,
+			forma: &pkgmodel.Forma{
+				Stacks: []pkgmodel.Stack{
+					{Label: "new-stack"},
+				},
+				Resources: []pkgmodel.Resource{
+					{
+						Label:      "test-instance",
+						Type:       "AWS::EC2::Instance",
+						Stack:      "new-stack",
+						Target:     "test-target",
+						Properties: json.RawMessage(`{"InstanceType": "t2.micro"}`),
+						Managed:    true,
+					},
+					{
+						Label:      "test-vpc",
+						Type:       "AWS::EC2::VPC",
+						Stack:      "new-stack",
+						Target:     "test-target",
+						Properties: json.RawMessage(`{"CidrBlock": "10.0.0.0/16"}`),
+						Managed:    true,
+					},
+				},
+			},
+			setupDatastore: func(ds *mockDatastore) {
+				// Don't persist anything - stack doesn't exist yet
+			},
+			expectedCount: 2,
+			validate: func(t *testing.T, updates []ResourceUpdate) {
+				assert.Len(t, updates, 2)
+
+				// Check that both resources have create operations
+				for _, update := range updates {
+					assert.Equal(t, OperationCreate, update.Operation)
+					assert.Equal(t, ResourceUpdateStateNotStarted, update.State)
+					assert.Equal(t, "new-stack", update.StackLabel)
+				}
+
+				// Check specific resources
+				resourceLabels := make(map[string]bool)
+				for _, update := range updates {
+					resourceLabels[update.DesiredState.Label] = true
+				}
+				assert.True(t, resourceLabels["test-instance"])
+				assert.True(t, resourceLabels["test-vpc"])
+			},
+		},
+		{
+			name: "res stack does not exist - should return error",
+			mode: pkgmodel.FormaApplyModeReconcile,
+			forma: &pkgmodel.Forma{
+				Stacks: []pkgmodel.Stack{
+					// Note: Stack is NOT defined here, only referenced by resource
+				},
+				Resources: []pkgmodel.Resource{
+					{
+						Label:   "test-instance",
+						Type:    "AWS::EC2::Instance",
+						Stack:   "non-existent-res-stack",
+						Target:  "test-target",
+						Managed: true,
+					},
+				},
+			},
+			setupDatastore: func(ds *mockDatastore) {
+				// Don't persist anything - res stack won't exist
+			},
+			expectedError: "stack res provided: non-existent-res-stack does not exist",
+		},
+		{
+			name: "res stack exists in database - should succeed and reconcile",
+			mode: pkgmodel.FormaApplyModeReconcile,
+			forma: &pkgmodel.Forma{
+				Stacks: []pkgmodel.Stack{
+					// Note: Stack is NOT defined here, only referenced by resource
+				},
+				Resources: []pkgmodel.Resource{
+					{
+						Label:      "new-instance",
+						Type:       "AWS::EC2::Instance",
+						Stack:      "existing-res-stack",
+						Target:     "test-target",
+						Properties: json.RawMessage(`{"InstanceType": "t3.micro"}`),
+						Managed:    true,
+					},
+				},
+			},
+			setupDatastore: func(ds *mockDatastore) {
+				// Persist the stack in database so reference is valid
+				existingStack := &pkgmodel.Forma{
+					Stacks: []pkgmodel.Stack{
+						{Label: "existing-res-stack"},
+					},
+					Resources: []pkgmodel.Resource{
+						{
+							Label:      "existing-instance",
+							Type:       "AWS::EC2::Instance",
+							Stack:      "existing-res-stack",
+							Target:     "test-target",
+							Properties: json.RawMessage(`{"InstanceType": "t2.micro"}`),
+							Managed:    true,
+						},
+					},
+				}
+				_, err := ds.StoreStack(existingStack, "test-command-setup")
+				if err != nil {
+					panic(err)
+				}
+			},
+			expectedCount: 2,
+			validate: func(t *testing.T, updates []ResourceUpdate) {
+				assert.Len(t, updates, 2)
+
+				// Should have one create (new-instance) and one delete (existing-instance)
+				// because reconcile mode assumes Forma is complete
+				operationsByType := make(map[OperationType]ResourceUpdate)
+				for _, update := range updates {
+					operationsByType[update.Operation] = update
+					assert.Equal(t, "existing-res-stack", update.StackLabel)
+				}
+
+				createOp := operationsByType[OperationCreate]
+				assert.Equal(t, "new-instance", createOp.DesiredState.Label)
+
+				deleteOp := operationsByType[OperationDelete]
+				assert.Equal(t, "existing-instance", deleteOp.DesiredState.Label)
+			},
+		},
+		{
+			name: "multiple stacks - create resources in each new stack",
+			mode: pkgmodel.FormaApplyModeReconcile,
+			forma: &pkgmodel.Forma{
+				Stacks: []pkgmodel.Stack{
+					{Label: "stack-1"},
+					{Label: "stack-2"},
+				},
+				Resources: []pkgmodel.Resource{
+					{
+						Label:  "instance-1",
+						Type:   "AWS::EC2::Instance",
+						Stack:  "stack-1",
+						Target: "test-target",
+					},
+					{
+						Label:  "instance-2",
+						Type:   "AWS::EC2::Instance",
+						Stack:  "stack-2",
+						Target: "test-target",
+					},
+				},
+			},
+			setupDatastore: func(ds *mockDatastore) {
+				// Don't persist anything - both stacks are new
+			},
+			expectedCount: 2,
+			validate: func(t *testing.T, updates []ResourceUpdate) {
+				assert.Len(t, updates, 2)
+
+				resourcesByStack := make(map[string]string)
+				operationsByResource := make(map[string]OperationType)
+				for _, update := range updates {
+					resourcesByStack[update.DesiredState.Label] = update.StackLabel
+					operationsByResource[update.DesiredState.Label] = update.Operation
+				}
+
+				assert.Equal(t, "stack-1", resourcesByStack["instance-1"])
+				assert.Equal(t, "stack-2", resourcesByStack["instance-2"])
+				assert.Equal(t, OperationCreate, operationsByResource["instance-1"])
+				assert.Equal(t, OperationCreate, operationsByResource["instance-2"])
+			},
+		},
+		{
+			name: "empty stack - no resources to create",
+			mode: pkgmodel.FormaApplyModeReconcile,
+			forma: &pkgmodel.Forma{
+				Stacks: []pkgmodel.Stack{
+					{Label: "empty-stack"},
+				},
+				Resources: []pkgmodel.Resource{},
+			},
+			setupDatastore: func(ds *mockDatastore) {
+				// Don't persist anything - stack doesn't exist yet
+			},
+			expectedCount: 0,
+			validate: func(t *testing.T, updates []ResourceUpdate) {
+				assert.Empty(t, updates)
+			},
+		},
+		{
+			name: "resources with different targets",
+			mode: pkgmodel.FormaApplyModeReconcile,
+			forma: &pkgmodel.Forma{
+				Stacks: []pkgmodel.Stack{
+					{Label: "multi-target-stack"},
+				},
+				Resources: []pkgmodel.Resource{
+					{
+						Label:  "aws-instance",
+						Type:   "AWS::EC2::Instance",
+						Stack:  "multi-target-stack",
+						Target: "aws-target",
+					},
+					{
+						Label:  "gcp-instance",
+						Type:   "GCP::Compute::Instance",
+						Stack:  "multi-target-stack",
+						Target: "gcp-target",
+					},
+				},
+			},
+			setupDatastore: func(ds *mockDatastore) {
+				// Don't persist anything - stack doesn't exist yet
+			},
+			expectedCount: 2,
+			validate: func(t *testing.T, updates []ResourceUpdate) {
+				assert.Len(t, updates, 2)
+
+				targetsByResource := make(map[string]string)
+				for _, update := range updates {
+					targetsByResource[update.DesiredState.Label] = update.DesiredState.Target
+					assert.Equal(t, OperationCreate, update.Operation)
+				}
+
+				assert.Equal(t, "aws-target", targetsByResource["aws-instance"])
+				assert.Equal(t, "gcp-target", targetsByResource["gcp-instance"])
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ds, _ := GetDeps(t)
+			if tt.setupDatastore != nil {
+				tt.setupDatastore(ds)
+			}
+
+			existingTargets := []*pkgmodel.Target{
+				{
+					Label:     "test-target",
+					Config:    json.RawMessage(`{"Region": "us-west-2"}`),
+					Namespace: "aws",
+				},
+				{
+					Label:     "aws-target",
+					Config:    json.RawMessage(`{"Region": "us-west-2"}`),
+					Namespace: "aws",
+				},
+				{
+					Label:     "gcp-target",
+					Config:    json.RawMessage(`{"Project": "my-project", "Region": "us-central1"}`),
+					Namespace: "gcp",
+				},
+			}
+
+			updates, err := GenerateResourceUpdates(
+				tt.forma,
+				pkgmodel.CommandApply,
+				tt.mode,
+				FormaCommandSourceUser,
+				existingTargets,
+				ds,
+				nil,
+				nil, false)
+
+			if tt.expectedError != "" {
+				assert.Error(t, err)
+				assert.Contains(t, err.Error(), tt.expectedError)
+				return
+			}
+
+			assert.NoError(t, err)
+			assert.Len(t, updates, tt.expectedCount)
+
+			if tt.validate != nil {
+				tt.validate(t, updates)
+			}
+		})
+	}
+}
+
+func TestGenerateResourceUpdatesForReconcile_NewResourceUpdateForCreate(t *testing.T) {
+	// Test that the NewResourceUpdateForCreate function is called correctly
+	ds, _ := GetDeps(t)
+
+	mode := pkgmodel.FormaApplyModeReconcile
+	forma := &pkgmodel.Forma{
+		Stacks: []pkgmodel.Stack{
+			{Label: "test-stack"},
+		},
+		Resources: []pkgmodel.Resource{
+			{
+				Label:      "test-instance",
+				Type:       "AWS::EC2::Instance",
+				Stack:      "test-stack",
+				Target:     "test-target",
+				Properties: json.RawMessage(`{"InstanceType": "t2.micro"}`),
+			},
+		},
+	}
+
+	targetMap := map[string]*pkgmodel.Target{
+		"test-target": {
+			Label:     "test-target",
+			Config:    json.RawMessage(`{"Region": "us-west-2"}`),
+			Namespace: "aws",
+		},
+	}
+
+	updates, err := generateResourceUpdatesForReconcile(
+		forma,
+		mode,
+		FormaCommandSourceUser,
+		targetMap,
+		targetMap,
+		ds,
+		nil,
+		false,
+	)
+
+	assert.NoError(t, err)
+	assert.Len(t, updates, 1)
+
+	update := updates[0]
+	assert.Equal(t, OperationCreate, update.Operation)
+	assert.Equal(t, "test-instance", update.DesiredState.Label)
+	assert.Equal(t, "AWS::EC2::Instance", update.DesiredState.Type)
+	assert.Equal(t, "test-stack", update.DesiredState.Stack)
+	assert.Equal(t, "test-target", update.DesiredState.Target)
+	assert.Equal(t, ResourceUpdateStateNotStarted, update.State)
+}
+
+func TestGenerateResourceUpdatesForReconcile_VPCSubnetReplaceScenario(t *testing.T) {
+	ds, _ := GetDeps(t)
+
+	vpcKsuid := util.NewID()
+	subnetKsuid := util.NewID()
+
+	// Setup existing stack with VPC -> Subnet dependency
+	existingVpc := pkgmodel.Resource{
+		Label:    "test-vpc",
+		Type:     "AWS::EC2::VPC",
+		Stack:    "infrastructure",
+		Target:   "test-target",
+		Ksuid:    vpcKsuid,
+		NativeID: "vpc-12345",
+		Schema: pkgmodel.Schema{
+			Identifier: "VpcId",
+			Hints: map[string]pkgmodel.FieldHint{
+				"CidrBlock": {
+					CreateOnly: true,
+				},
+			},
+			Fields: []string{"CidrBlock", "VpcId", "Tags"},
+		},
+		Properties: json.RawMessage(`{
+			"CidrBlock": "10.0.0.0/16",
+			"Tags": [
+			{
+			"Key": "Environment",
+			"Value": "Test"
+			}
+			]
+			}`),
+		ReadOnlyProperties: json.RawMessage(`{"VpcId": "vpc-12345"}`),
+	}
+
+	existingSubnet := pkgmodel.Resource{
+		Label:    "test-subnet",
+		Type:     "AWS::EC2::Subnet",
+		Stack:    "infrastructure",
+		Target:   "test-target",
+		Ksuid:    subnetKsuid,
+		NativeID: "subnet-12345",
+		Schema: pkgmodel.Schema{
+			Identifier: "SubnetId",
+			Hints: map[string]pkgmodel.FieldHint{
+				"CidrBlock": {
+					CreateOnly: true,
+				},
+				"VpcId": {
+					CreateOnly: true,
+				},
+			},
+			Fields: []string{"VpcId", "CidrBlock", "SubnetId", "Tags"},
+		},
+		Properties: fmt.Appendf(nil, `{
+			"VpcId": {
+			"$ref": "formae://%s#/VpcId",
+			"$value": "vpc-12345"
+			},
+			"CidrBlock": "10.0.1.0/24",
+			"Tags": [
+			{
+			"Key": "Environment",
+			"Value": "Test"
+			}
+			]
+			}`, vpcKsuid),
+		ReadOnlyProperties: json.RawMessage(`{"SubnetId": "subnet-12345"}`),
+	}
+
+	// persist existing stack
+	existingStack := &pkgmodel.Forma{
+		Stacks:    []pkgmodel.Stack{{Label: "infrastructure"}},
+		Resources: []pkgmodel.Resource{existingVpc, existingSubnet},
+	}
+	_, err := ds.StoreStack(existingStack, "test-command-4")
+	assert.NoError(t, err)
+
+	// Create new resources with changed VPC CidrBlock (requires replacement)
+	// Note: Only including the new VPC, not the subnet (subnet will be implicitly deleted)
+	newVpc := pkgmodel.Resource{
+		Label:    "test-vpc",
+		Type:     "AWS::EC2::VPC",
+		Stack:    "infrastructure",
+		Target:   "test-target",
+		Ksuid:    vpcKsuid,
+		NativeID: "new-vpc-67890",
+		Schema: pkgmodel.Schema{
+			Identifier: "VpcId",
+			Hints: map[string]pkgmodel.FieldHint{
+				"CidrBlock": {
+					CreateOnly: true,
+				},
+			},
+			Fields: []string{"CidrBlock", "VpcId", "Tags"},
+		},
+		Properties: json.RawMessage(`{
+			"CidrBlock": "172.16.0.0/16",
+			"Tags": [
+			{
+			"Key": "Environment",
+			"Value": "Test"
+			}
+			]
+			}`),
+	}
+
+	// Create apply command with replace mode - only new VPC, no subnet
+	mode := pkgmodel.FormaApplyModeReconcile
+	forma := &pkgmodel.Forma{
+		Stacks:    []pkgmodel.Stack{{Label: "infrastructure"}},
+		Resources: []pkgmodel.Resource{newVpc, existingSubnet}, // Only VPC, subnet will be implicitly deleted
+	}
+
+	targetMap := map[string]*pkgmodel.Target{
+		"test-target": {
+			Label:     "test-target",
+			Config:    json.RawMessage(`{"Region": "us-west-2"}`),
+			Namespace: "aws",
+		},
+	}
+
+	updates, err := generateResourceUpdatesForReconcile(
+		forma,
+		mode,
+		FormaCommandSourceUser,
+		targetMap,
+		targetMap,
+		ds,
+		nil,
+		false,
+	)
+
+	assert.NoError(t, err)
+
+	// Should have 4 operations: delete VPC, create VPC, delete Subnet, and create Subnet (Subnet is implicitly replaced)
+	assert.Len(t, updates, 4)
+
+	// Categorize updates by operation and resource
+	updatesByOperation := make(map[OperationType][]ResourceUpdate)
+	for _, update := range updates {
+		updatesByOperation[update.Operation] = append(updatesByOperation[update.Operation], update)
+	}
+
+	// Should have 2 deletes (VPC + Subnet) and 2 create (VPC + Subnet)
+	assert.Len(t, updatesByOperation[OperationDelete], 2, "Should have 2 delete operations")
+	assert.Len(t, updatesByOperation[OperationCreate], 2, "Should have 2 create operation")
+
+	// Check delete operations
+	deletesByLabel := make(map[string]ResourceUpdate)
+	for _, deleteUpdate := range updatesByOperation[OperationDelete] {
+		deletesByLabel[deleteUpdate.DesiredState.Label] = deleteUpdate
+	}
+
+	vpcDelete := deletesByLabel["test-vpc"]
+	assert.Equal(t, "AWS::EC2::VPC", vpcDelete.DesiredState.Type)
+	assert.Equal(t, "infrastructure", vpcDelete.StackLabel)
+	assert.JSONEq(t, string(existingVpc.Properties), string(vpcDelete.DesiredState.Properties))
+
+	subnetDelete := deletesByLabel["test-subnet"]
+	assert.Equal(t, "AWS::EC2::Subnet", subnetDelete.DesiredState.Type)
+	assert.Equal(t, "infrastructure", subnetDelete.StackLabel)
+	assert.JSONEq(t, string(existingSubnet.Properties), string(subnetDelete.DesiredState.Properties))
+
+	// Check create operation (should only be VPC)
+	createsByLabel := make(map[string]ResourceUpdate)
+	for _, createUpdate := range updatesByOperation[OperationCreate] {
+		createsByLabel[createUpdate.DesiredState.Label] = createUpdate
+	}
+
+	vpcCreate := createsByLabel["test-vpc"]
+	assert.Equal(t, "AWS::EC2::VPC", vpcCreate.DesiredState.Type)
+	assert.Equal(t, "infrastructure", vpcCreate.StackLabel)
+	assert.JSONEq(t, string(newVpc.Properties), string(vpcCreate.DesiredState.Properties))
+
+	subnetCreate := createsByLabel["test-subnet"]
+	assert.Equal(t, "AWS::EC2::Subnet", subnetCreate.DesiredState.Type)
+	assert.Equal(t, "infrastructure", subnetCreate.StackLabel)
+	assert.JSONEq(t, string(existingSubnet.Properties), string(subnetCreate.DesiredState.Properties))
+
+	assert.Equal(t, vpcCreate.GroupID, vpcDelete.GroupID, "VPC create and delete should have same group ID")
+	assert.Equal(t, subnetCreate.GroupID, subnetDelete.GroupID, "Subnet create and delete should have same group ID")
+
+	// Should not have subnet create
+	_, hasSubnetCreate := createsByLabel["test-subnet"]
+	assert.True(t, hasSubnetCreate, "Should have subnet create operation")
+
+	// Verify that VPC delete and create have the same group ID (VPC replacement)
+	assert.Equal(t, vpcDelete.GroupID, vpcCreate.GroupID, "VPC delete and create should have same group ID")
+
+	// Subnet delete should have a different group ID (implicit delete, not replacement)
+	assert.NotEqual(t, vpcDelete.GroupID, subnetDelete.GroupID, "VPC and Subnet should have different group IDs")
+
+	// All operations should be in NotStarted state
+	for _, update := range updates {
+		assert.Equal(t, ResourceUpdateStateNotStarted, update.State)
+	}
+
+	// Verify that CIDR block changed in the VPC create operation
+	vpcCreateParsed := gjson.Parse(string(vpcCreate.DesiredState.Properties))
+	assert.Equal(t, "172.16.0.0/16", vpcCreateParsed.Get("CidrBlock").String())
+
+	// Verify that old CIDR blocks are preserved in delete operations
+	vpcDeleteParsed := gjson.Parse(string(vpcDelete.DesiredState.Properties))
+	assert.Equal(t, "10.0.0.0/16", vpcDeleteParsed.Get("CidrBlock").String())
+
+	subnetDeleteParsed := gjson.Parse(string(subnetDelete.DesiredState.Properties))
+	assert.Equal(t, "10.0.1.0/24", subnetDeleteParsed.Get("CidrBlock").String())
+
+	// Verify dependencies are preserved
+	assert.Contains(t, subnetDelete.RemainingResolvables, pkgmodel.NewFormaeURI(vpcKsuid, "VpcId"))
+	assert.Empty(t, vpcDelete.RemainingResolvables, "VPC delete should have no dependencies")
+	assert.Empty(t, vpcCreate.RemainingResolvables, "VPC create should have no dependencies")
+}
+
+func TestGenerateResourceUpdatesForReconcile_VPCSubnetReplace_Adding_New_Subnet(t *testing.T) {
+	ds, _ := GetDeps(t)
+
+	vpcKsuid := util.NewID()
+	subnetKsuid := util.NewID()
+
+	// Setup existing stack with VPC -> Subnet dependency
+	existingVpc := pkgmodel.Resource{
+		Label:  "test-vpc",
+		Type:   "AWS::EC2::VPC",
+		Stack:  "infrastructure",
+		Target: "test-target",
+		Ksuid:  vpcKsuid,
+		Schema: pkgmodel.Schema{
+			Identifier: "VpcId",
+			Hints: map[string]pkgmodel.FieldHint{
+				"CidrBlock": {
+					CreateOnly: true,
+				},
+			},
+			Fields: []string{"CidrBlock", "VpcId", "Tags"},
+		},
+		Properties: json.RawMessage(`{
+			"CidrBlock": "10.0.0.0/16",
+			"Tags": [
+			{
+			"Key": "Environment",
+			"Value": "Test"
+			}
+			]
+			}`),
+		ReadOnlyProperties: json.RawMessage(`{"VpcId": "vpc-12345"}`),
+	}
+
+	newSubnet := pkgmodel.Resource{
+		Label:  "test-subnet",
+		Type:   "AWS::EC2::Subnet",
+		Stack:  "infrastructure",
+		Target: "test-target",
+		Ksuid:  subnetKsuid,
+		Schema: pkgmodel.Schema{
+			Identifier: "SubnetId",
+			Hints: map[string]pkgmodel.FieldHint{
+				"CidrBlock": {
+					CreateOnly: true,
+				},
+				"VpcId": {
+					CreateOnly: true,
+				},
+			},
+			Fields: []string{"VpcId", "CidrBlock", "SubnetId", "Tags"},
+		},
+		Properties: fmt.Appendf(nil, `{
+			"VpcId": {
+			"$ref": "formae://%s#/VpcId",
+			"$value": "vpc-12345"
+			},
+			"CidrBlock": "10.0.1.0/24",
+			"Tags": [
+			{
+			"Key": "Environment",
+			"Value": "Test"
+			}
+			]
+			}`, vpcKsuid),
+		ReadOnlyProperties: json.RawMessage(`{"SubnetId": "subnet-12345"}`),
+	}
+
+	// persist existing stack
+	existingStack := &pkgmodel.Forma{
+		Stacks:    []pkgmodel.Stack{{Label: "infrastructure"}},
+		Resources: []pkgmodel.Resource{existingVpc},
+	}
+	_, err := ds.StoreStack(existingStack, "test-command-5")
+	assert.NoError(t, err)
+
+	// Create new resources with changed VPC CidrBlock (requires replacement)
+	// Note: Only including the new VPC, not the subnet (subnet will be implicitly deleted)
+	newVpc := pkgmodel.Resource{
+		Label:  "test-vpc",
+		Type:   "AWS::EC2::VPC",
+		Stack:  "infrastructure",
+		Target: "test-target",
+		Ksuid:  vpcKsuid,
+		Schema: pkgmodel.Schema{
+			Identifier: "VpcId",
+			Hints: map[string]pkgmodel.FieldHint{
+				"CidrBlock": {
+					CreateOnly: true,
+				},
+			},
+			Fields: []string{"CidrBlock", "VpcId", "Tags"},
+		},
+		Properties: json.RawMessage(`{
+			"CidrBlock": "172.16.0.0/16",
+			"Tags": [
+			{
+			"Key": "Environment",
+			"Value": "Test"
+			}
+			]
+			}`),
+	}
+
+	// Create apply command with replace mode - only new VPC, no subnet
+	mode := pkgmodel.FormaApplyModeReconcile
+	forma := &pkgmodel.Forma{
+		Stacks:    []pkgmodel.Stack{{Label: "infrastructure"}},
+		Resources: []pkgmodel.Resource{newVpc, newSubnet}, // Only VPC, subnet will be implicitly deleted
+	}
+
+	targetMap := map[string]*pkgmodel.Target{
+		"test-target": {
+			Label:     "test-target",
+			Config:    json.RawMessage(`{"Region": "us-west-2"}`),
+			Namespace: "aws",
+		},
+	}
+
+	updates, err := generateResourceUpdatesForReconcile(
+		forma,
+		mode,
+		FormaCommandSourceUser,
+		targetMap,
+		targetMap,
+		ds,
+		nil,
+		false,
+	)
+
+	assert.NoError(t, err)
+
+	// Should have 3 operations: delete VPC, delete Subnet (implicit), create VPC
+	assert.Len(t, updates, 3)
+
+	// Categorize updates by operation and resource
+	updatesByOperation := make(map[OperationType][]ResourceUpdate)
+	for _, update := range updates {
+		updatesByOperation[update.Operation] = append(updatesByOperation[update.Operation], update)
+	}
+
+	// Should have 1 deletes (VPC only) and 2 create (VPC + Subnet)
+	assert.Len(t, updatesByOperation[OperationDelete], 1, "Should have 1 delete operations")
+	assert.Len(t, updatesByOperation[OperationCreate], 2, "Should have 1 create operation")
+
+	// Check delete operations
+	deletesByLabel := make(map[string]ResourceUpdate)
+	for _, deleteUpdate := range updatesByOperation[OperationDelete] {
+		deletesByLabel[deleteUpdate.DesiredState.Label] = deleteUpdate
+	}
+
+	vpcDelete := deletesByLabel["test-vpc"]
+	assert.Equal(t, "AWS::EC2::VPC", vpcDelete.DesiredState.Type)
+	assert.Equal(t, "infrastructure", vpcDelete.StackLabel)
+	assert.JSONEq(t, string(existingVpc.Properties), string(vpcDelete.DesiredState.Properties))
+
+	// Check create operation (should only be VPC)
+	createsByLabel := make(map[string]ResourceUpdate)
+	for _, createUpdate := range updatesByOperation[OperationCreate] {
+		createsByLabel[createUpdate.DesiredState.Label] = createUpdate
+	}
+
+	vpcCreate := createsByLabel["test-vpc"]
+	assert.Equal(t, "AWS::EC2::VPC", vpcCreate.DesiredState.Type)
+	assert.Equal(t, "infrastructure", vpcCreate.StackLabel)
+	assert.JSONEq(t, string(newVpc.Properties), string(vpcCreate.DesiredState.Properties))
+
+	subnetCreate := createsByLabel["test-subnet"]
+	assert.Equal(t, "AWS::EC2::Subnet", subnetCreate.DesiredState.Type)
+	assert.Equal(t, "infrastructure", subnetCreate.StackLabel)
+	assert.JSONEq(t, string(newSubnet.Properties), string(subnetCreate.DesiredState.Properties))
+
+	// Verify that VPC delete and create have the same group ID (VPC replacement)
+	assert.Equal(t, vpcDelete.GroupID, vpcCreate.GroupID, "VPC delete and create should have same group ID")
+
+	// Subnet delete should have a different group ID (implicit delete, not replacement)
+	assert.NotEqual(t, vpcDelete.GroupID, subnetCreate.GroupID, "VPC and Subnet should have different group IDs")
+
+	// All operations should be in NotStarted state
+	for _, update := range updates {
+		assert.Equal(t, ResourceUpdateStateNotStarted, update.State)
+	}
+
+	// Verify that CIDR block changed in the VPC create operation
+	vpcCreateParsed := gjson.Parse(string(vpcCreate.DesiredState.Properties))
+	assert.Equal(t, "172.16.0.0/16", vpcCreateParsed.Get("CidrBlock").String())
+
+	// Verify that old CIDR blocks are preserved in delete operations
+	vpcDeleteParsed := gjson.Parse(string(vpcDelete.DesiredState.Properties))
+	assert.Equal(t, "10.0.0.0/16", vpcDeleteParsed.Get("CidrBlock").String())
+
+	subnetDeleteParsed := gjson.Parse(string(subnetCreate.DesiredState.Properties))
+	assert.Equal(t, "10.0.1.0/24", subnetDeleteParsed.Get("CidrBlock").String())
+
+	// Verify dependencies are preserved
+	assert.Contains(t, subnetCreate.RemainingResolvables, pkgmodel.NewFormaeURI(vpcKsuid, "VpcId"))
+	assert.Empty(t, vpcDelete.RemainingResolvables, "VPC delete should have no dependencies")
+	assert.Empty(t, vpcCreate.RemainingResolvables, "VPC create should have no dependencies")
+}
+
+func TestGenerateResourceUpdatesForReconcile_MissingResolvable(t *testing.T) {
+	ds, _ := GetDeps(t)
+
+	resource := pkgmodel.Resource{
+		Label:  "pel-record-set",
+		Type:   "AWS::Route53::RecordSet",
+		Stack:  "infrastructure",
+		Target: "test-target",
+		Ksuid:  util.NewID(),
+		Schema: pkgmodel.Schema{
+			Identifier: "Id",
+			Hints: map[string]pkgmodel.FieldHint{
+				"HostedZoneId": {
+					CreateOnly: true,
+				},
+			},
+			Fields: []string{"HostedZoneId"},
+		},
+		Properties: json.RawMessage(`{"HostedZoneId": {"$ref":"formae://aws/infrastructure/does-not-exist#/Id"}}`),
+	}
+
+	mode := pkgmodel.FormaApplyModeReconcile
+	forma := &pkgmodel.Forma{
+		Stacks:    []pkgmodel.Stack{{Label: "infrastructure"}},
+		Resources: []pkgmodel.Resource{resource},
+	}
+
+	targetMap := map[string]*pkgmodel.Target{
+		"test-target": {
+			Label:     "test-target",
+			Config:    json.RawMessage(`{"Region": "us-west-2"}`),
+			Namespace: "aws",
+		},
+	}
+
+	updates, err := generateResourceUpdatesForApply(forma, mode, FormaCommandSourceUser, targetMap, targetMap, ds, nil, false)
+	assert.NoError(t, err)
+	assert.Len(t, updates, 1)
+}
+
+func TestResourceUpdatesForReconcile_GeneratesUpdateOperationsForUnmanagedResources(t *testing.T) {
+	ds, _ := GetDeps(t)
+
+	unmanagedResource := pkgmodel.Resource{
+		Label:  "my-s3-bucket",
+		Type:   "AWS::S3::Bucket",
+		Stack:  "$unmanaged",
+		Target: "test-target",
+		Schema: pkgmodel.Schema{
+			Identifier: "BucketName",
+			Hints: map[string]pkgmodel.FieldHint{
+				"BucketName": {
+					CreateOnly: true,
+				},
+			},
+			Fields: []string{"BucketName", "VersioningConfiguration", "Tags"},
+		},
+		Properties: json.RawMessage(`{
+			"BucketName": "my-unique-bucket-name",
+			"VersioningConfiguration": {
+			"Status": "Enabled"
+			},
+			"Tags": [
+			{
+			"Key": "Environment",
+			"Value": "Production"
+			}
+			]
+			}`),
+		Managed: false,
+	}
+
+	// First persist initial resource
+	unmanagedStack := &pkgmodel.Forma{
+		Stacks:    []pkgmodel.Stack{{Label: "$unmanaged"}},
+		Resources: []pkgmodel.Resource{unmanagedResource},
+	}
+	_, err := ds.StoreStack(unmanagedStack, "discovery-command-1")
+	assert.NoError(t, err)
+
+	managedResource := pkgmodel.Resource{
+		Label:  "my-s3-bucket",
+		Type:   "AWS::S3::Bucket",
+		Stack:  "infrastructure",
+		Target: "test-target",
+		Schema: pkgmodel.Schema{
+			Identifier: "BucketName",
+			Hints: map[string]pkgmodel.FieldHint{
+				"BucketName": {
+					CreateOnly: true,
+				},
+			},
+			Fields: []string{"BucketName", "VersioningConfiguration", "Tags"},
+		},
+		Properties: json.RawMessage(`{
+			"BucketName": "my-unique-bucket-name",
+			"VersioningConfiguration": {
+			"Status": "Enabled"
+			},
+			"Tags": [
+			{
+			"Key": "FormaeStackLabel",
+			"Value": "infrastructure"
+			},
+			{
+			"Key": "FormaeResourceLabel",
+			"Value": "my-s3-bucket"
+			},
+			{
+			"Key": "Environment",
+			"Value": "Production"
+			}
+			]
+			}`),
+		Managed: true,
+	}
+
+	mode := pkgmodel.FormaApplyModeReconcile
+	forma := &pkgmodel.Forma{
+		Stacks:    []pkgmodel.Stack{{Label: "infrastructure"}},
+		Resources: []pkgmodel.Resource{managedResource},
+	}
+
+	targetMap := map[string]*pkgmodel.Target{
+		"test-target": {
+			Label:     "test-target",
+			Config:    json.RawMessage(`{"Region": "us-west-2"}`),
+			Namespace: "aws",
+		},
+	}
+
+	updates, err := generateResourceUpdatesForApply(forma, mode, FormaCommandSourceUser, targetMap, targetMap, ds, nil, false)
+	assert.NoError(t, err)
+	assert.Len(t, updates, 1)
+	assert.Equal(t, OperationUpdate, updates[0].Operation)
+	assert.Equal(t, "my-s3-bucket", updates[0].DesiredState.Label)
+	assert.Equal(t, true, updates[0].DesiredState.Managed)
+}
+
+// TODO(naxty): are the remaining tests in this file needed?
+func TestGenerateResourceUpdatesForReconcile_Create(t *testing.T) {
+	ds, _ := GetDeps(t)
+
+	resource := pkgmodel.Resource{
+		Label:  "my-s3-bucket",
+		Type:   "AWS::S3::Bucket",
+		Stack:  "infrastructure",
+		Target: "test-target",
+		Schema: pkgmodel.Schema{
+			Identifier: "BucketName",
+			Hints: map[string]pkgmodel.FieldHint{
+				"BucketName": {
+					CreateOnly: true,
+				},
+			},
+			Fields: []string{"BucketName", "VersioningConfiguration", "Tags"},
+		},
+		Properties: json.RawMessage(`{
+			"BucketName": "my-unique-bucket-name",
+			"VersioningConfiguration": {
+			"Status": "Enabled"
+			},
+			"Tags": [
+			{
+			"Key": "Environment",
+			"Value": "Production"
+			}
+			]
+			}`),
+	}
+
+	mode := pkgmodel.FormaApplyModeReconcile
+	forma := &pkgmodel.Forma{
+		Stacks:    []pkgmodel.Stack{{Label: "infrastructure"}},
+		Resources: []pkgmodel.Resource{resource},
+	}
+
+	targetMap := map[string]*pkgmodel.Target{
+		"test-target": {
+			Label:     "test-target",
+			Config:    json.RawMessage(`{"Region": "us-west-2"}`),
+			Namespace: "aws",
+		},
+	}
+
+	updates, err := generateResourceUpdatesForApply(forma, mode, FormaCommandSourceUser, targetMap, targetMap, ds, nil, false)
+	assert.NoError(t, err)
+	assert.Len(t, updates, 1)
+	assert.Equal(t, OperationCreate, updates[0].Operation)
+	assert.Equal(t, "my-s3-bucket", updates[0].DesiredState.Label)
+}
+
+func TestGenerateResourceUpdatesForReconcile_StackExists_NoChanges(t *testing.T) {
+	ds, _ := GetDeps(t)
+
+	resource := pkgmodel.Resource{
+		Label:  "my-s3-bucket",
+		Type:   "AWS::S3::Bucket",
+		Stack:  "infrastructure",
+		Target: "test-target",
+		Schema: pkgmodel.Schema{
+			Identifier: "BucketName",
+			Hints: map[string]pkgmodel.FieldHint{
+				"BucketName": {
+					CreateOnly: true,
+				},
+			},
+			Fields: []string{"BucketName", "VersioningConfiguration", "Tags"},
+		},
+		Properties: json.RawMessage(`{
+			"BucketName": "my-unique-bucket-name",
+			"VersioningConfiguration": {
+			"Status": "Enabled"
+			},
+			"Tags": [
+			{
+			"Key": "Environment",
+			"Value": "Production"
+			}
+			]
+			}`),
+	}
+
+	// First persist the stack
+	existingStack := &pkgmodel.Forma{
+		Stacks:    []pkgmodel.Stack{{Label: "infrastructure"}},
+		Resources: []pkgmodel.Resource{resource},
+	}
+	_, err := ds.StoreStack(existingStack, "test-command-1")
+	assert.NoError(t, err)
+
+	mode := pkgmodel.FormaApplyModeReconcile
+	forma := existingStack
+
+	targetMap := map[string]*pkgmodel.Target{
+		"test-target": {
+			Label:     "test-target",
+			Config:    json.RawMessage(`{"Region": "us-west-2"}`),
+			Namespace: "aws",
+		},
+	}
+
+	updates, err := generateResourceUpdatesForApply(forma, mode, FormaCommandSourceUser, targetMap, targetMap, ds, nil, false)
+	assert.NoError(t, err)
+	assert.Len(t, updates, 0) // No changes needed
+}
+
+func TestGenerateResourceUpdatesForReconcile_ImplicitDelete(t *testing.T) {
+	ds, _ := GetDeps(t)
+
+	resource1 := pkgmodel.Resource{
+		Label:  "my-s3-bucket-keep",
+		Type:   "AWS::S3::Bucket",
+		Stack:  "infrastructure",
+		Target: "test-target",
+		Schema: pkgmodel.Schema{
+			Identifier: "BucketName",
+			Hints: map[string]pkgmodel.FieldHint{
+				"BucketName": {
+					CreateOnly: true,
+				},
+			},
+			Fields: []string{"BucketName", "VersioningConfiguration", "Tags"},
+		},
+		Properties: json.RawMessage(`{
+			"BucketName": "my-unique-bucket-name",
+			"VersioningConfiguration": {
+			"Status": "Enabled"
+			},
+			"Tags": [
+			{
+			"Key": "Environment",
+			"Value": "Production"
+			}
+			]
+			}`),
+		Managed: true,
+	}
+
+	resource2 := pkgmodel.Resource{
+		Label:  "my-s3-bucket-delete",
+		Type:   "AWS::S3::Bucket",
+		Stack:  "infrastructure",
+		Target: "test-target",
+		Schema: pkgmodel.Schema{
+			Identifier: "BucketName",
+			Hints: map[string]pkgmodel.FieldHint{
+				"BucketName": {
+					CreateOnly: true,
+				},
+			},
+			Fields: []string{"BucketName", "VersioningConfiguration", "Tags"},
+		},
+		Properties: json.RawMessage(`{
+			"BucketName": "my-unique-to-delete-name",
+			"VersioningConfiguration": {
+			"Status": "Enabled"
+			},
+			"Tags": [
+			{
+			"Key": "Environment",
+			"Value": "Production"
+			}
+			]
+			}`),
+		Managed: true,
+	}
+
+	// First persist stack with both resources
+	existingStack := &pkgmodel.Forma{
+		Stacks:    []pkgmodel.Stack{{Label: "infrastructure"}},
+		Resources: []pkgmodel.Resource{resource1, resource2},
+	}
+	_, err := ds.StoreStack(existingStack, "test-command-1")
+	assert.NoError(t, err)
+
+	// Apply with only first resource (second should be deleted)
+	mode := pkgmodel.FormaApplyModeReconcile
+	forma := &pkgmodel.Forma{
+		Stacks:    []pkgmodel.Stack{{Label: "infrastructure"}},
+		Resources: []pkgmodel.Resource{resource1},
+	}
+
+	targetMap := map[string]*pkgmodel.Target{
+		"test-target": {
+			Label:     "test-target",
+			Config:    json.RawMessage(`{"Region": "us-west-2"}`),
+			Namespace: "aws",
+		},
+	}
+
+	updates, err := generateResourceUpdatesForApply(forma, mode, FormaCommandSourceUser, targetMap, targetMap, ds, nil, false)
+	assert.NoError(t, err)
+	assert.Len(t, updates, 1)
+	assert.Equal(t, OperationDelete, updates[0].Operation)
+	assert.Equal(t, "my-s3-bucket-delete", updates[0].DesiredState.Label)
+}
+
+// Explicit stack declarations are complete reconcile boundaries even when only
+// generators remain. Generator ownership alone does not declare another stack.
+func TestGenerateResourceUpdatesForReconcile_GeneratorOnlyStackDeletesOmittedResources(t *testing.T) {
+	ds, _ := GetDeps(t)
+
+	resource := pkgmodel.Resource{
+		Label:  "my-s3-bucket",
+		Type:   "AWS::S3::Bucket",
+		Stack:  "infrastructure",
+		Target: "test-target",
+		Schema: pkgmodel.Schema{
+			Identifier: "BucketName",
+			Hints: map[string]pkgmodel.FieldHint{
+				"BucketName": {
+					CreateOnly: true,
+				},
+			},
+			Fields: []string{"BucketName"},
+		},
+		Properties: json.RawMessage(`{"BucketName": "my-unique-bucket-name"}`),
+		Managed:    true,
+	}
+
+	// First persist the stack with its resource.
+	existingStack := &pkgmodel.Forma{
+		Stacks:    []pkgmodel.Stack{{Label: "infrastructure"}},
+		Resources: []pkgmodel.Resource{resource},
+	}
+	_, err := ds.StoreStack(existingStack, "test-command-1")
+	assert.NoError(t, err)
+
+	generator := json.RawMessage(`{
+		"Type": "password",
+		"Label": "db-password",
+		"Stack": "infrastructure",
+		"Length": 24,
+		"Uppercase": true,
+		"Lowercase": true,
+		"Digits": true,
+		"Symbols": false,
+		"RequireEachIncludedType": true
+	}`)
+
+	// Apply a forma that declares only the generator on the same stack -
+	// the omitted resource is deleted, while the generator remains declared.
+	mode := pkgmodel.FormaApplyModeReconcile
+	forma := &pkgmodel.Forma{
+		Stacks:     []pkgmodel.Stack{{Label: "infrastructure"}},
+		Generators: []json.RawMessage{generator},
+	}
+
+	targetMap := map[string]*pkgmodel.Target{
+		"test-target": {
+			Label:     "test-target",
+			Config:    json.RawMessage(`{"Region": "us-west-2"}`),
+			Namespace: "aws",
+		},
+	}
+
+	other := resource
+	other.Stack = "undeclared-owner"
+	other.Label = "untouched"
+	_, err = ds.StoreStack(&pkgmodel.Forma{Stacks: []pkgmodel.Stack{{Label: other.Stack}}, Resources: []pkgmodel.Resource{other}}, "other-command")
+	assert.NoError(t, err)
+	forma.Generators = append(forma.Generators, json.RawMessage(`{"Type":"password","Label":"external","Stack":"undeclared-owner","Length":24,"Lowercase":true}`))
+
+	updates, err := generateResourceUpdatesForApply(forma, mode, FormaCommandSourceUser, targetMap, targetMap, ds, nil, false)
+	assert.NoError(t, err)
+	if assert.Len(t, updates, 1) {
+		assert.Equal(t, OperationDelete, updates[0].Operation)
+		assert.Equal(t, "infrastructure", updates[0].DesiredState.Stack)
+	}
+	patchUpdates, err := generateResourceUpdatesForApply(forma, pkgmodel.FormaApplyModePatch, FormaCommandSourceUser, targetMap, targetMap, ds, nil, false)
+	assert.NoError(t, err)
+	assert.Empty(t, patchUpdates, "patch generator maintenance does not delete omitted resources")
+}
+
+func TestGenerateResourceUpdatesForReconcile_Update(t *testing.T) {
+	ds, _ := GetDeps(t)
+
+	resourceInitial := pkgmodel.Resource{
+		Label:  "my-s3-bucket",
+		Type:   "AWS::S3::Bucket",
+		Stack:  "infrastructure",
+		Target: "test-target",
+		Schema: pkgmodel.Schema{
+			Identifier: "BucketName",
+			Hints: map[string]pkgmodel.FieldHint{
+				"BucketName": {
+					CreateOnly: true,
+				},
+			},
+			Fields: []string{"BucketName", "VersioningConfiguration", "Tags"},
+		},
+		Properties: json.RawMessage(`{
+			"BucketName": "my-unique-bucket-name",
+			"VersioningConfiguration": {
+			"Status": "Enabled"
+			},
+			"Tags": [
+			{
+			"Key": "Environment",
+			"Value": "Production"
+			}
+			]
+			}`),
+	}
+
+	resourceUpdate := pkgmodel.Resource{
+		Label:  "my-s3-bucket",
+		Type:   "AWS::S3::Bucket",
+		Stack:  "infrastructure",
+		Target: "test-target",
+		Schema: pkgmodel.Schema{
+			Identifier: "BucketName",
+			Hints: map[string]pkgmodel.FieldHint{
+				"BucketName": {
+					CreateOnly: true,
+				},
+			},
+			Fields: []string{"BucketName", "VersioningConfiguration", "Tags"},
+		},
+		Properties: json.RawMessage(`{
+			"BucketName": "my-unique-bucket-name",
+			"VersioningConfiguration": {
+			"Status": "Disabled"
+			},
+			"Tags": [
+			{
+			"Key": "Environment",
+			"Value": "Production"
+			}
+			]
+			}`),
+	}
+
+	// First persist initial resource
+	existingStack := &pkgmodel.Forma{
+		Stacks:    []pkgmodel.Stack{{Label: "infrastructure"}},
+		Resources: []pkgmodel.Resource{resourceInitial},
+	}
+	_, err := ds.StoreStack(existingStack, "test-command-1")
+	assert.NoError(t, err)
+
+	mode := pkgmodel.FormaApplyModeReconcile
+	forma := &pkgmodel.Forma{
+		Stacks:    []pkgmodel.Stack{{Label: "infrastructure"}},
+		Resources: []pkgmodel.Resource{resourceUpdate},
+	}
+
+	targetMap := map[string]*pkgmodel.Target{
+		"test-target": {
+			Label:     "test-target",
+			Config:    json.RawMessage(`{"Region": "us-west-2"}`),
+			Namespace: "aws",
+		},
+	}
+
+	updates, err := generateResourceUpdatesForApply(forma, mode, FormaCommandSourceUser, targetMap, targetMap, ds, nil, false)
+	assert.NoError(t, err)
+	assert.Len(t, updates, 1)
+	assert.Equal(t, OperationUpdate, updates[0].Operation)
+}
+
+func TestGenerateResourceUpdatesForReconcile_ReplaceCreateOnlyProperty(t *testing.T) {
+	ds, _ := GetDeps(t)
+
+	resourceInitial := pkgmodel.Resource{
+		Label:  "my-s3-bucket",
+		Type:   "AWS::S3::Bucket",
+		Stack:  "infrastructure",
+		Target: "test-target",
+		Schema: pkgmodel.Schema{
+			Identifier: "BucketName",
+			Hints: map[string]pkgmodel.FieldHint{
+				"BucketName": {
+					CreateOnly: true,
+				},
+			},
+			Fields: []string{"BucketName", "VersioningConfiguration", "Tags"},
+		},
+		Properties: json.RawMessage(`{
+			"BucketName": "my-unique-bucket-name",
+			"VersioningConfiguration": {
+			"Status": "Enabled"
+			},
+			"Tags": [
+			{
+			"Key": "Environment",
+			"Value": "Production"
+			}
+			]
+			}`),
+	}
+
+	resourceUpdate := pkgmodel.Resource{
+		Label:  "my-s3-bucket",
+		Type:   "AWS::S3::Bucket",
+		Stack:  "infrastructure",
+		Target: "test-target",
+		Schema: pkgmodel.Schema{
+			Identifier: "BucketName",
+			Hints: map[string]pkgmodel.FieldHint{
+				"BucketName": {
+					CreateOnly: true,
+				},
+			},
+			Fields: []string{"BucketName", "VersioningConfiguration", "Tags"},
+		},
+		Properties: json.RawMessage(`{
+			"BucketName": "my-unique-bucket-name-new",
+			"VersioningConfiguration": {
+			"Status": "Enabled"
+			},
+			"Tags": [
+			{
+			"Key": "Environment",
+			"Value": "Production"
+			}
+			]
+			}`),
+	}
+
+	// First persist initial resource
+	existingStack := &pkgmodel.Forma{
+		Stacks:    []pkgmodel.Stack{{Label: "infrastructure"}},
+		Resources: []pkgmodel.Resource{resourceInitial},
+	}
+	_, err := ds.StoreStack(existingStack, "test-command-1")
+	assert.NoError(t, err)
+
+	mode := pkgmodel.FormaApplyModeReconcile
+	forma := &pkgmodel.Forma{
+		Stacks:    []pkgmodel.Stack{{Label: "infrastructure"}},
+		Resources: []pkgmodel.Resource{resourceUpdate},
+	}
+
+	targetMap := map[string]*pkgmodel.Target{
+		"test-target": {
+			Label:     "test-target",
+			Config:    json.RawMessage(`{"Region": "us-west-2"}`),
+			Namespace: "aws",
+		},
+	}
+
+	updates, err := generateResourceUpdatesForApply(forma, mode, FormaCommandSourceUser, targetMap, targetMap, ds, nil, false)
+	assert.NoError(t, err)
+	assert.Len(t, updates, 2)
+
+	// Should have delete and create operations for replacement
+	operationsByType := make(map[OperationType]ResourceUpdate)
+	for _, update := range updates {
+		operationsByType[update.Operation] = update
+	}
+
+	deleteUpdate := operationsByType[OperationDelete]
+	createUpdate := operationsByType[OperationCreate]
+
+	assert.Equal(t, "my-s3-bucket", deleteUpdate.DesiredState.Label)
+	assert.Equal(t, "my-s3-bucket", createUpdate.DesiredState.Label)
+
+	// Should have same group ID for replacement
+	assert.NotEmpty(t, deleteUpdate.GroupID)
+	assert.Equal(t, deleteUpdate.GroupID, createUpdate.GroupID)
+}
+
+func TestGenerateResourceUpdatesForReconcile_ForwardReferenceToNewResource(t *testing.T) {
+	ds, _ := GetDeps(t)
+
+	existingSecretKsuid := util.NewID()
+	existingPolicyKsuid := util.NewID()
+
+	// Store existing stack with a Secret and a ResourcePolicy that references it
+	existingStack := &pkgmodel.Forma{
+		Stacks: []pkgmodel.Stack{{Label: "test-stack"}},
+		Resources: []pkgmodel.Resource{
+			{
+				Label:              "my-secret",
+				Type:               "AWS::SecretsManager::Secret",
+				Stack:              "test-stack",
+				Target:             "aws-target",
+				Ksuid:              existingSecretKsuid,
+				Properties:         json.RawMessage(`{"Name": "my-secret"}`),
+				ReadOnlyProperties: json.RawMessage(fmt.Sprintf(`{"Id": "arn:aws:secretsmanager:us-east-1:123456789:secret:my-secret-%s"}`, existingSecretKsuid[:6])),
+			},
+			{
+				Label:  "my-policy",
+				Type:   "AWS::SecretsManager::ResourcePolicy",
+				Stack:  "test-stack",
+				Target: "aws-target",
+				Ksuid:  existingPolicyKsuid,
+				Properties: json.RawMessage(fmt.Sprintf(`{
+					"SecretId": {
+						"$ref": "formae://%s#/Id"
+					},
+					"ResourcePolicy": {"Version": "2012-10-17"}
+				}`, existingSecretKsuid)),
+			},
+		},
+	}
+
+	_, err := ds.StoreStack(existingStack, "previous-command")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// New forma: replaces my-secret with my-secret-2 (new resource),
+	// and updates ResourcePolicy to reference the new secret.
+	// Uses GenerateResourceUpdates (not the lower-level function) so that
+	// translateFormaeReferencesToKsuid runs first — this assigns a new KSUID
+	// to my-secret-2 and translates the $res to $ref with that KSUID.
+	// The bug: LoadResolvablePropertiesFromStacks looks up the new KSUID in
+	// allResourcesByStack (DB-only), fails because my-secret-2 isn't in the DB.
+	forma := &pkgmodel.Forma{
+		Stacks: []pkgmodel.Stack{{Label: "test-stack"}},
+		Targets: []pkgmodel.Target{
+			{Label: "aws-target", Config: json.RawMessage(`{"Region": "us-east-1"}`), Namespace: "aws"},
+		},
+		Resources: []pkgmodel.Resource{
+			{
+				Label:      "my-secret-2",
+				Type:       "AWS::SecretsManager::Secret",
+				Stack:      "test-stack",
+				Target:     "aws-target",
+				Properties: json.RawMessage(`{"Name": "my-secret-2"}`),
+			},
+			{
+				Label:  "my-policy",
+				Type:   "AWS::SecretsManager::ResourcePolicy",
+				Stack:  "test-stack",
+				Target: "aws-target",
+				Properties: json.RawMessage(`{
+					"SecretId": {
+						"$res": true,
+						"$label": "my-secret-2",
+						"$type": "AWS::SecretsManager::Secret",
+						"$stack": "test-stack",
+						"$property": "Id"
+					},
+					"ResourcePolicy": {"Version": "2012-10-17"}
+				}`),
+			},
+		},
+	}
+
+	existingTargets := []*pkgmodel.Target{
+		{Label: "aws-target", Config: json.RawMessage(`{"Region": "us-east-1"}`), Namespace: "aws"},
+	}
+
+	updates, err := GenerateResourceUpdates(forma, pkgmodel.CommandApply, pkgmodel.FormaApplyModeReconcile, FormaCommandSourceUser, existingTargets, ds, nil, nil, false)
+
+	assert.NoError(t, err, "forward reference to new resource should not cause an error")
+	assert.NotEmpty(t, updates, "should produce resource updates")
+}
+
+func TestGenerateResourceUpdatesForReconcile_AddNewResourceWithForwardReference(t *testing.T) {
+	ds, _ := GetDeps(t)
+
+	existingQueueKsuid := util.NewID()
+
+	// Store existing stack with a Queue
+	existingStack := &pkgmodel.Forma{
+		Stacks: []pkgmodel.Stack{{Label: "test-stack"}},
+		Resources: []pkgmodel.Resource{
+			{
+				Label:              "my-queue",
+				Type:               "AWS::SQS::Queue",
+				Stack:              "test-stack",
+				Target:             "aws-target",
+				Ksuid:              existingQueueKsuid,
+				Properties:         json.RawMessage(`{"QueueName": "my-queue"}`),
+				ReadOnlyProperties: json.RawMessage(fmt.Sprintf(`{"QueueUrl": "https://sqs.us-east-1.amazonaws.com/123456789/%s"}`, existingQueueKsuid[:8])),
+			},
+		},
+	}
+
+	_, err := ds.StoreStack(existingStack, "previous-command")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// New forma: adds a QueueInlinePolicy that references the existing Queue.
+	// Also adds a SECOND Queue (my-queue-2) and a SECOND QueueInlinePolicy
+	// that references it via $res. The second queue is new — not in the DB.
+	// This triggers the bug: LoadResolvablePropertiesFromStacks can't find
+	// my-queue-2's KSUID in allResourcesByStack (DB-only).
+	forma := &pkgmodel.Forma{
+		Stacks: []pkgmodel.Stack{{Label: "test-stack"}},
+		Targets: []pkgmodel.Target{
+			{Label: "aws-target", Config: json.RawMessage(`{"Region": "us-east-1"}`), Namespace: "aws"},
+		},
+		Resources: []pkgmodel.Resource{
+			{
+				Label:      "my-queue",
+				Type:       "AWS::SQS::Queue",
+				Stack:      "test-stack",
+				Target:     "aws-target",
+				Properties: json.RawMessage(`{"QueueName": "my-queue"}`),
+			},
+			{
+				Label:  "my-queue-policy",
+				Type:   "AWS::SQS::QueueInlinePolicy",
+				Stack:  "test-stack",
+				Target: "aws-target",
+				Properties: json.RawMessage(fmt.Sprintf(`{
+					"Queue": {
+						"$res": true,
+						"$label": "my-queue",
+						"$type": "AWS::SQS::Queue",
+						"$stack": "test-stack",
+						"$property": "QueueUrl"
+					},
+					"PolicyDocument": {"Version": "2012-10-17"}
+				}`)),
+			},
+			{
+				Label:      "my-queue-2",
+				Type:       "AWS::SQS::Queue",
+				Stack:      "test-stack",
+				Target:     "aws-target",
+				Properties: json.RawMessage(`{"QueueName": "my-queue-2"}`),
+			},
+			{
+				Label:  "my-queue-policy-2",
+				Type:   "AWS::SQS::QueueInlinePolicy",
+				Stack:  "test-stack",
+				Target: "aws-target",
+				Properties: json.RawMessage(`{
+					"Queue": {
+						"$res": true,
+						"$label": "my-queue-2",
+						"$type": "AWS::SQS::Queue",
+						"$stack": "test-stack",
+						"$property": "QueueUrl"
+					},
+					"PolicyDocument": {"Version": "2012-10-17"}
+				}`),
+			},
+		},
+	}
+
+	existingTargets := []*pkgmodel.Target{
+		{Label: "aws-target", Config: json.RawMessage(`{"Region": "us-east-1"}`), Namespace: "aws"},
+	}
+
+	updates, err := GenerateResourceUpdates(forma, pkgmodel.CommandApply, pkgmodel.FormaApplyModeReconcile, FormaCommandSourceUser, existingTargets, ds, nil, nil, false)
+
+	assert.NoError(t, err, "adding new resource with forward reference should not cause an error")
+	assert.NotEmpty(t, updates, "should produce resource updates")
+
+	// Verify we get creates for the new resources
+	var createCount int
+	for _, u := range updates {
+		if u.Operation == OperationCreate {
+			createCount++
+		}
+	}
+	assert.GreaterOrEqual(t, createCount, 2, "should create at least my-queue-2 and my-queue-policy-2")
+}
+
+func TestTargetReplace_Reconcile_AllPortable(t *testing.T) {
+	ds, _ := GetDeps(t)
+
+	vpcKsuid := util.NewID()
+
+	existingVpc := pkgmodel.Resource{
+		Label:      "my-vpc",
+		Type:       "AWS::EC2::VPC",
+		Stack:      "infra",
+		Target:     "aws-prod",
+		Ksuid:      vpcKsuid,
+		Managed:    true,
+		Properties: json.RawMessage(`{"CidrBlock":"10.0.0.0/16"}`),
+		Schema: pkgmodel.Schema{
+			Fields:   []string{"CidrBlock"},
+			Portable: true,
+		},
+	}
+
+	existingStack := &pkgmodel.Forma{
+		Stacks:    []pkgmodel.Stack{{Label: "infra"}},
+		Resources: []pkgmodel.Resource{existingVpc},
+	}
+	_, err := ds.StoreStack(existingStack, "setup-cmd")
+	assert.NoError(t, err)
+
+	forma := &pkgmodel.Forma{
+		Stacks:  []pkgmodel.Stack{{Label: "infra"}},
+		Targets: []pkgmodel.Target{{Label: "aws-prod", Namespace: "aws", Config: json.RawMessage(`{"region":"us-west-2"}`)}},
+		Resources: []pkgmodel.Resource{
+			{
+				Label:      "my-vpc",
+				Type:       "AWS::EC2::VPC",
+				Stack:      "infra",
+				Target:     "aws-prod",
+				Ksuid:      vpcKsuid,
+				Managed:    true,
+				Properties: json.RawMessage(`{"CidrBlock":"10.0.0.0/16"}`),
+				Schema: pkgmodel.Schema{
+					Fields:   []string{"CidrBlock"},
+					Portable: true,
+				},
+			},
+		},
+	}
+
+	replacedTargets := map[string]bool{"aws-prod": true}
+
+	existingTargetMap := map[string]*pkgmodel.Target{
+		"aws-prod": {Label: "aws-prod", Namespace: "aws", Config: json.RawMessage(`{"region":"us-east-1"}`)},
+	}
+	desiredTargetMap := map[string]*pkgmodel.Target{
+		"aws-prod": {Label: "aws-prod", Namespace: "aws", Config: json.RawMessage(`{"region":"us-west-2"}`)},
+	}
+
+	updates, err := generateResourceUpdatesForReconcile(
+		forma,
+		pkgmodel.FormaApplyModeReconcile,
+		FormaCommandSourceUser,
+		existingTargetMap,
+		desiredTargetMap,
+		ds,
+		replacedTargets,
+		false,
+	)
+
+	assert.NoError(t, err)
+
+	deleteCount := 0
+	createCount := 0
+	for _, u := range updates {
+		if u.Operation == OperationDelete {
+			deleteCount++
+		}
+		if u.Operation == OperationCreate {
+			createCount++
+		}
+	}
+	assert.Equal(t, 1, deleteCount, "should have 1 delete for vpc")
+	assert.Equal(t, 1, createCount, "should have 1 create for vpc")
+}
+
+func TestTargetReplace_Reconcile_NonPortableInForma_Rejected(t *testing.T) {
+	ds, _ := GetDeps(t)
+
+	subnetKsuid := util.NewID()
+
+	existingSubnet := pkgmodel.Resource{
+		Label:      "my-subnet",
+		Type:       "AWS::EC2::Subnet",
+		Stack:      "infra",
+		Target:     "aws-prod",
+		Ksuid:      subnetKsuid,
+		Managed:    true,
+		Properties: json.RawMessage(`{"CidrBlock":"10.0.1.0/24"}`),
+		Schema: pkgmodel.Schema{
+			Fields:   []string{"CidrBlock"},
+			Portable: false,
+		},
+	}
+
+	existingStack := &pkgmodel.Forma{
+		Stacks:    []pkgmodel.Stack{{Label: "infra"}},
+		Resources: []pkgmodel.Resource{existingSubnet},
+	}
+	_, err := ds.StoreStack(existingStack, "setup-cmd")
+	assert.NoError(t, err)
+
+	forma := &pkgmodel.Forma{
+		Stacks:  []pkgmodel.Stack{{Label: "infra"}},
+		Targets: []pkgmodel.Target{{Label: "aws-prod", Namespace: "aws", Config: json.RawMessage(`{"region":"us-west-2"}`)}},
+		Resources: []pkgmodel.Resource{
+			{
+				Label:      "my-subnet",
+				Type:       "AWS::EC2::Subnet",
+				Stack:      "infra",
+				Target:     "aws-prod",
+				Ksuid:      subnetKsuid,
+				Managed:    true,
+				Properties: json.RawMessage(`{"CidrBlock":"10.0.1.0/24"}`),
+				Schema: pkgmodel.Schema{
+					Fields:   []string{"CidrBlock"},
+					Portable: false,
+				},
+			},
+		},
+	}
+
+	replacedTargets := map[string]bool{"aws-prod": true}
+
+	existingTargetMap := map[string]*pkgmodel.Target{
+		"aws-prod": {Label: "aws-prod", Namespace: "aws", Config: json.RawMessage(`{"region":"us-east-1"}`)},
+	}
+	desiredTargetMap := map[string]*pkgmodel.Target{
+		"aws-prod": {Label: "aws-prod", Namespace: "aws", Config: json.RawMessage(`{"region":"us-west-2"}`)},
+	}
+
+	_, err = generateResourceUpdatesForReconcile(
+		forma,
+		pkgmodel.FormaApplyModeReconcile,
+		FormaCommandSourceUser,
+		existingTargetMap,
+		desiredTargetMap,
+		ds,
+		replacedTargets,
+		false,
+	)
+
+	require.Error(t, err)
+	var nonPortableErr apimodel.NonPortableResourcesError
+	require.ErrorAs(t, err, &nonPortableErr)
+	assert.Equal(t, "aws-prod", nonPortableErr.TargetLabel)
+	assert.NotEmpty(t, nonPortableErr.Resources)
+}
+
+func TestTargetReplace_Reconcile_NonPortableNotInForma_Succeeds(t *testing.T) {
+	ds, _ := GetDeps(t)
+
+	vpcKsuid := util.NewID()
+	subnetKsuid := util.NewID()
+
+	existingVpc := pkgmodel.Resource{
+		Label:      "my-vpc",
+		Type:       "AWS::EC2::VPC",
+		Stack:      "infra",
+		Target:     "aws-prod",
+		Ksuid:      vpcKsuid,
+		Managed:    true,
+		Properties: json.RawMessage(`{"CidrBlock":"10.0.0.0/16"}`),
+		Schema: pkgmodel.Schema{
+			Fields:   []string{"CidrBlock"},
+			Portable: true,
+		},
+	}
+
+	existingSubnet := pkgmodel.Resource{
+		Label:      "my-subnet",
+		Type:       "AWS::EC2::Subnet",
+		Stack:      "infra",
+		Target:     "aws-prod",
+		Ksuid:      subnetKsuid,
+		Managed:    true,
+		Properties: json.RawMessage(`{"CidrBlock":"10.0.1.0/24"}`),
+		Schema: pkgmodel.Schema{
+			Fields:   []string{"CidrBlock"},
+			Portable: false,
+		},
+	}
+
+	existingStack := &pkgmodel.Forma{
+		Stacks:    []pkgmodel.Stack{{Label: "infra"}},
+		Resources: []pkgmodel.Resource{existingVpc, existingSubnet},
+	}
+	_, err := ds.StoreStack(existingStack, "setup-cmd")
+	assert.NoError(t, err)
+
+	// Forma includes only VPC. In reconcile mode, the subnet is NOT in the forma,
+	// so it will only be deleted (not recreated). Non-portable is fine for delete-only.
+	forma := &pkgmodel.Forma{
+		Stacks:  []pkgmodel.Stack{{Label: "infra"}},
+		Targets: []pkgmodel.Target{{Label: "aws-prod", Namespace: "aws", Config: json.RawMessage(`{"region":"us-west-2"}`)}},
+		Resources: []pkgmodel.Resource{
+			{
+				Label:      "my-vpc",
+				Type:       "AWS::EC2::VPC",
+				Stack:      "infra",
+				Target:     "aws-prod",
+				Ksuid:      vpcKsuid,
+				Managed:    true,
+				Properties: json.RawMessage(`{"CidrBlock":"10.0.0.0/16"}`),
+				Schema: pkgmodel.Schema{
+					Fields:   []string{"CidrBlock"},
+					Portable: true,
+				},
+			},
+		},
+	}
+
+	replacedTargets := map[string]bool{"aws-prod": true}
+
+	existingTargetMap := map[string]*pkgmodel.Target{
+		"aws-prod": {Label: "aws-prod", Namespace: "aws", Config: json.RawMessage(`{"region":"us-east-1"}`)},
+	}
+	desiredTargetMap := map[string]*pkgmodel.Target{
+		"aws-prod": {Label: "aws-prod", Namespace: "aws", Config: json.RawMessage(`{"region":"us-west-2"}`)},
+	}
+
+	updates, err := generateResourceUpdatesForReconcile(
+		forma,
+		pkgmodel.FormaApplyModeReconcile,
+		FormaCommandSourceUser,
+		existingTargetMap,
+		desiredTargetMap,
+		ds,
+		replacedTargets,
+		false,
+	)
+
+	assert.NoError(t, err)
+
+	// Subnet should only have delete ops (implicit reconcile delete), not create
+	for _, u := range updates {
+		if u.DesiredState.Label == "my-subnet" {
+			assert.Equal(t, OperationDelete, u.Operation, "subnet should only be deleted, not recreated")
+		}
+	}
+}
+
+func TestTargetReplace_Reconcile_TargetOnlyForma_RecreatesAll(t *testing.T) {
+	ds, _ := GetDeps(t)
+
+	vpcKsuid := util.NewID()
+
+	existingVpc := pkgmodel.Resource{
+		Label:      "my-vpc",
+		Type:       "AWS::EC2::VPC",
+		Stack:      "infra",
+		Target:     "aws-prod",
+		Ksuid:      vpcKsuid,
+		Managed:    true,
+		Properties: json.RawMessage(`{"CidrBlock":"10.0.0.0/16"}`),
+		Schema: pkgmodel.Schema{
+			Fields:   []string{"CidrBlock"},
+			Portable: true,
+		},
+	}
+
+	existingStack := &pkgmodel.Forma{
+		Stacks:    []pkgmodel.Stack{{Label: "infra"}},
+		Resources: []pkgmodel.Resource{existingVpc},
+	}
+	_, err := ds.StoreStack(existingStack, "setup-cmd")
+	assert.NoError(t, err)
+
+	// Forma has only a target, no resources, no stacks
+	forma := &pkgmodel.Forma{
+		Targets: []pkgmodel.Target{{Label: "aws-prod", Namespace: "aws", Config: json.RawMessage(`{"region":"us-west-2"}`)}},
+	}
+
+	replacedTargets := map[string]bool{"aws-prod": true}
+
+	existingTargetMap := map[string]*pkgmodel.Target{
+		"aws-prod": {Label: "aws-prod", Namespace: "aws", Config: json.RawMessage(`{"region":"us-east-1"}`)},
+	}
+	desiredTargetMap := map[string]*pkgmodel.Target{
+		"aws-prod": {Label: "aws-prod", Namespace: "aws", Config: json.RawMessage(`{"region":"us-west-2"}`)},
+	}
+
+	updates, err := generateResourceUpdatesForReconcile(
+		forma,
+		pkgmodel.FormaApplyModeReconcile,
+		FormaCommandSourceUser,
+		existingTargetMap,
+		desiredTargetMap,
+		ds,
+		replacedTargets,
+		false,
+	)
+
+	assert.NoError(t, err)
+
+	deleteCount := 0
+	createCount := 0
+	for _, u := range updates {
+		if u.Operation == OperationDelete {
+			deleteCount++
+		}
+		if u.Operation == OperationCreate {
+			createCount++
+		}
+	}
+	assert.Equal(t, 1, deleteCount, "should have 1 delete for vpc")
+	assert.Equal(t, 1, createCount, "should have 1 create for vpc")
+}
+
+// A resource that declares `alias` matches an existing managed row
+// by the alias label under reconcile mode. The renamed resource must surface
+// as a single OperationUpdate (label change in PriorState/DesiredState), NOT
+// as Delete(old) + Create(new). The destroy-and-recreate outcome would
+// destroy the underlying cloud object — exactly what this RFC avoids.
+func TestGenerateResourceUpdatesForReconcile_RenameViaAlias(t *testing.T) {
+	ds, _ := GetDeps(t)
+
+	ksuid := util.NewID()
+	existingStack := &pkgmodel.Forma{
+		Stacks: []pkgmodel.Stack{{Label: "prod"}},
+		Resources: []pkgmodel.Resource{
+			{
+				Ksuid:      ksuid,
+				Label:      "web-server",
+				Type:       "AWS::EC2::Instance",
+				Stack:      "prod",
+				Target:     "test-target",
+				NativeID:   "i-0abc1234",
+				Properties: json.RawMessage(`{"InstanceType": "t2.micro"}`),
+				Managed:    true,
+			},
+		},
+	}
+	if _, err := ds.StoreStack(existingStack, "setup"); err != nil {
+		t.Fatalf("setup: %v", err)
+	}
+
+	forma := &pkgmodel.Forma{
+		Stacks: []pkgmodel.Stack{{Label: "prod"}},
+		Resources: []pkgmodel.Resource{
+			{
+				Label:      "app-server",
+				Alias:      "web-server",
+				Type:       "AWS::EC2::Instance",
+				Stack:      "prod",
+				Target:     "test-target",
+				Properties: json.RawMessage(`{"InstanceType": "t2.micro"}`),
+				Managed:    true,
+			},
+		},
+	}
+	targetMap := map[string]*pkgmodel.Target{
+		"test-target": {Label: "test-target", Namespace: "aws", Config: json.RawMessage(`{}`)},
+	}
+
+	updates, err := generateResourceUpdatesForReconcile(
+		forma,
+		pkgmodel.FormaApplyModeReconcile,
+		FormaCommandSourceUser,
+		targetMap,
+		targetMap,
+		ds,
+		nil,
+		false,
+	)
+	require.NoError(t, err)
+	require.Len(t, updates, 1, "rename under reconcile must emit one update, not delete+create")
+
+	u := updates[0]
+	assert.Equal(t, OperationUpdate, u.Operation, "must be OperationUpdate, not Delete or Create")
+	assert.Equal(t, "web-server", u.PriorState.Label, "PriorState carries old label")
+	assert.Equal(t, "app-server", u.DesiredState.Label, "DesiredState carries new label")
+	assert.Equal(t, ksuid, u.DesiredState.Ksuid, "KSUID preserved across rename")
+}
+
+// Rename + property change in reconcile mode: still ONE OperationUpdate,
+// PatchDocument present for the property delta.
+func TestGenerateResourceUpdatesForReconcile_RenameWithPropertyChange(t *testing.T) {
+	ds, _ := GetDeps(t)
+
+	ksuid := util.NewID()
+	existingStack := &pkgmodel.Forma{
+		Stacks: []pkgmodel.Stack{{Label: "prod"}},
+		Resources: []pkgmodel.Resource{
+			{
+				Ksuid:      ksuid,
+				Label:      "web-server",
+				Type:       "AWS::EC2::Instance",
+				Stack:      "prod",
+				Target:     "test-target",
+				Schema:     pkgmodel.Schema{Fields: []string{"InstanceType"}},
+				Properties: json.RawMessage(`{"InstanceType": "t2.micro"}`),
+				Managed:    true,
+			},
+		},
+	}
+	if _, err := ds.StoreStack(existingStack, "setup"); err != nil {
+		t.Fatalf("setup: %v", err)
+	}
+
+	forma := &pkgmodel.Forma{
+		Stacks: []pkgmodel.Stack{{Label: "prod"}},
+		Resources: []pkgmodel.Resource{
+			{
+				Label:      "app-server",
+				Alias:      "web-server",
+				Type:       "AWS::EC2::Instance",
+				Stack:      "prod",
+				Target:     "test-target",
+				Schema:     pkgmodel.Schema{Fields: []string{"InstanceType"}},
+				Properties: json.RawMessage(`{"InstanceType": "t3.medium"}`),
+				Managed:    true,
+			},
+		},
+	}
+	targetMap := map[string]*pkgmodel.Target{
+		"test-target": {Label: "test-target", Namespace: "aws", Config: json.RawMessage(`{}`)},
+	}
+
+	updates, err := generateResourceUpdatesForReconcile(
+		forma,
+		pkgmodel.FormaApplyModeReconcile,
+		FormaCommandSourceUser,
+		targetMap,
+		targetMap,
+		ds,
+		nil,
+		false,
+	)
+	require.NoError(t, err)
+	require.Len(t, updates, 1)
+
+	u := updates[0]
+	assert.Equal(t, OperationUpdate, u.Operation)
+	assert.Equal(t, "web-server", u.PriorState.Label)
+	assert.Equal(t, "app-server", u.DesiredState.Label)
+	assert.NotNil(t, u.DesiredState.PatchDocument, "patch document expected for property change")
+}
+
+// Bring-under-management + rename in a single reconcile.
+// The forma's resource declares the NEW human label and an alias to the
+// discovery default. The unmanaged row sits at the discovery default in the
+// $unmanaged stack. Reconcile must emit ONE OperationUpdate pairing the
+// unmanaged row with the new declaration (KSUID + NativeID preserved),
+// NOT a Create for the new label.
+func TestGenerateResourceUpdatesForReconcile_BringingUnderManagementAndRename(t *testing.T) {
+	ds, _ := GetDeps(t)
+
+	ksuid := util.NewID()
+	// Seed an unmanaged row at the discovery default label.
+	if _, err := ds.StoreStack(&pkgmodel.Forma{
+		Resources: []pkgmodel.Resource{
+			{
+				Ksuid:      ksuid,
+				Label:      "i-0abc1234",
+				Type:       "AWS::EC2::Instance",
+				Stack:      "$unmanaged",
+				Target:     "test-target",
+				NativeID:   "i-0abc1234",
+				Properties: json.RawMessage(`{"InstanceType": "t2.micro"}`),
+				Managed:    false,
+			},
+		},
+	}, "discovery"); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	forma := &pkgmodel.Forma{
+		Stacks: []pkgmodel.Stack{{Label: "prod"}},
+		Resources: []pkgmodel.Resource{
+			{
+				Label:      "web-server",
+				Alias:      "i-0abc1234",
+				Type:       "AWS::EC2::Instance",
+				Stack:      "prod",
+				Target:     "test-target",
+				Properties: json.RawMessage(`{"InstanceType": "t2.micro"}`),
+				Managed:    true,
+			},
+		},
+	}
+	targetMap := map[string]*pkgmodel.Target{
+		"test-target": {Label: "test-target", Namespace: "aws", Config: json.RawMessage(`{}`)},
+	}
+
+	updates, err := generateResourceUpdatesForReconcile(
+		forma,
+		pkgmodel.FormaApplyModeReconcile,
+		FormaCommandSourceUser,
+		targetMap,
+		targetMap,
+		ds,
+		nil,
+		false,
+	)
+	require.NoError(t, err)
+	require.Len(t, updates, 1, "bring-under-management + rename must emit one update, not Create+leave-orphan")
+
+	u := updates[0]
+	assert.Equal(t, OperationUpdate, u.Operation, "must be OperationUpdate, not Create")
+	assert.Equal(t, "i-0abc1234", u.PriorState.Label, "PriorState carries discovery default label")
+	assert.Equal(t, "$unmanaged", u.PriorState.Stack, "PriorState in $unmanaged")
+	assert.Equal(t, "web-server", u.DesiredState.Label, "DesiredState carries new human label")
+	assert.Equal(t, "prod", u.DesiredState.Stack, "DesiredState in target stack")
+	assert.Equal(t, ksuid, u.DesiredState.Ksuid, "KSUID preserved across import+rename")
+	assert.Equal(t, "i-0abc1234", u.DesiredState.NativeID, "NativeID preserved")
+}

@@ -1,0 +1,123 @@
+name: formae-container
+
+on:
+  workflow_dispatch:
+    inputs:
+      pel_n:
+        description: 'PEL build revision. If set, the image tag becomes <git-tag>-pel-<pel_n>. Leave empty for the plain <git-tag> name used by the release flow.'
+        required: false
+        type: string
+        default: ''
+      tag:
+        description: 'Exact release tag to build (X.Y.Z or X.Y.Z-dev.N). Leave empty to take the tag of the ref being built.'
+        required: false
+        type: string
+        default: ''
+  workflow_call:
+    inputs:
+      pel_n:
+        type: string
+        required: false
+        default: ''
+      tag:
+        type: string
+        required: false
+        default: ''
+
+jobs:
+
+  container_linux:
+    runs-on: ubuntu-latest
+
+    env:
+      REGISTRY: ghcr.io
+      IMAGE_NAME: ${{ github.repository }}
+
+    permissions:
+      contents: read
+      packages: write
+      attestations: write
+      id-token: write
+
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: Log in to the container registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set VERSION and CHANNEL
+        # Tag-to-channel mapping mirrors formae-actions/plugin-build.yml:
+        #   X.Y.Z         -> stable
+        #   X.Y.Z-dev[.N] -> dev
+        # The channel must match an orbital channel exactly; an earlier
+        # version of this script forwarded `dev.N` verbatim, which orbital
+        # rejects ("No install candidates found").
+        shell: bash
+        run: |
+          # The tag names the release. When the ref being built is itself a
+          # tag, that tag is the release; `git describe` is only for builds
+          # from a branch, and it is ambiguous when several tags point at the
+          # same commit (a stable tag cut on a commit that already carries its
+          # last dev tag).
+          tag="${{ inputs.tag }}"
+          if [[ -z "$tag" && "${{ github.ref_type }}" == "tag" ]]; then
+            tag="${{ github.ref_name }}"
+          fi
+          if [[ -z "$tag" ]]; then
+            tag=$(git describe --tags --abbrev=0 --match "[0-9]*" --match "v[0-9]*")
+          fi
+          version="${tag#v}"
+          if [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "CHANNEL=stable" >> "$GITHUB_ENV"
+            echo "VERSION=$version" >> "$GITHUB_ENV"
+          elif [[ "$version" =~ ^([0-9]+\.[0-9]+\.[0-9]+)-dev(\.[0-9]+)?$ ]]; then
+            echo "CHANNEL=dev" >> "$GITHUB_ENV"
+            echo "VERSION=${BASH_REMATCH[1]}" >> "$GITHUB_ENV"
+          else
+            echo "::error::unsupported tag pattern '${tag}'; expected X.Y.Z or X.Y.Z-dev[.N]"
+            exit 1
+          fi
+          # The image tag is the original git tag, plus an optional -pel-N
+          # suffix when pel_n is set (workflow_dispatch invocations that
+          # bake in custom plugins on top of an upstream release).
+          if [[ -n "${{ inputs.pel_n }}" ]]; then
+            echo "IMAGE_TAG=${tag}-pel-${{ inputs.pel_n }}" >> "$GITHUB_ENV"
+          else
+            echo "IMAGE_TAG=${tag}" >> "$GITHUB_ENV"
+          fi
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=raw,value=${{ env.IMAGE_TAG }}
+          flavor: |
+            latest=false
+
+      - name: Build and push container image
+        id: push
+        uses: docker/build-push-action@v6
+        with:
+          context: ./
+          platforms: linux/amd64, linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            VERSION=${{ env.VERSION }}
+            CHANNEL=${{ env.CHANNEL }}

@@ -1,0 +1,1185 @@
+// © 2025 Platform Engineering Labs Inc.
+//
+// SPDX-License-Identifier: FSL-1.1-ALv2
+
+package discovery
+
+import (
+	"encoding/json"
+	"errors"
+	"fmt"
+	"log/slog"
+	"maps"
+	"net/url"
+	"slices"
+	"strings"
+	"time"
+
+	"ergo.services/actor/statemachine"
+	"ergo.services/ergo/gen"
+	"github.com/google/uuid"
+	"github.com/tidwall/gjson"
+	"github.com/tidwall/sjson"
+
+	"github.com/platform-engineering-labs/formae/internal/constants"
+	"github.com/platform-engineering-labs/formae/internal/datastore"
+	"github.com/platform-engineering-labs/formae/internal/metastructure/actornames"
+	"github.com/platform-engineering-labs/formae/internal/metastructure/changeset"
+	"github.com/platform-engineering-labs/formae/internal/metastructure/config"
+	"github.com/platform-engineering-labs/formae/internal/metastructure/forma_command"
+	"github.com/platform-engineering-labs/formae/internal/metastructure/forma_persister"
+	"github.com/platform-engineering-labs/formae/internal/metastructure/messages"
+	"github.com/platform-engineering-labs/formae/internal/metastructure/resolver"
+	"github.com/platform-engineering-labs/formae/internal/metastructure/resource_update"
+	"github.com/platform-engineering-labs/formae/internal/metastructure/target_update"
+	"github.com/platform-engineering-labs/formae/internal/metastructure/util"
+	pkgmodel "github.com/platform-engineering-labs/formae/pkg/model"
+	"github.com/platform-engineering-labs/formae/pkg/plugin"
+	"github.com/platform-engineering-labs/formae/pkg/plugin/resource"
+)
+
+// Discovery is the component responsible for automated resource discovery. On a configured interval, discovery will
+// scan all non block-listed targets for resources that are marked as discoverable by the resource plugins.
+//
+// The state transitions are as follows:
+//
+//				+-----------------------+
+//			 -->|         Idle          |---
+//			|   +-----------------------+   |
+//			|                               |
+//			|                               |
+//			|                               |
+//			|                               |
+//			|                               |                 -
+//			|                               |
+//			|   +-----------------------+   |
+//			 ---|      Discovering      |<---
+//				+-----------------------+
+
+type Discovery struct {
+	statemachine.StateMachine[DiscoveryData]
+}
+
+type hierarchyNode struct {
+	resourceType string
+	discoverable bool
+	children     map[*hierarchyNode][]plugin.ListParameter
+}
+
+func (n *hierarchyNode) hasChildren() bool {
+	return len(n.children) > 0
+}
+
+func NewDiscovery() gen.ProcessBehavior {
+	return &Discovery{}
+}
+
+// Messages processed by Discovery
+
+type Discover struct{}
+
+type ResumeScanning struct{}
+
+const (
+	StateIdle        = gen.Atom("Idle")
+	StateDiscovering = gen.Atom("Discovering")
+
+	// InitialDelay is the delay before the first discovery run after startup
+	// to allow the plugins to register.
+	InitialDelay = 10 * time.Second
+
+	// discoveryTickName is the GenericTimeout name used for the periodic
+	// re-arm. Setting a new timer with this name auto-cancels any prior one,
+	// so exactly one periodic tick is in flight at any time.
+	discoveryTickName = gen.Atom("discovery-tick")
+)
+
+// rescheduleAction returns the action that schedules the next periodic
+// discovery. Auto-cancel-on-replace semantics of the named GenericTimeout
+// guarantee a single periodic chain.
+func rescheduleAction(data DiscoveryData) []statemachine.Action {
+	if !data.discoveryCfg.Enabled {
+		return nil
+	}
+	return []statemachine.Action{statemachine.GenericTimeout{
+		Name:     discoveryTickName,
+		Duration: data.discoveryCfg.Interval,
+		Message:  Discover{},
+	}}
+}
+
+type DiscoveryData struct {
+	ds                            datastore.Datastore
+	serverCfg                     *pkgmodel.ServerConfig
+	discoveryCfg                  *pkgmodel.DiscoveryConfig
+	targets                       map[string]pkgmodel.Target
+	resourceHierarchy             map[string]*hierarchyNode
+	resourceDescriptors           map[string]plugin.ResourceDescriptor
+	queuedListOperations          map[string][]ListOperation
+	outstandingListOperations     map[string]ListOperation
+	outstandingSyncCommands       map[string]ListOperation
+	recentlyDiscoveredResourceIDs map[string]struct{}
+	timeStarted                   time.Time
+	summary                       map[string]int
+	// typesWithChildrenQueued tracks parent types (keyed by type#target) that have had
+	// child discovery queued this cycle. Prevents duplicate queueing when multiple
+	// listings complete for the same parent type.
+	typesWithChildrenQueued map[string]struct{}
+	// nativeIDsByCommand stores NativeIDs of resources being synced, keyed by command ID.
+	// Used in syncCompleted to discover children only for newly synced parents.
+	nativeIDsByCommand map[string][]string
+	// pauseCount tracks the number of active pause requests. When > 0, Discovery
+	// will not start new list operations, but will allow outstanding operations
+	// to complete. Uses reference counting to support multiple concurrent pausers.
+	pauseCount int
+	// hasPendingResumeScan tracks whether a delayed ResumeScanning message is in flight.
+	// This prevents sending redundant delayed messages when one is already pending.
+	hasPendingResumeScan bool
+	// Cached plugin info per namespace, refreshed at start of each discovery cycle
+	pluginInfoCache map[string]*messages.PluginInfoResponse
+	// resolvedTargets tracks which targets have had their opaque $ref config
+	// successfully resolved this cycle. Keyed by target label.
+	resolvedTargets map[string]bool
+	// failedTargets tracks which targets failed opaque $ref resolution this
+	// cycle. Such targets are skipped for all remaining scan operations.
+	failedTargets map[string]bool
+}
+
+func (d *DiscoveryData) SetTargets(targets []*pkgmodel.Target) {
+	d.targets = make(map[string]pkgmodel.Target, len(targets))
+	if d.resolvedTargets == nil {
+		d.resolvedTargets = make(map[string]bool)
+	}
+	if d.failedTargets == nil {
+		d.failedTargets = make(map[string]bool)
+	}
+	for _, target := range targets {
+		// A reaped (or reap-pending) target is being — or has been —
+		// tombstoned by the reaper. Never sweep it: its resources are already
+		// invisible to every live-resource query, and scanning it would race
+		// the reap transaction and/or re-discover resources the target no
+		// longer answers for.
+		if target.Health != nil && target.Health.State == pkgmodel.TargetHealthStateReaped {
+			continue
+		}
+		d.targets[target.Label] = *target
+	}
+}
+
+func (d DiscoveryData) HasOutstandingWork() bool {
+	return len(d.queuedListOperations) > 0 || len(d.outstandingListOperations) > 0 || len(d.outstandingSyncCommands) > 0
+}
+
+type ListOperation struct {
+	ResourceType string
+	TargetLabel  string
+	ParentKSUID  string
+	ListParams   string
+}
+
+func (d *Discovery) Init(args ...any) (statemachine.StateMachineSpec[DiscoveryData], error) {
+	dsEnv, ok := d.Env("Datastore")
+	if !ok {
+		d.Log().Error("Discovery: missing 'Datastore' environment variable")
+		return statemachine.StateMachineSpec[DiscoveryData]{}, fmt.Errorf("discovery: missing 'Datastore' environment variable")
+	}
+
+	scfg, ok := d.Env("ServerConfig")
+	if !ok {
+		d.Log().Error("Discovery: missing 'ServerConfig' environment variable")
+		return statemachine.StateMachineSpec[DiscoveryData]{}, fmt.Errorf("discovery: missing 'ServerConfig' environment variable")
+	}
+	serverCfg := scfg.(pkgmodel.ServerConfig)
+
+	dcfg, ok := d.Env("DiscoveryConfig")
+	if !ok {
+		d.Log().Error("Discovery: missing 'DiscoveryConfig' environment variable")
+		return statemachine.StateMachineSpec[DiscoveryData]{}, fmt.Errorf("discovery: missing 'DiscoveryConfig' environment variable")
+	}
+	discoveryCfg := dcfg.(pkgmodel.DiscoveryConfig)
+
+	// Load discoverable targets from datastore
+	ds := dsEnv.(datastore.Datastore)
+
+	data := DiscoveryData{
+		ds:                            ds,
+		discoveryCfg:                  &discoveryCfg,
+		serverCfg:                     &serverCfg,
+		targets:                       make(map[string]pkgmodel.Target),
+		resourceHierarchy:             make(map[string]*hierarchyNode),
+		resourceDescriptors:           make(map[string]plugin.ResourceDescriptor),
+		queuedListOperations:          make(map[string][]ListOperation),
+		outstandingListOperations:     make(map[string]ListOperation),
+		outstandingSyncCommands:       make(map[string]ListOperation),
+		recentlyDiscoveredResourceIDs: make(map[string]struct{}),
+		summary:                       make(map[string]int),
+		pluginInfoCache:               make(map[string]*messages.PluginInfoResponse),
+		typesWithChildrenQueued:       make(map[string]struct{}),
+		nativeIDsByCommand:            make(map[string][]string),
+		resolvedTargets:               make(map[string]bool),
+		failedTargets:                 make(map[string]bool),
+	}
+
+	spec := statemachine.NewStateMachineSpec(StateIdle,
+		statemachine.WithData(data),
+
+		statemachine.WithStateEnterCallback(onStateChange),
+
+		statemachine.WithStateMessageHandler(StateIdle, discover),
+		statemachine.WithStateMessageHandler(StateDiscovering, discover),
+		statemachine.WithStateMessageHandler(StateDiscovering, resumeScanning),
+		statemachine.WithStateMessageHandler(StateDiscovering, processListing),
+		statemachine.WithStateMessageHandler(StateDiscovering, syncCompleted),
+
+		// Handle pause/resume in both states to allow pausing at any time
+		statemachine.WithStateCallHandler(StateIdle, pauseDiscovery),
+		statemachine.WithStateCallHandler(StateDiscovering, pauseDiscovery),
+		statemachine.WithStateMessageHandler(StateIdle, resumeDiscovery),
+		statemachine.WithStateMessageHandler(StateDiscovering, resumeDiscovery),
+	)
+
+	if discoveryCfg.Enabled {
+		if _, err := d.SendAfter(d.PID(), Discover{}, InitialDelay); err != nil {
+			return statemachine.StateMachineSpec[DiscoveryData]{}, fmt.Errorf("failed to send initial discovery message: %s", err)
+		}
+		d.Log().Info("Resource discovery ready")
+	}
+
+	return spec, nil
+}
+
+func onStateChange(oldState gen.Atom, newState gen.Atom, data DiscoveryData, proc gen.Process) (gen.Atom, DiscoveryData, error) {
+	if oldState == StateDiscovering && newState == StateIdle {
+		proc.Log().Debug("Discovery finished (duration=%s). The following resources have been discovered:\n%s", time.Since(data.timeStarted), renderSummary(data.summary))
+		if len(data.failedTargets) > 0 {
+			labels := make([]string, 0, len(data.failedTargets))
+			for label := range data.failedTargets {
+				labels = append(labels, label)
+			}
+			slices.Sort(labels)
+			proc.Log().Warning("discovery: %d target(s) skipped this cycle due to config resolution failure: %v", len(data.failedTargets), labels)
+		}
+	}
+	return newState, data, nil
+}
+
+func pauseDiscovery(from gen.PID, state gen.Atom, data DiscoveryData, message messages.PauseDiscovery, proc gen.Process) (gen.Atom, DiscoveryData, messages.PauseDiscoveryResponse, []statemachine.Action, error) {
+	if !data.discoveryCfg.Enabled {
+		return state, data, messages.PauseDiscoveryResponse{}, nil, nil
+	}
+
+	data.pauseCount++
+	proc.Log().Debug("Discovery paused pauseCount=%d outstandingListOps=%d outstandingSyncCmds=%d", data.pauseCount, len(data.outstandingListOperations), len(data.outstandingSyncCommands))
+	return state, data, messages.PauseDiscoveryResponse{}, nil, nil
+}
+
+func resumeDiscovery(from gen.PID, state gen.Atom, data DiscoveryData, message messages.ResumeDiscovery, proc gen.Process) (gen.Atom, DiscoveryData, []statemachine.Action, error) {
+	if !data.discoveryCfg.Enabled {
+		return state, data, nil, nil
+	}
+
+	if data.pauseCount > 0 {
+		data.pauseCount--
+	}
+	proc.Log().Debug("Discovery resume requested pauseCount=%d", data.pauseCount)
+
+	// If we're no longer paused and have queued operations, resume scanning
+	if data.pauseCount == 0 && len(data.queuedListOperations) > 0 {
+		err := proc.Send(proc.PID(), ResumeScanning{})
+		if err != nil {
+			proc.Log().Error("Failed to send ResumeScanning after unpause: %v", err)
+			return state, data, nil, gen.TerminateReasonPanic
+		}
+	}
+
+	return state, data, nil, nil
+}
+
+// getPluginInfo fetches plugin info from PluginCoordinator
+func getPluginInfo(proc gen.Process, namespace string) (*messages.PluginInfoResponse, error) {
+	result, err := messages.UnwrapCall(proc.Call(
+		gen.ProcessID{Name: actornames.PluginCoordinator, Node: proc.Node().Name()},
+		messages.GetPluginInfo{Namespace: namespace},
+	))
+	if err != nil {
+		return nil, fmt.Errorf("failed to get plugin info for %s: %w", namespace, err)
+	}
+
+	response, ok := result.(messages.PluginInfoResponse)
+	if !ok {
+		return nil, fmt.Errorf("unexpected response type from PluginCoordinator")
+	}
+
+	if !response.Found {
+		return nil, fmt.Errorf("plugin not found: %s", response.Error)
+	}
+
+	return &response, nil
+}
+
+func discover(from gen.PID, state gen.Atom, data DiscoveryData, message Discover, proc gen.Process) (gen.Atom, DiscoveryData, []statemachine.Action, error) {
+	// Check if a discovery cycle is already running
+	if state == StateDiscovering {
+		proc.Log().Debug("Discovery already running, consider configuring a longer interval")
+		return state, data, nil, nil
+	}
+
+	data.timeStarted = time.Now()
+	data.summary = make(map[string]int)
+
+	// Clear per-cycle state at start of each discovery cycle
+	data.pluginInfoCache = make(map[string]*messages.PluginInfoResponse)
+	data.typesWithChildrenQueued = make(map[string]struct{})
+	data.recentlyDiscoveredResourceIDs = make(map[string]struct{})
+	data.resolvedTargets = make(map[string]bool)
+	data.failedTargets = make(map[string]bool)
+	proc.Log().Debug("Starting resource discovery timestamp=%v", data.timeStarted)
+
+	allTargets, err := data.ds.LoadDiscoverableTargets()
+	if err != nil {
+		proc.Log().Error("Discovery: failed to load targets from datastore: %v", err)
+		allTargets = []*pkgmodel.Target{}
+	}
+	data.SetTargets(allTargets)
+
+	// If there are no discoverable targets, complete discovery immediately
+	if len(data.targets) == 0 {
+		proc.Log().Debug("No discoverable targets found, completing discovery")
+		return StateIdle, data, rescheduleAction(data), nil
+	}
+
+	for _, target := range data.targets {
+		// Get plugin info from PluginCoordinator (with filter refresh for fresh filters)
+		pluginInfo, err := getPluginInfo(proc, target.Namespace)
+		if err != nil {
+			proc.Log().Info("Discovery: no plugin for namespace %s, skipping: %v", target.Namespace, err)
+			continue
+		}
+
+		// Cache for later use
+		data.pluginInfoCache[target.Namespace] = pluginInfo
+
+		discoverableResources := pluginInfo.SupportedResources
+		supportedResources := make([]plugin.ResourceDescriptor, 0)
+
+		// Per-plugin resourceTypesToDiscover takes precedence over global
+		typesToDiscover := pluginInfo.ResourceTypesToDiscover
+		if len(typesToDiscover) == 0 {
+			typesToDiscover = data.discoveryCfg.ResourceTypesToDiscover
+		}
+
+		for _, desc := range discoverableResources {
+			if len(typesToDiscover) == 0 || slices.Contains(typesToDiscover, desc.Type) {
+				supportedResources = append(supportedResources, desc)
+				data.resourceDescriptors[desc.Type] = desc
+			}
+		}
+
+		newHierarchy := buildResourceHierarchy(supportedResources)
+		maps.Copy(data.resourceHierarchy, newHierarchy)
+
+		for resourceType, node := range newHierarchy {
+			originalDesc, exists := data.resourceDescriptors[resourceType]
+			if !exists {
+				proc.Log().Error("Resource descriptor not found for type %s", resourceType)
+				continue
+			}
+			if len(originalDesc.ParentResourceTypesWithMappingProperties) == 0 {
+				data.queuedListOperations[target.Namespace] = append(data.queuedListOperations[target.Namespace],
+					ListOperation{ResourceType: node.resourceType, TargetLabel: target.Label, ListParams: util.MapToString(make(map[string]plugin.ListParam))})
+			}
+		}
+	}
+
+	// If no work was queued (e.g., all plugins failed to register), return to Idle
+	// to allow future Discover messages to be processed
+	if !data.HasOutstandingWork() {
+		proc.Log().Debug("No targets could be processed (plugins not available), completing discovery")
+		return StateIdle, data, rescheduleAction(data), nil
+	}
+
+	// Send ResumeScanning only after confirming work was queued and we're transitioning to StateDiscovering.
+	// This prevents sending the message when returning to StateIdle, which would cause a state machine error
+	// since ResumeScanning is only handled in StateDiscovering.
+	err = proc.Send(proc.PID(), ResumeScanning{})
+	if err != nil {
+		proc.Log().Error("Discovery failed to send ResumeScanning message: %v", err)
+		return state, data, nil, gen.TerminateReasonPanic
+	}
+
+	return StateDiscovering, data, nil, nil
+}
+
+// ensureTargetResolved guarantees that data.targets[label].Config holds the
+// ephemeral resolved form of the target's config (opaque $ref replaced by live
+// plaintext) before any List call reaches the plugin. Resolution is memoized
+// within the current discovery cycle via data.resolvedTargets / data.failedTargets
+// so each target is resolved at most once per cycle regardless of how many
+// resource types it scans.
+//
+// Returns the updated DiscoveryData and true on success; false when the target
+// failed resolution (it should be skipped for the remainder of this cycle).
+func ensureTargetResolved(data DiscoveryData, label string, proc gen.Process) (DiscoveryData, bool) {
+	if data.resolvedTargets == nil {
+		data.resolvedTargets = make(map[string]bool)
+	}
+	if data.failedTargets == nil {
+		data.failedTargets = make(map[string]bool)
+	}
+
+	if data.resolvedTargets[label] {
+		return data, true
+	}
+	if data.failedTargets[label] {
+		return data, false
+	}
+
+	resolved, err := resolveTargetConfigForList(proc, data.targets[label])
+	if err != nil {
+		// Fail closed: a target whose credential source is missing or rotated is
+		// skipped for the remainder of this cycle so its ListResources call is
+		// never issued with a stale or unresolved credential. The target recovers
+		// automatically on the next discovery cycle once the source resolves.
+		proc.Log().Error("discovery: skipping target %s: could not resolve its config: %v", label, err)
+		data.failedTargets[label] = true
+		return data, false
+	}
+
+	t := data.targets[label]
+	t.Config = resolved
+	data.targets[label] = t
+	data.resolvedTargets[label] = true
+	return data, true
+}
+
+func resumeScanning(from gen.PID, state gen.Atom, data DiscoveryData, message ResumeScanning, proc gen.Process) (gen.Atom, DiscoveryData, []statemachine.Action, error) {
+	// The delayed message has arrived - clear the pending flag
+	data.hasPendingResumeScan = false
+
+	// Don't start new list operations if Discovery is paused
+	if data.pauseCount > 0 {
+		proc.Log().Debug("Discovery is paused, skipping resumeScanning pauseCount=%d", data.pauseCount)
+		return state, data, nil, nil
+	}
+
+	finished := make(map[string]bool)
+
+	// Do as much work as the rate limiter allows for each namespace
+	for namespace := range data.queuedListOperations {
+		finished[namespace] = true
+		remaining := len(data.queuedListOperations[namespace])
+		tokens, err := proc.Call(actornames.RateLimiter, changeset.RequestTokens{Namespace: namespace, N: remaining})
+		if err != nil {
+			proc.Log().Error("Failed to fetch tokens for namespace=%s: %v", namespace, err)
+			return state, data, nil, gen.TerminateReasonPanic
+		}
+		n := tokens.(changeset.TokensGranted).N
+		if n < remaining {
+			finished[namespace] = false
+		}
+
+		for range n {
+			nextOp := data.queuedListOperations[namespace][0]
+			data.queuedListOperations[namespace] = data.queuedListOperations[namespace][1:]
+			var ok bool
+			data, ok = ensureTargetResolved(data, nextOp.TargetLabel, proc)
+			if !ok {
+				continue
+			}
+			if err := scanTargetForResourceType(data.targets[nextOp.TargetLabel], nextOp, data, proc); err != nil {
+				// A failed scan of a single resource type must not crash the
+				// Discovery actor. Skip the resource type for this cycle and
+				// keep scanning the rest; it is re-queued on the next cycle. A
+				// spawn timeout is transient back-pressure (the plugin node was
+				// momentarily unresponsive), so it is logged at WRN; anything
+				// else is unexpected and logged at ERR. Either way the actor
+				// survives — mirroring ResourceUpdater and ResolveCache, which
+				// already treat a plugin spawn/operation failure as terminal for
+				// the unit of work, never fatal for the actor.
+				if errors.Is(err, gen.ErrTimeout) {
+					proc.Log().Warning("Skipping resource type %s for this discovery cycle: transient spawn back-pressure: %v", nextOp.ResourceType, err)
+				} else {
+					proc.Log().Error("Skipping resource type %s for this discovery cycle: %v", nextOp.ResourceType, err)
+				}
+			}
+		}
+	}
+	for namespace, done := range finished {
+		if !done {
+			// Send a delayed message to continue processing
+			_, err := proc.SendAfter(proc.PID(), ResumeScanning{}, 1*time.Second)
+			if err != nil {
+				proc.Log().Error("Discovery failed to send ResumeScanning message: %v", err)
+				return state, data, nil, gen.TerminateReasonPanic
+			}
+			data.hasPendingResumeScan = true
+			return state, data, nil, nil
+		}
+		delete(data.queuedListOperations, namespace)
+	}
+
+	// If every scanned operation this cycle was skipped (e.g. all spawns timed
+	// out), no Listing callback will arrive to drive completion. Finish the
+	// cycle here so the Discovering->Idle transition fires and the next
+	// scheduled discovery run is queued; otherwise Discovery would hang in
+	// StateDiscovering forever.
+	if !data.HasOutstandingWork() {
+		return StateIdle, data, rescheduleAction(data), nil
+	}
+
+	return StateDiscovering, data, nil, nil
+}
+
+func scanTargetForResourceType(target pkgmodel.Target, op ListOperation, data DiscoveryData, proc gen.Process) error {
+	if !data.resourceDescriptors[op.ResourceType].Discoverable {
+		proc.Log().Debug("Skipping non-discoverable resource type %s in target %s", op.ResourceType, target.Label)
+		return nil
+	}
+
+	// Register the operation as remaining work
+	mapKey := listOperationMapKey(op.ResourceType, op.TargetLabel, op.ListParams)
+	data.outstandingListOperations[mapKey] = op
+	if _, exists := data.summary[op.ResourceType]; !exists {
+		data.summary[op.ResourceType] = 0
+	}
+
+	uri := discoveryURI(op.ResourceType)
+	operation := resource.OperationList
+	operationID := uuid.New().String()
+	listParameters := util.StringToMap[plugin.ListParam](op.ListParams)
+
+	// Strip resolvable metadata ($ref/$value wrappers) from target config before
+	// sending to plugin — plugins expect plain JSON values, not resolvable objects.
+	pluginConfig := target.Config
+	if cleanConfig, err := resolver.ConvertToPluginFormat(target.Config); err == nil {
+		pluginConfig = cleanConfig
+	}
+
+	// A generator reference in the target's config names a credential that was
+	// never drawn; the envelope is never that credential. Sending it would hand
+	// the plugin a JSON object where a token belongs. Conversion leaves such an
+	// envelope untouched, so this checks the document either branch above
+	// settled on. Skip this resource type for the cycle rather than scanning
+	// with a credential formae does not have: a scan that cannot authenticate
+	// returns nothing and would be indistinguishable from an empty account.
+	// This must run before the spawn below — a PluginOperator started for a
+	// scan that never sends ListResources is never reaped.
+	if err := resolver.GuardNoUnresolvedGenerators(pluginConfig); err != nil {
+		delete(data.outstandingListOperations, mapKey)
+		return fmt.Errorf("cannot scan %s in target %s: its configuration is bound to a generator whose value has not been drawn: %w", op.ResourceType, target.Label, err)
+	}
+
+	// Spawn PluginOperator via PluginCoordinator
+	spawnResult, err := messages.UnwrapCall(proc.Call(
+		gen.ProcessID{Name: actornames.PluginCoordinator, Node: proc.Node().Name()},
+		messages.SpawnPluginOperator{
+			Namespace:   target.Namespace,
+			ResourceURI: string(uri),
+			Operation:   string(operation),
+			OperationID: operationID,
+			RequestedBy: proc.PID(),
+		}))
+	if err != nil {
+		delete(data.outstandingListOperations, mapKey)
+		return fmt.Errorf("failed to spawn PluginOperator for %s: %w", uri, err)
+	}
+	spawnRes, ok := spawnResult.(messages.SpawnPluginOperatorResult)
+	if !ok {
+		delete(data.outstandingListOperations, mapKey)
+		return fmt.Errorf("unexpected result type from PluginCoordinator: %T", spawnResult)
+	}
+	if spawnRes.Error != "" {
+		delete(data.outstandingListOperations, mapKey)
+		return fmt.Errorf("failed to spawn PluginOperator: %s", spawnRes.Error)
+	}
+
+	err = proc.Send(spawnRes.PID, plugin.ListResources{
+		Namespace:      target.Namespace,
+		TargetLabel:    target.Label,
+		ResourceType:   op.ResourceType,
+		TargetConfig:   pluginConfig,
+		ListParameters: listParameters,
+	})
+	if err != nil {
+		delete(data.outstandingListOperations, mapKey)
+		return fmt.Errorf("discovery failed to send ListResources for %s: %w", uri, err)
+	}
+	proc.Log().Debug("Scanning resource type %s in target %s with list properties %v in %f seconds", op.ResourceType, target.Label, listParameters)
+
+	return nil
+}
+
+func processListing(from gen.PID, state gen.Atom, data DiscoveryData, message plugin.Listing, proc gen.Process) (gen.Atom, DiscoveryData, []statemachine.Action, error) {
+	proc.Log().Debug("Processing listing for %s in target %s with list parameters %v", message.ResourceType, message.TargetLabel, message.ListParameters)
+
+	mapKey := listOperationMapKey(message.ResourceType, message.TargetLabel, util.MapToString(message.ListParameters))
+	op := data.outstandingListOperations[mapKey]
+
+	delete(data.outstandingListOperations, mapKey)
+
+	// Remove the operation from remaining work if the plugin reported an error
+	if message.Error != "" {
+		proc.Log().Error("Failed to list resources for %s in target %s: %s", message.ResourceType, message.TargetLabel, message.Error)
+		if !data.HasOutstandingWork() {
+			return StateIdle, data, rescheduleAction(data), nil
+		}
+		return state, data, nil, nil
+	}
+
+	listedResources := message.Resources
+	proc.Log().Debug("Received %d resources for %s in target %s", len(listedResources), message.ResourceType, message.TargetLabel)
+
+	// De-duplicate resources already under management
+	var newResources []plugin.ListedResource
+	for _, res := range listedResources {
+		if !resourceExists(res.NativeID, res.ResourceType, data) {
+			newResources = append(newResources, res)
+			key := fmt.Sprintf("%s::%s", res.ResourceType, res.NativeID)
+			data.recentlyDiscoveredResourceIDs[key] = struct{}{}
+			data.summary[res.ResourceType]++
+		}
+	}
+
+	// If there are no new resources, we can skip the synchronization
+	// However, we still need to discover nested resources if this parent resource type has any
+	if len(newResources) == 0 {
+		proc.Log().Debug("No new resources to synchronize for %s in target %s", message.ResourceType, message.TargetLabel)
+		if err := discoverChildrenOnce(op, data, proc); err != nil {
+			proc.Log().Error("Failed to discover children for %s in target %s: %v", message.ResourceType, message.TargetLabel, err)
+			if !data.HasOutstandingWork() {
+				return StateIdle, data, rescheduleAction(data), nil
+			}
+			return state, data, nil, nil
+		}
+		if !data.HasOutstandingWork() {
+			return StateIdle, data, rescheduleAction(data), nil
+		}
+		return state, data, nil, nil
+	}
+
+	// Look up the full target from the data.targets map
+	target, ok := data.targets[message.TargetLabel]
+	if !ok {
+		proc.Log().Error("Target not found for label %s", message.TargetLabel)
+		if !data.HasOutstandingWork() {
+			return StateIdle, data, rescheduleAction(data), nil
+		}
+		return state, data, nil, nil
+	}
+
+	// Synchronize the new resources, remove the operation from remaining work on error
+	commandID, err := synchronizeResources(op, message.Namespace, target, newResources, data, proc)
+	if err != nil {
+		proc.Log().Error("Failed to synchronize resources for %s in target %s: %v", message.ResourceType, message.TargetLabel, err)
+		if !data.HasOutstandingWork() {
+			return StateIdle, data, rescheduleAction(data), nil
+		}
+	}
+
+	data.outstandingSyncCommands[commandID] = op
+
+	// Discover nested resources for existing parents immediately, even though we're also syncing new ones.
+	// This ensures we don't miss nested resources for existing parents while waiting for new ones to sync.
+	// New nested resources will be discovered after sync completes in syncCompleted().
+	if err := discoverChildrenOnce(op, data, proc); err != nil {
+		proc.Log().Error("Failed to discover children for %s in target %s: %v", message.ResourceType, message.TargetLabel, err)
+	}
+
+	return StateDiscovering, data, nil, nil
+}
+
+func listOperationMapKey(resourceType, targetLabel, listParams string) string {
+	return fmt.Sprintf("%s#%s#%s", resourceType, targetLabel, listParams)
+}
+
+// getSchemaFromCache retrieves a schema from the cached plugin info
+func getSchemaFromCache(data *DiscoveryData, namespace, resourceType string) (pkgmodel.Schema, error) {
+	pluginInfo, ok := data.pluginInfoCache[namespace]
+	if !ok {
+		return pkgmodel.Schema{}, fmt.Errorf("no cached plugin info for %s", namespace)
+	}
+
+	schema, ok := pluginInfo.ResourceSchemas[resourceType]
+	if !ok {
+		return pkgmodel.Schema{}, fmt.Errorf("schema not found for %s", resourceType)
+	}
+
+	return schema, nil
+}
+
+// getMatchFiltersFromCache retrieves MatchFilters from the cached plugin info
+func getMatchFiltersFromCache(data *DiscoveryData, namespace string) []pkgmodel.MatchFilter {
+	pluginInfo, ok := data.pluginInfoCache[namespace]
+	if !ok {
+		return nil
+	}
+	return pluginInfo.MatchFilters
+}
+
+func synchronizeResources(op ListOperation, namespace string, target pkgmodel.Target, resources []plugin.ListedResource, data DiscoveryData, proc gen.Process) (string, error) {
+	// Get schema from cache instead of calling plugin directly
+	schema, err := getSchemaFromCache(&data, namespace, op.ResourceType)
+	if err != nil {
+		proc.Log().Error("failed to synchronize resources of type %s in target %s: %v", op.ResourceType, op.TargetLabel, err)
+		return "", err
+	}
+
+	var resourcesToSynchronize []pkgmodel.Resource
+	for _, res := range resources {
+		resourcesToSynchronize = append(resourcesToSynchronize, pkgmodel.Resource{
+			Label:      url.QueryEscape(res.NativeID),
+			Type:       res.ResourceType,
+			Stack:      constants.UnmanagedStack,
+			Target:     target.Label,
+			NativeID:   res.NativeID,
+			Properties: injectResolvables("{}", op),
+			Schema:     schema,
+			Managed:    false,
+			Ksuid:      util.NewID(),
+		})
+	}
+
+	forma := pkgmodel.Forma{
+		Targets:   []pkgmodel.Target{target},
+		Resources: resourcesToSynchronize,
+	}
+
+	formaCommandConfig := &config.FormaCommandConfig{Mode: pkgmodel.FormaApplyModePatch}
+	existingTargets, err := data.ds.LoadAllTargets()
+	if err != nil {
+		proc.Log().Error("failed to load existing targets: %v", err)
+		return "", fmt.Errorf("failed to load targets: %w", err)
+	}
+
+	resourceUpdates, err := resource_update.GenerateResourceUpdates(&forma, pkgmodel.CommandSync, formaCommandConfig.Mode, resource_update.FormaCommandSourceDiscovery, existingTargets, data.ds, nil, nil, false)
+	if err != nil {
+		proc.Log().Error("failed to generate resource updates: %v", err)
+		return "", fmt.Errorf("failed to generate resource updates: %w", err)
+	}
+
+	// Attach MatchFilters from cache to resource updates for declarative filtering
+	matchFilters := getMatchFiltersFromCache(&data, namespace)
+	for i := range resourceUpdates {
+		filters := pkgmodel.FiltersForType(matchFilters, resourceUpdates[i].DesiredState.Type)
+		if len(filters) > 0 {
+			resourceUpdates[i].MatchFilters = filters
+		}
+	}
+
+	syncCommand := forma_command.NewFormaCommand(
+		&forma,
+		formaCommandConfig,
+		pkgmodel.CommandSync,
+		resourceUpdates,
+		nil, // No target updates on discovery
+		nil, // No stack updates on discovery
+		nil, // No policy updates on discovery
+		nil, // No generator updates on discovery
+		"discovery",
+		"",
+		"",
+		forma_command.SourceDiscovery,
+	)
+
+	// store the forma command
+	_, err = messages.UnwrapCall(proc.Call(actornames.FormaCommandPersister, forma_persister.StoreNewFormaCommand{
+		Command: *syncCommand,
+	}))
+	if err != nil {
+		proc.Log().Error("failed to store sync command: %v", err)
+		return "", err
+	}
+
+	// Pass CommandSync so the DAG skips buildOperationRelationships — discovery
+	// sync reads are independent and one failed read must not cascade to others.
+	synth, err := target_update.SynthesizeResolveTargetUpdates(
+		resource_update.ReferencedTargetLabels(syncCommand.ResourceUpdates),
+		resource_update.SourceTargetByKsuid(syncCommand.ResourceUpdates),
+		nil, data.ds)
+	if err != nil {
+		slog.Error("failed to build changeset for discovery sync command", "commandID", syncCommand.ID, "error", err)
+		finalizeFailedSyncCommand(syncCommand, proc)
+		return "", fmt.Errorf("failed to build changeset: %w", err)
+	}
+	// No generator draws: a sync command only reads the inventory, so no
+	// destination in it is waiting for a generated value.
+	cs, err := changeset.NewChangeset(syncCommand.ResourceUpdates, synth, nil, syncCommand.ID, pkgmodel.CommandSync, syncCommand.Config.Mode)
+	if err != nil {
+		slog.Error("failed to build changeset for discovery sync command", "commandID", syncCommand.ID, "error", err)
+		finalizeFailedSyncCommand(syncCommand, proc)
+		return "", fmt.Errorf("failed to build changeset: %w", err)
+	}
+
+	proc.Log().Debug("Ensuring ChangesetExecutor for sync command commandID=%s", syncCommand.ID)
+	_, err = proc.Call(
+		gen.ProcessID{Name: actornames.ChangesetSupervisor, Node: proc.Node().Name()},
+		changeset.EnsureChangesetExecutor{CommandID: syncCommand.ID},
+	)
+	if err != nil {
+		slog.Error("failed to ensure ChangesetExecutor for sync command", "command", syncCommand.Command, "forma", syncCommand, "error", err)
+		return "", err
+	}
+
+	proc.Log().Debug("Starting ChangesetExecutor for sync command commandID=%s", syncCommand.ID)
+	err = proc.Send(
+		gen.ProcessID{Name: actornames.ChangesetExecutor(syncCommand.ID), Node: proc.Node().Name()},
+		changeset.Start{Changeset: cs, NotifyOnComplete: true},
+	)
+	if err != nil {
+		slog.Error("failed to start ChangesetExecutor for sync command", "command", syncCommand.Command, "forma", syncCommand, "error", err)
+		return "", err
+	}
+
+	// Store NativeIDs for child discovery in syncCompleted
+	nativeIDs := make([]string, len(resources))
+	for i, res := range resources {
+		nativeIDs[i] = res.NativeID
+	}
+	data.nativeIDsByCommand[syncCommand.ID] = nativeIDs
+
+	return syncCommand.ID, nil
+}
+
+// discoverChildrenOnce queries the DB for parents and discovers their children, but only once
+// per type#target per discovery cycle. Subsequent calls for the same type#target are no-ops.
+func discoverChildrenOnce(op ListOperation, data DiscoveryData, proc gen.Process) error {
+	key := op.ResourceType + "#" + op.TargetLabel
+	if _, done := data.typesWithChildrenQueued[key]; done {
+		return nil
+	}
+
+	query := datastore.ResourceQuery{
+		Type:   &datastore.QueryItem[string]{Item: op.ResourceType, Constraint: datastore.Required},
+		Target: &datastore.QueryItem[string]{Item: op.TargetLabel, Constraint: datastore.Required},
+	}
+	parents, err := data.ds.QueryResources(&query)
+	if err != nil {
+		proc.Log().Error("Failed to load parent resources type=%s target=%s: %v", op.ResourceType, op.TargetLabel, err)
+		return fmt.Errorf("failed to load parent resources: %w", err)
+	}
+
+	// Mark the type done only once its children are actually queued. Setting
+	// this first made a partial or failed queueing indistinguishable from a
+	// complete one: the guard above then refused every retry for the rest of
+	// the cycle, and the next cycle restarted in the same arbitrary order.
+	if err := discoverChildren(parents, op, data, proc); err != nil {
+		return err
+	}
+	data.typesWithChildrenQueued[key] = struct{}{}
+	return nil
+}
+
+func discoverChildren(parents []*pkgmodel.Resource, op ListOperation, data DiscoveryData, proc gen.Process) error {
+	parentNode, exists := data.resourceHierarchy[op.ResourceType]
+	if !exists || !parentNode.hasChildren() {
+		return nil
+	}
+
+	var operations []ListOperation
+	for _, parent := range parents {
+		for childNode, mappingProps := range parentNode.children {
+			listParams := make(map[string]plugin.ListParam)
+			for _, param := range mappingProps {
+				value, found := parent.GetProperty(param.ParentProperty)
+				if found {
+					// Extract the actual value if this is a JSON reference object.
+					// This handles cases like OCI resources where parent properties (e.g. CompartmentID)
+					// are serialized as {"$ref":"...","$value":"..."} reference objects.
+					// We need only the value for the List API call.
+					actualValue := extractActualValue(value)
+					listParams[param.ListProperty] = plugin.ListParam{
+						ParentProperty: param.ParentProperty,
+						ListParam:      param.ListProperty,
+						ListValue:      actualValue,
+					}
+				} else {
+					proc.Log().Error("Missing parent property property=%s parent_id=%s", param.ParentProperty, parent.NativeID)
+				}
+			}
+			operations = append(operations, ListOperation{
+				ResourceType: childNode.resourceType,
+				TargetLabel:  op.TargetLabel,
+				ParentKSUID:  parent.Ksuid,
+				ListParams:   util.MapToString(listParams),
+			})
+		}
+	}
+
+	if len(operations) == 0 {
+		return nil
+	}
+	// Arrange a wakeup before committing the batch. A failed send must not
+	// leave queued work keeping discovery busy forever, or a partial batch
+	// that a later attempt queues again. The actor handles the wakeup only
+	// after this handler returns, so it will see the whole batch.
+	if !data.hasPendingResumeScan {
+		if err := proc.Send(proc.PID(), ResumeScanning{}); err != nil {
+			proc.Log().Error("Failed to send ResumeScanning: %v", err)
+			return fmt.Errorf("failed to send ResumeScanning: %w", err)
+		}
+	}
+	namespace := data.targets[op.TargetLabel].Namespace
+	data.queuedListOperations[namespace] = append(data.queuedListOperations[namespace], operations...)
+
+	return nil
+}
+
+func syncCompleted(from gen.PID, state gen.Atom, data DiscoveryData, message changeset.ChangesetCompleted, proc gen.Process) (gen.Atom, DiscoveryData, []statemachine.Action, error) {
+	op, exists := data.outstandingSyncCommands[message.CommandID]
+	if !exists {
+		proc.Log().Error("Discovery received ChangesetCompleted for unknown command ID commandID=%s", message.CommandID)
+		return state, data, nil, nil
+	}
+	delete(data.outstandingSyncCommands, message.CommandID)
+
+	// A changeset that finished with errors is still a changeset that wrote
+	// something: some parents synced, some did not. Dropping the whole batch's
+	// native IDs here used to take child discovery down with it, so every
+	// child of every parent in the batch went undiscovered because one sibling
+	// failed — and nothing revisited them, because listCompleted had already
+	// marked this type's children queued from a DB read taken before the sync.
+	//
+	// Keep the IDs. The block below re-reads the parents from the datastore
+	// and intersects with them, so a parent that genuinely failed to persist
+	// is filtered out on its own merits rather than by association.
+	if message.State == changeset.ChangeSetStateFinishedWithErrors {
+		proc.Log().Error("Discovery failed to synchronize discovered resources resourceType=%s listParams=%s commandID=%s", op.ResourceType, op.ListParams, message.CommandID)
+		if !data.HasOutstandingWork() && len(data.nativeIDsByCommand[message.CommandID]) == 0 {
+			delete(data.nativeIDsByCommand, message.CommandID)
+			return StateIdle, data, rescheduleAction(data), nil
+		}
+	}
+
+	// Discover nested resources for the newly synced parents
+	syncedNativeIDs := data.nativeIDsByCommand[message.CommandID]
+	delete(data.nativeIDsByCommand, message.CommandID)
+
+	if len(syncedNativeIDs) > 0 {
+		// Query DB for the synced resources by type+target, then filter to only the ones we synced
+		query := datastore.ResourceQuery{
+			Type:   &datastore.QueryItem[string]{Item: op.ResourceType, Constraint: datastore.Required},
+			Target: &datastore.QueryItem[string]{Item: op.TargetLabel, Constraint: datastore.Required},
+		}
+		allParents, err := data.ds.QueryResources(&query)
+		if err != nil {
+			proc.Log().Error("Failed to load parent resources for child discovery type=%s target=%s: %v", op.ResourceType, op.TargetLabel, err)
+			if !data.HasOutstandingWork() {
+				return StateIdle, data, rescheduleAction(data), nil
+			}
+			return state, data, nil, nil
+		}
+
+		// Filter to only newly synced parents
+		syncedSet := make(map[string]struct{}, len(syncedNativeIDs))
+		for _, id := range syncedNativeIDs {
+			syncedSet[id] = struct{}{}
+		}
+		var syncedParents []*pkgmodel.Resource
+		for _, p := range allParents {
+			if _, ok := syncedSet[p.NativeID]; ok {
+				syncedParents = append(syncedParents, p)
+			}
+		}
+
+		if err := discoverChildren(syncedParents, op, data, proc); err != nil {
+			proc.Log().Error("Failed to discover children for %s in target %s: %v", op.ResourceType, op.TargetLabel, err)
+			if !data.HasOutstandingWork() {
+				return StateIdle, data, rescheduleAction(data), nil
+			}
+			return state, data, nil, nil
+		}
+	}
+	if !data.HasOutstandingWork() {
+		return StateIdle, data, rescheduleAction(data), nil
+	}
+
+	return state, data, nil, nil
+}
+
+// Some resource types are global and might be discovered in multiple targets. This introduces a race condition. A resource can be discovered, but before the resource has
+// been synchronized and created in the database the resource is then discovered again. Therefore we cannot rely on the database for deduplication but we maintain a set of
+// recently discovered resources locally in the actor.
+func resourceExists(nativeID string, resourceType string, data DiscoveryData) bool {
+	key := fmt.Sprintf("%s::%s", resourceType, nativeID)
+	_, recentlyDiscovered := data.recentlyDiscoveredResourceIDs[key]
+	if recentlyDiscovered {
+		return true
+	}
+
+	resource, err := data.ds.LoadResourceByNativeID(nativeID, resourceType)
+	if err != nil {
+		slog.Error("Failed to load resource by native ID", "nativeID", nativeID, "resourceType", resourceType, "error", err)
+		return false
+	}
+	return resource != nil
+}
+
+func buildResourceHierarchy(descriptors []plugin.ResourceDescriptor) map[string]*hierarchyNode {
+	hierarchy := make(map[string]*hierarchyNode)
+	childDescriptors := make(map[string]plugin.ResourceDescriptor)
+
+	for _, desc := range descriptors {
+		if !desc.Discoverable {
+			continue
+		}
+
+		hierarchy[desc.Type] = &hierarchyNode{
+			resourceType: desc.Type,
+			discoverable: desc.Discoverable,
+			children:     make(map[*hierarchyNode][]plugin.ListParameter),
+		}
+
+		if len(desc.ParentResourceTypesWithMappingProperties) > 0 {
+			childDescriptors[desc.Type] = desc
+		}
+	}
+
+	for _, desc := range childDescriptors {
+		childNode := hierarchy[desc.Type]
+		for parentType, mappingProps := range desc.ParentResourceTypesWithMappingProperties {
+			parentNode, exists := hierarchy[parentType]
+			if !exists {
+				slog.Error("Parent resource type not found", "parent", parentType, "child", desc.Type)
+				continue
+			}
+			parentNode.children[childNode] = mappingProps
+		}
+	}
+
+	return hierarchy
+}
+
+func discoveryURI(resourceType string) pkgmodel.FormaeURI {
+	parts := strings.Split(resourceType, "::")
+	for i, j := 0, len(parts)-1; i < j; i, j = i+1, j-1 {
+		parts[i], parts[j] = parts[j], parts[i]
+	}
+	for i := range parts {
+		parts[i] = strings.ToLower(parts[i])
+	}
+	namespace := strings.Join(parts, ".")
+
+	// Generate a discovery-specific KSUID for this resource type
+	discoveryKsuid := fmt.Sprintf("discovery-%s-%s", namespace, util.NewID())
+	return pkgmodel.NewFormaeURI(discoveryKsuid, "")
+}
+
+func renderSummary(summary map[string]int) string {
+	var builder strings.Builder
+
+	// Define column headers and widths for formatting.
+	const resourceHeader = "Resource Type"
+	const countHeader = "Value"
+	const resourceWidth = 40
+	const countWidth = 5
+
+	// Write the header row.
+	headerFormat := fmt.Sprintf("%%-%ds  %%-%ds\n", resourceWidth, countWidth)
+	fmt.Fprintf(&builder, headerFormat, resourceHeader, countHeader)
+
+	// Write a separator line for the header.
+	builder.WriteString(strings.Repeat("-", resourceWidth+countWidth+2) + "\n")
+
+	// Iterate over the map and add resource types and counts as a row.
+	rowFormat := fmt.Sprintf("%%-%ds  %%-%dd\n", resourceWidth, countWidth)
+	for key, value := range summary {
+		fmt.Fprintf(&builder, rowFormat, key, value)
+	}
+
+	return builder.String()
+}
+
+// extractActualValue extracts the actual value from a property that may be a JSON reference object.
+// If the value is a JSON string containing {"$ref":"...","$value":"..."}, it extracts the $value.
+// Otherwise, it returns the value as-is.
+func extractActualValue(value string) string {
+	// Try to parse as JSON to see if it's a JSON reference
+	var jsonRef struct {
+		Ref   string `json:"$ref"`
+		Value string `json:"$value"`
+	}
+
+	if err := json.Unmarshal([]byte(value), &jsonRef); err == nil && jsonRef.Value != "" {
+		return jsonRef.Value
+	}
+
+	return value
+}
+
+func injectResolvables(props string, op ListOperation) json.RawMessage {
+	if op.ParentKSUID == "" {
+		return json.RawMessage(props)
+	}
+
+	params := util.StringToMap[plugin.ListParam](op.ListParams)
+	for _, v := range params {
+		// Check if there's an existing value and validate it matches the parent's expected value
+		// This prevents incorrect parent associations when resources are discovered via multiple paths
+		existingProp := gjson.Get(props, v.ListParam)
+		if existingProp.Exists() {
+			// If it's already a reference object, check if the $value matches
+			if existingProp.IsObject() && existingProp.Get("$ref").Exists() {
+				existingValue := existingProp.Get("$value").String()
+				if existingValue != v.ListValue {
+					slog.Debug("Skipping parent reference injection - existing ref has different value",
+						"field", v.ListParam,
+						"existingValue", existingValue,
+						"expectedValue", v.ListValue,
+						"parentKSUID", op.ParentKSUID)
+					continue
+				}
+				// Value matches, but already has a reference - skip to avoid overwriting
+				continue
+			}
+
+			// If it's a plain string value, validate it matches before converting to reference
+			if existingValue := existingProp.String(); existingValue != v.ListValue {
+				slog.Debug("Skipping parent reference injection - value mismatch",
+					"field", v.ListParam,
+					"existingValue", existingValue,
+					"expectedValue", v.ListValue,
+					"parentKSUID", op.ParentKSUID)
+				continue
+			}
+		}
+
+		// Either no existing value, or it matches the expected value - inject the reference
+		prop := struct {
+			Ref   string `json:"$ref"`
+			Value string `json:"$value"`
+		}{
+			Ref:   fmt.Sprintf("formae://%s#/%s", op.ParentKSUID, v.ParentProperty),
+			Value: v.ListValue,
+		}
+		props, _ = sjson.Set(props, v.ListParam, prop)
+	}
+
+	return json.RawMessage(props)
+}
+
+// finalizeFailedSyncCommand marks all resource updates in the command as failed and then
+// finalizes the command itself, preventing persisted commands from being left in a
+// non-terminal pending state when changeset construction fails after storage.
+func finalizeFailedSyncCommand(cmd *forma_command.FormaCommand, proc gen.Process) {
+	refs := make([]forma_persister.ResourceUpdateRef, 0, len(cmd.ResourceUpdates))
+	for _, ru := range cmd.ResourceUpdates {
+		refs = append(refs, forma_persister.ResourceUpdateRef{
+			URI:       ru.URI(),
+			Operation: ru.Operation,
+		})
+	}
+	persister := actornames.FormaCommandPersister
+	if len(refs) > 0 {
+		if _, err := messages.UnwrapCall(proc.Call(persister, forma_persister.MarkResourcesAsFailed{
+			CommandID:          cmd.ID,
+			Resources:          refs,
+			ResourceModifiedTs: time.Now(),
+		})); err != nil {
+			slog.Error("Discovery: failed to mark resources as failed for aborted command", "commandID", cmd.ID, "error", err)
+			return
+		}
+	}
+	if _, err := messages.UnwrapCall(proc.Call(persister, forma_persister.FinalizeIncompleteCommand{CommandID: cmd.ID})); err != nil {
+		slog.Error("Discovery: failed to finalize aborted command", "commandID", cmd.ID, "error", err)
+	}
+}

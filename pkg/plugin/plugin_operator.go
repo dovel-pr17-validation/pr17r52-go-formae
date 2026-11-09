@@ -1,0 +1,1088 @@
+// © 2025 Platform Engineering Labs Inc.
+//
+// SPDX-License-Identifier: FSL-1.1-ALv2
+
+package plugin
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"strings"
+	"time"
+
+	"ergo.services/actor/statemachine"
+	"ergo.services/ergo/gen"
+	"github.com/platform-engineering-labs/formae/pkg/model"
+	"github.com/platform-engineering-labs/formae/pkg/plugin/resource"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	otelmetric "go.opentelemetry.io/otel/metric"
+)
+
+// PluginOperator is the Ergo state machine responsible for operations on cloud resources. The operator handles the
+// lifecycle of plugin operations, including reading, creating, updating, and deleting resources.
+// All the CRUD methods on the PluginOperator are syncrhonous and return a ProgressResult. If this ProgressResult
+// is in a final state (which the caller can interrogate via HasFinished(), FinishedSuccessfully(), and Failed()
+// methods), the PluginOperator will shut itself down. Otherwise, the PluginOperator will transition into either
+// the WaitingForResource or Retrying state, depending on the status of the progress and it will start publishing
+// subsequent progress updates to the requester of the plugin operation.
+//
+// The machine transitions are as follows:
+//
+//	                     +-----------------------+
+//	 ------------------- |      NotStarted       |--------------------
+//	|                    +-----------------------+                    |
+//	|                        |               |                        |
+//	|                        |               |                        |
+//	|                        |               |                        |
+//	|                        |               |                        |
+//	|                        |               |                        |
+//	|                        v               v                        |
+//	|   +-----------------------+           +----------------------+  |
+//	|   |      Waiting          |<--------- |   Retrying           |  |
+//	|   +-----------------------+           +----------------------+  |
+//	|         |        |  |                      ^      |    |        |
+//	|         |        |  |                      |      |    |        |
+//	|         |        |   ----------------------       |    |        |
+//	|         |        |                                |    |        |
+//	|         |      --|--------------------------------     |        |
+//	|         |     |  |                                     |        |
+//	|         |     |   --------------------------------     |        |
+//	|         |     |                                   |    |        |
+//	|         v     v                                   v    v        |
+//	|   +----------------------+            +----------------------+  |
+//	 -> | FinishedSuccessfully |            |  FinishedWithErrors  |<-
+//	    +----------------------+            +----------------------+
+type PluginOperator struct {
+	statemachine.StateMachine[PluginUpdateData]
+}
+
+// PluginOperatorFactoryName is the factory name for remote spawning
+const PluginOperatorFactoryName = "PluginOperator"
+
+func NewPluginOperator() gen.ProcessBehavior {
+	return &PluginOperator{}
+}
+
+const (
+	StateNotStarted           = gen.Atom("not_started")
+	StateWaitingForResource   = gen.Atom("waiting_for_resource")
+	StateRetrying             = gen.Atom("retrying")
+	StateFinishedSuccessfully = gen.Atom("finished_successfully")
+	StateFinishedWithError    = gen.Atom("finished_with_error")
+)
+
+// Message types for the PluginOperator state machine
+
+type StartPluginOperation struct{}
+
+type PluginOperatorShutdown struct{}
+
+type ResumeWaitingForResource struct {
+	Namespace         string
+	ResourceOperation resource.Operation
+	Request           PluginOperatorCheckStatus
+	PreviousAttempts  int
+}
+
+type PluginOperatorRetry struct {
+	ResourceOperation resource.Operation
+	Request           any
+}
+
+// TrackedProgress wraps ProgressResult with tracking information.
+// This is the message type sent from PluginOperator to ResourceUpdater.
+// Plugin implementations do not use this type - they return resource.ProgressResult.
+//
+// NOTE: This type lives in pkg/plugin for now because PluginOperator needs it,
+// but plugin developers don't need to interact with it. Consider splitting
+// pkg/plugin into public SDK types and internal infrastructure types.
+type TrackedProgress struct {
+	resource.ProgressResult
+	ResourceType string    `json:"ResourceType,omitempty"`
+	StartTs      time.Time `json:"StartTs,omitempty"`
+	ModifiedTs   time.Time `json:"ModifiedTs,omitempty"`
+	Attempts     int       `json:"Attempts,omitempty"`
+	MaxAttempts  int       `json:"MaxAttempts,omitempty"`
+}
+
+// Failed returns true if the operation has failed and no more retries are available.
+// This shadows the embedded ProgressResult.Failed() to include retry-aware logic.
+// For recoverable errors, this returns false while retries remain, allowing the
+// PluginOperator to retry the operation.
+func (tp *TrackedProgress) Failed() bool {
+	if tp.OperationStatus != resource.OperationStatusFailure {
+		return false
+	}
+	// Return true only if error is NOT recoverable OR we've exhausted all retries.
+	// Attempts will always be one more than MaxAttempts after exhausting all retries
+	// because progress results are sent during each attempt.
+	return !resource.IsRecoverable(tp.ErrorCode) || tp.Attempts > tp.MaxAttempts
+}
+
+// HasFinished returns true if the operation has completed (successfully or with final failure).
+// This shadows the embedded ProgressResult.HasFinished() to use TrackedProgress.Failed()
+// which includes retry-aware logic.
+func (tp *TrackedProgress) HasFinished() bool {
+	return tp.FinishedSuccessfully() || tp.Failed()
+}
+
+type ReadResource struct {
+	Namespace         string          `json:"Namespace"`
+	NativeID          string          `json:"NativeID"`
+	ResourceType      string          `json:"ResourceType"`
+	ResourceNamespace string          `json:"ResourceNamespace"`
+	TargetConfig      json.RawMessage `json:"TargetConfig"`
+	Resource          model.Resource  `json:"Resource"`
+	ExistingResource  model.Resource  `json:"ExistingResource"`
+	IsSync            bool            `json:"IsSync"`
+	IsDelete          bool            `json:"IsDelete"`
+}
+
+func (r *ReadResource) TreatNotFoundAsSuccess() bool {
+	return r.IsSync || r.IsDelete
+}
+
+type CreateResource struct {
+	Namespace    string          `json:"Namespace"`
+	ResourceType string          `json:"ResourceType"`
+	Label        string          `json:"Label"`
+	Properties   json.RawMessage `json:"Properties"`
+	TargetConfig json.RawMessage `json:"TargetConfig"`
+}
+
+type UpdateResource struct {
+	Namespace         string          `json:"Namespace"`
+	NativeID          string          `json:"NativeID"`
+	ResourceType      string          `json:"ResourceType"`
+	Label             string          `json:"Label"`
+	PriorProperties   json.RawMessage `json:"PriorProperties"`
+	DesiredProperties json.RawMessage `json:"DesiredProperties"`
+	PatchDocument     string          `json:"PatchDocument"`
+	TargetConfig      json.RawMessage `json:"TargetConfig"`
+}
+
+type DeleteResource struct {
+	Namespace    string          `json:"Namespace"`
+	NativeID     string          `json:"NativeID"`
+	Resource     model.Resource  `json:"Resource"`
+	ResourceType string          `json:"ResourceType"`
+	TargetConfig json.RawMessage `json:"TargetConfig"`
+}
+
+type ListParam struct {
+	ParentProperty string
+	ListParam      string
+	ListValue      string
+}
+
+type ListResources struct {
+	Namespace      string
+	TargetLabel    string // Target label for tracking in discovery
+	ResourceType   string
+	TargetConfig   json.RawMessage
+	ListParameters map[string]ListParam
+}
+
+// ListedResource is a lightweight representation of a discovered resource,
+// containing only the NativeID needed for discovery. This keeps the Listing
+// message small to avoid exceeding Ergo's message size limits.
+type ListedResource struct {
+	NativeID     string
+	ResourceType string
+}
+
+// Listing is the response from a List operation, containing discovered resources.
+type Listing struct {
+	Namespace      string               `json:"Namespace"`
+	TargetLabel    string               `json:"TargetLabel"`
+	Resources      []ListedResource     `json:"Resources"`
+	ResourceType   string               `json:"ResourceType"`
+	ListParameters map[string]ListParam `json:"ListParameters"`
+	TargetConfig   json.RawMessage      `json:"TargetConfig"`
+	Error          string               `json:"Error"`
+}
+
+type PluginOperatorCheckStatus struct {
+	Namespace         string
+	RequestID         string
+	NativeID          string // NativeID returned by initial Create/Update
+	ResourceType      string // Optional resource type for status checks
+	TargetConfig      json.RawMessage
+	ResourceOperation resource.Operation
+	Request           any `json:"-"` // local-only: not serialized across nodes
+}
+
+// StatusCheck is an interface that facilitates generating a status check message from the different resource
+// operations so the retry logic can be generalized.
+type StatusCheck interface {
+	StatusCheck(progress *resource.ProgressResult) PluginOperatorCheckStatus
+	Operation() resource.Operation
+	GetResourceType() string
+}
+
+// StatusCheck implementations - properties are expected to be pre-resolved by ResourceUpdater
+func (r ReadResource) StatusCheck(progress *resource.ProgressResult) PluginOperatorCheckStatus {
+	return PluginOperatorCheckStatus{
+		Namespace:         r.ResourceNamespace,
+		RequestID:         r.NativeID,
+		ResourceType:      r.ResourceType,
+		TargetConfig:      r.TargetConfig,
+		ResourceOperation: resource.OperationRead,
+		Request:           r,
+	}
+}
+
+func (c CreateResource) StatusCheck(progress *resource.ProgressResult) PluginOperatorCheckStatus {
+	return PluginOperatorCheckStatus{
+		Namespace:         c.Namespace,
+		RequestID:         progress.RequestID,
+		NativeID:          progress.NativeID,
+		ResourceType:      c.ResourceType,
+		TargetConfig:      c.TargetConfig,
+		ResourceOperation: resource.OperationCreate,
+		Request:           c,
+	}
+}
+
+func (u UpdateResource) StatusCheck(progress *resource.ProgressResult) PluginOperatorCheckStatus {
+	return PluginOperatorCheckStatus{
+		Namespace:         u.Namespace,
+		RequestID:         progress.RequestID,
+		NativeID:          progress.NativeID,
+		ResourceType:      u.ResourceType,
+		TargetConfig:      u.TargetConfig,
+		ResourceOperation: resource.OperationUpdate,
+		Request:           u,
+	}
+}
+
+func (d DeleteResource) StatusCheck(progress *resource.ProgressResult) PluginOperatorCheckStatus {
+	return PluginOperatorCheckStatus{
+		Namespace:         d.Namespace,
+		RequestID:         progress.RequestID,
+		NativeID:          progress.NativeID,
+		ResourceType:      d.ResourceType,
+		TargetConfig:      d.TargetConfig,
+		ResourceOperation: resource.OperationDelete,
+		Request:           d,
+	}
+}
+
+func (c PluginOperatorCheckStatus) StatusCheck(progress *resource.ProgressResult) PluginOperatorCheckStatus {
+	return c
+}
+
+// PluginOperation is an interface that all resource operation messages implement to allow for handling them
+// in a generic way.
+type PluginOperation interface {
+	Operation() resource.Operation
+	PluginNamespace() string
+}
+
+func (r ReadResource) Operation() resource.Operation {
+	return resource.OperationRead
+}
+
+func (r ReadResource) PluginNamespace() string {
+	return r.Namespace
+}
+
+func (r ReadResource) GetResourceType() string {
+	return r.ResourceType
+}
+
+func (c CreateResource) Operation() resource.Operation {
+	return resource.OperationCreate
+}
+
+func (c CreateResource) PluginNamespace() string {
+	return c.Namespace
+}
+
+func (c CreateResource) GetResourceType() string {
+	return c.ResourceType
+}
+
+func (u UpdateResource) Operation() resource.Operation {
+	return resource.OperationUpdate
+}
+
+func (u UpdateResource) PluginNamespace() string {
+	return u.Namespace
+}
+
+func (u UpdateResource) GetResourceType() string {
+	return u.ResourceType
+}
+
+func (d DeleteResource) Operation() resource.Operation {
+	return resource.OperationDelete
+}
+
+func (d DeleteResource) PluginNamespace() string {
+	return d.Namespace
+}
+
+func (d DeleteResource) GetResourceType() string {
+	return d.ResourceType
+}
+
+func (r ResumeWaitingForResource) Operation() resource.Operation {
+	return r.ResourceOperation
+}
+
+func (r ResumeWaitingForResource) PluginNamespace() string {
+	return r.Namespace
+}
+
+func (r ResumeWaitingForResource) GetResourceType() string {
+	return r.Request.ResourceType
+}
+
+func (c PluginOperatorCheckStatus) Operation() resource.Operation {
+	return resource.OperationNoOp
+}
+
+func (c PluginOperatorCheckStatus) PluginNamespace() string {
+	return c.Namespace
+}
+
+func (c PluginOperatorCheckStatus) GetResourceType() string {
+	return c.ResourceType
+}
+
+type PluginUpdateData struct {
+	attempts          int
+	LastStatusMessage string
+
+	config      model.RetryConfig
+	plugin      FullResourcePlugin
+	context     context.Context
+	requestedBy gen.PID
+
+	// Metrics
+	operationStartTime time.Time
+	operationDuration  otelmetric.Float64Histogram
+	operationCounter   otelmetric.Int64Counter
+	retryCounter       otelmetric.Int64Counter
+}
+
+// newNamespaceMismatchError creates a TrackedProgress for namespace mismatch errors.
+// This includes attempts info so the UI can show retry status.
+func (data PluginUpdateData) newNamespaceMismatchError() TrackedProgress {
+	maxAttempts := int(data.config.MaxRetries) + 1
+	return TrackedProgress{
+		ProgressResult: resource.ProgressResult{
+			OperationStatus: resource.OperationStatusFailure,
+			ErrorCode:       resource.OperationErrorCodePluginNotFound,
+		},
+		Attempts:    data.attempts,
+		MaxAttempts: maxAttempts,
+		ModifiedTs:  time.Now(),
+	}
+}
+
+func (data PluginUpdateData) newUnforeseenError() TrackedProgress {
+	maxAttempts := int(data.config.MaxRetries) + 1
+	return TrackedProgress{
+		ProgressResult: resource.ProgressResult{
+			OperationStatus: resource.OperationStatusFailure,
+			ErrorCode:       resource.OperationErrorCodeUnforeseenError,
+		},
+		Attempts:    data.attempts,
+		MaxAttempts: maxAttempts,
+		ModifiedTs:  time.Now(),
+	}
+}
+
+// terminalCallError builds the terminal progress for a failed mutating plugin
+// call. A create, update or delete that failed may already have reached the
+// provider, so it is reported as terminal rather than retried.
+func (data PluginUpdateData) terminalCallError(operation resource.Operation, err error) TrackedProgress {
+	progress := data.newUnforeseenError()
+	progress.StatusMessage = err.Error()
+	return progress
+}
+
+// statusCheckAfterFailedCall returns the check to feed back into
+// handlePluginResult when a status call itself failed.
+// handlePluginResult re-issues the operation that started a check whenever the
+// check still carries it, so clearing Request guarantees the retry is another
+// status poll: only the poll failed, and a mutation that may already have
+// reached the provider must never be issued twice. Every identifier survives,
+// because a check's own StatusCheck is the identity.
+func statusCheckAfterFailedCall(check PluginOperatorCheckStatus) PluginOperatorCheckStatus {
+	check.Request = nil
+	return check
+}
+
+// statusCallFailure builds the failure progress for a status call that returned
+// an error instead of a result. A throttled call is safe to repeat, so it
+// widens into a recoverable code; every other error stays terminal. The check's
+// identifiers are carried over because the retry ladder rebuilds the next poll
+// from the progress.
+func (data PluginUpdateData) statusCallFailure(check PluginOperatorCheckStatus, err error) *resource.ProgressResult {
+	errorCode := resource.OperationErrorCodeUnforeseenError
+	if isThrottlingError(err) {
+		errorCode = resource.OperationErrorCodeThrottling
+	}
+
+	return &resource.ProgressResult{
+		Operation:       check.ResourceOperation,
+		OperationStatus: resource.OperationStatusFailure,
+		RequestID:       check.RequestID,
+		NativeID:        check.NativeID,
+		ErrorCode:       errorCode,
+		StatusMessage:   err.Error(),
+	}
+}
+
+func (o *PluginOperator) Init(args ...any) (statemachine.StateMachineSpec[PluginUpdateData], error) {
+	data := PluginUpdateData{
+		attempts: 1,
+	}
+
+	initialState := StateNotStarted
+	if len(args) > 0 {
+		initialState = args[0].(gen.Atom)
+	}
+
+	pluginEnv, ok := o.Env("Plugin")
+	if !ok {
+		pluginEnv, ok = o.Node().Env("Plugin")
+		if !ok {
+			o.Log().Error("PluginOperator: missing 'Plugin' environment variable")
+			return statemachine.StateMachineSpec[PluginUpdateData]{}, fmt.Errorf("pluginOperator: missing 'Plugin' environment variable")
+		}
+	}
+	data.plugin = pluginEnv.(FullResourcePlugin)
+
+	ctx, ok := o.Env("Context")
+	if !ok {
+		ctx, ok = o.Node().Env("Context")
+		if !ok {
+			o.Log().Error("PluginOperator: missing 'Context' environment variable")
+			return statemachine.StateMachineSpec[PluginUpdateData]{}, fmt.Errorf("pluginOperator: missing 'Context' environment variable")
+		}
+	}
+	data.context = ctx.(context.Context)
+
+	// RetryConfig from node environment
+	cfg, ok := o.Env("RetryConfig")
+	if !ok {
+		o.Log().Error("PluginOperator: missing 'RetryConfig' environment variable")
+		return statemachine.StateMachineSpec[PluginUpdateData]{}, fmt.Errorf("pluginOperator: missing 'RetryConfig' environment variable")
+	}
+	data.config = cfg.(model.RetryConfig)
+
+	// RequestedBy: the requesting ResourceUpdater's PID, threaded in via Env so
+	// we can establish the operator→RU link asynchronously (off the operation
+	// critical path). Linking here in Init would block, so we defer it via a
+	// self-message handled once the operator is Running (mirrors PluginActor's
+	// deferred setupMonitoring).
+	if v, ok := o.Env("RequestedBy"); ok {
+		if pid, ok := v.(gen.PID); ok && pid != (gen.PID{}) {
+			data.requestedBy = pid
+			if err := o.Send(o.PID(), establishLinkRequester{}); err != nil {
+				o.Log().Error("PluginOperator: failed to schedule requester link: %v", err)
+			}
+		}
+	}
+
+	// OidcCredentialBroker{Node,Name}: the broker the coordinator paired with
+	// this plugin's namespace. The pair is injected atomically, so exactly one
+	// key present is a broken pairing - refuse to start rather than serve
+	// operations as if no broker existed. The client goes on the operator's
+	// context, which is passed to every operation, including discovery.
+	brokerClient, err := oidcBrokerClientFromEnv(o, data.plugin.Namespace())
+	if err != nil {
+		o.Log().Error("%v", err)
+		return statemachine.StateMachineSpec[PluginUpdateData]{}, err
+	}
+	if brokerClient != nil {
+		data.context = withOidcBrokerClient(data.context, brokerClient)
+		if info, ok := oidcOperationInfoFromEnv(o); ok {
+			data.context = context.WithValue(data.context, oidcOperationInfoKey{}, info)
+		}
+	}
+
+	// Initialize OTel metrics
+	if err := setupPluginOperatorMetrics(&data); err != nil {
+		o.Log().Error("Failed to setup plugin operator metrics: %v", err)
+		// Don't fail initialization if metrics setup fails
+	}
+
+	return statemachine.NewStateMachineSpec(initialState,
+		statemachine.WithData(data),
+
+		statemachine.WithStateEnterCallback(onStateChange),
+
+		statemachine.WithStateCallHandler(StateNotStarted, read),
+		statemachine.WithStateCallHandler(StateNotStarted, create),
+		statemachine.WithStateCallHandler(StateNotStarted, update),
+		statemachine.WithStateCallHandler(StateNotStarted, delete),
+		statemachine.WithStateCallHandler(StateNotStarted, resume),
+		statemachine.WithStateCallHandler(StateRetrying, read),
+		statemachine.WithStateCallHandler(StateRetrying, create),
+		statemachine.WithStateCallHandler(StateRetrying, update),
+		statemachine.WithStateCallHandler(StateRetrying, delete),
+
+		statemachine.WithStateMessageHandler(StateNotStarted, list),
+		statemachine.WithStateMessageHandler(StateNotStarted, establishLink),
+		statemachine.WithStateMessageHandler(StateWaitingForResource, establishLink),
+		statemachine.WithStateMessageHandler(StateRetrying, establishLink),
+		statemachine.WithStateMessageHandler(StateWaitingForResource, status),
+		statemachine.WithStateMessageHandler(StateRetrying, retry),
+		statemachine.WithStateMessageHandler(StateFinishedSuccessfully, shutdown),
+		statemachine.WithStateMessageHandler(StateFinishedWithError, shutdown),
+	), nil
+}
+
+func shutdown(from gen.PID, state gen.Atom, data PluginUpdateData, shutdown PluginOperatorShutdown, proc gen.Process) (gen.Atom, PluginUpdateData, []statemachine.Action, error) {
+	return state, data, nil, gen.TerminateReasonNormal
+}
+
+// establishLinkRequester is sent to self after Init to defer establishing the
+// operator→ResourceUpdater link until the operator is Running (linking in Init
+// would block on a synchronous cross-node link RPC, stalling the spawn and the
+// requesting RU). Mirrors PluginActor's deferred setupMonitoring.
+type establishLinkRequester struct{}
+
+// establishLink creates a unidirectional link from this operator to its
+// requesting ResourceUpdater (RU). Because ergo links are unidirectional, the
+// RU's termination terminates the operator, while an operator crash leaves the
+// RU untouched.
+// This lets the executor's LinkParent cascade tear down in-flight remote
+// operators when their RU dies, without an operator failure reaching back to
+// the RU (that path stays handled by the existing timeout logic).
+//
+// The PluginOperator (a StateMachine) does not trap exits, so the link
+// auto-terminates it when the RU dies; no MessageExit* handler is needed.
+//
+// A failed link is not fatal: the operator can still complete its operation; it
+// just won't auto-terminate if the RU dies. The most common cause is the RU
+// already being gone, in which case nothing in flight matters anyway.
+func establishLink(from gen.PID, state gen.Atom, data PluginUpdateData, msg establishLinkRequester, proc gen.Process) (gen.Atom, PluginUpdateData, []statemachine.Action, error) {
+	if data.requestedBy != (gen.PID{}) {
+		if err := proc.LinkPID(data.requestedBy); err != nil {
+			proc.Log().Error("PluginOperator: failed to link requester %v: %v", data.requestedBy, err)
+		}
+	}
+	return state, data, nil, nil
+}
+
+func onStateChange(oldState gen.Atom, newState gen.Atom, data PluginUpdateData, proc gen.Process) (gen.Atom, PluginUpdateData, error) {
+	if newState == StateFinishedSuccessfully || newState == StateFinishedWithError {
+		err := proc.Send(proc.PID(), PluginOperatorShutdown{})
+		if err != nil {
+			proc.Log().Error("PluginOperator: failed to send terminate message: %v", err)
+		}
+	}
+	return newState, data, nil
+}
+
+// validateNamespace checks that the operation targets the correct plugin.
+// Uses case-insensitive comparison since plugins register with lowercase namespace
+// but resource types may use uppercase (e.g., "OVH::Compute::Keypair").
+func validateNamespace(data PluginUpdateData, namespace string, proc gen.Process) bool {
+	if !strings.EqualFold(namespace, data.plugin.Namespace()) {
+		proc.Log().Error("PluginOperator: namespace mismatch", "expected", data.plugin.Namespace(), "got", namespace)
+		return false
+	}
+	return true
+}
+
+func read(from gen.PID, state gen.Atom, data PluginUpdateData, operation ReadResource, proc gen.Process) (gen.Atom, PluginUpdateData, TrackedProgress, []statemachine.Action, error) {
+	data.requestedBy = from
+	data.operationStartTime = time.Now() // Start timing
+	if !validateNamespace(data, operation.Namespace, proc) {
+		return StateFinishedWithError, data, data.newNamespaceMismatchError(), nil, nil
+	}
+
+	progressResult := resource.ProgressResult{
+		Operation: resource.OperationRead,
+		NativeID:  operation.NativeID,
+	}
+	proc.Log().Debug("PluginOperator: starting read operation for %s", operation.NativeID)
+
+	result, err := data.plugin.Read(data.context, &resource.ReadRequest{
+		NativeID:        operation.NativeID,
+		ResourceType:    operation.ResourceType,
+		TargetConfig:    operation.TargetConfig,
+		PriorProperties: operation.ExistingResource.Properties,
+	})
+	if err != nil {
+		proc.Log().Debug("PluginOperator: failed to read resource: %v", err)
+		progressResult.OperationStatus = resource.OperationStatusFailure
+		progressResult.ErrorCode = resource.OperationErrorCodeUnforeseenError
+		progressResult.StatusMessage = err.Error()
+	} else if result.ErrorCode != "" && (!operation.TreatNotFoundAsSuccess() || result.ErrorCode != resource.OperationErrorCodeNotFound) {
+		progressResult.OperationStatus = resource.OperationStatusFailure
+		progressResult.ErrorCode = result.ErrorCode
+	} else if result.ErrorCode == resource.OperationErrorCodeNotFound && operation.TreatNotFoundAsSuccess() {
+		proc.Log().Debug("PluginOperator: resource %s not found, marking operation as successful due to sync or delete", operation.NativeID)
+		progressResult.OperationStatus = resource.OperationStatusSuccess
+		progressResult.ErrorCode = result.ErrorCode
+	} else {
+		progressResult.OperationStatus = resource.OperationStatusSuccess
+		progressResult.ResourceProperties = json.RawMessage(result.Properties)
+	}
+
+	return handlePluginResult(data, operation, proc, &progressResult)
+}
+
+func create(from gen.PID, state gen.Atom, data PluginUpdateData, operation CreateResource, proc gen.Process) (gen.Atom, PluginUpdateData, TrackedProgress, []statemachine.Action, error) {
+	data.requestedBy = from
+	data.operationStartTime = time.Now() // Start timing
+	if !validateNamespace(data, operation.Namespace, proc) {
+		return StateFinishedWithError, data, data.newNamespaceMismatchError(), nil, nil
+	}
+
+	proc.Log().Debug("PluginOperator: starting create operation for %s", operation.ResourceType)
+
+	// Properties are expected to be pre-resolved by ResourceUpdater
+	result, err := data.plugin.Create(data.context, &resource.CreateRequest{
+		ResourceType: operation.ResourceType,
+		Label:        operation.Label,
+		Properties:   operation.Properties,
+		TargetConfig: operation.TargetConfig,
+	})
+	if err != nil {
+		proc.Log().Error("PluginOperator: failed to create resource %s: %v", operation.ResourceType, err)
+		return StateFinishedWithError, data, data.terminalCallError(resource.OperationCreate, err), nil, nil
+	}
+
+	return handlePluginResult(data, operation, proc, result.ProgressResult)
+}
+
+func update(from gen.PID, state gen.Atom, data PluginUpdateData, operation UpdateResource, proc gen.Process) (gen.Atom, PluginUpdateData, TrackedProgress, []statemachine.Action, error) {
+	data.requestedBy = from
+	data.operationStartTime = time.Now() // Start timing
+	if !validateNamespace(data, operation.Namespace, proc) {
+		return StateFinishedWithError, data, data.newNamespaceMismatchError(), nil, nil
+	}
+
+	result, err := data.plugin.Update(data.context, &resource.UpdateRequest{
+		NativeID:          operation.NativeID,
+		ResourceType:      operation.ResourceType,
+		Label:             operation.Label,
+		PriorProperties:   operation.PriorProperties,
+		DesiredProperties: operation.DesiredProperties,
+		PatchDocument:     &operation.PatchDocument,
+		TargetConfig:      operation.TargetConfig,
+	})
+	if err != nil {
+		proc.Log().Error("PluginOperator: failed to update resource: %v", err)
+		return StateFinishedWithError, data, data.terminalCallError(resource.OperationUpdate, err), nil, nil
+	}
+
+	return handlePluginResult(data, operation, proc, result.ProgressResult)
+}
+
+func delete(from gen.PID, state gen.Atom, data PluginUpdateData, operation DeleteResource, proc gen.Process) (gen.Atom, PluginUpdateData, TrackedProgress, []statemachine.Action, error) {
+	data.requestedBy = from
+	data.operationStartTime = time.Now() // Start timing
+	if !validateNamespace(data, operation.Namespace, proc) {
+		return StateFinishedWithError, data, data.newNamespaceMismatchError(), nil, nil
+	}
+
+	result, err := data.plugin.Delete(data.context, &resource.DeleteRequest{
+		NativeID:     operation.NativeID,
+		ResourceType: operation.ResourceType,
+		TargetConfig: operation.TargetConfig,
+	})
+	if err != nil {
+		proc.Log().Error("PluginOperator: failed to delete resource: %v", err)
+		return StateFinishedWithError, data, data.terminalCallError(resource.OperationDelete, err), nil, nil
+	}
+
+	return handlePluginResult(data, operation, proc, result.ProgressResult)
+}
+
+func status(from gen.PID, state gen.Atom, data PluginUpdateData, operation PluginOperatorCheckStatus, proc gen.Process) (gen.Atom, PluginUpdateData, []statemachine.Action, error) {
+	if !validateNamespace(data, operation.Namespace, proc) {
+		mismatch := data.newNamespaceMismatchError()
+		// The requester tracks this update by the identifiers it polls with, so
+		// they travel with the failure.
+		mismatch.Operation = operation.ResourceOperation
+		mismatch.RequestID = operation.RequestID
+		mismatch.NativeID = operation.NativeID
+		if sendErr := proc.Send(data.requestedBy, mismatch); sendErr != nil {
+			proc.Log().Error("PluginOperator: failed to send namespace mismatch result: %v", sendErr)
+		}
+		return StateFinishedWithError, data, nil, nil
+	}
+
+	proc.Log().Debug("PluginOperator: checking status of resource %s", operation.RequestID)
+
+	result, err := data.plugin.Status(data.context, &resource.StatusRequest{
+		RequestID:    operation.RequestID,
+		NativeID:     operation.NativeID,
+		ResourceType: operation.ResourceType,
+		TargetConfig: operation.TargetConfig,
+	})
+
+	var checkResult *resource.ProgressResult
+	if err != nil {
+		// A status call that returned no result leaves the operation's outcome
+		// unknown, so it travels the normal ladder as a failure of the check and
+		// only another check may follow it.
+		operation = statusCheckAfterFailedCall(operation)
+		checkResult = data.statusCallFailure(operation, err)
+		proc.Log().Error("PluginOperator: status check of resource %s failed with error code %s: %v", operation.RequestID, checkResult.ErrorCode, err)
+		// A failed call spends an attempt, unlike a poll that reports progress:
+		// it escalates the backoff and eventually ends the operation instead of
+		// polling a failing API forever. The message travels with the attempt so
+		// this failure is the one the requester reads, not an earlier one.
+		data.attempts++
+		data.LastStatusMessage = checkResult.StatusMessage
+	} else {
+		checkResult = result.ProgressResult
+	}
+
+	nextState, data, progress, actions, pluginErr := handlePluginResult(data, operation, proc, checkResult)
+	err = proc.Send(data.requestedBy, progress)
+	if err != nil {
+		proc.Log().Error("PluginOperator: failed to send status result: %v", err)
+		return StateFinishedWithError, data, nil, nil
+	}
+
+	return nextState, data, actions, pluginErr
+}
+
+func retry(from gen.PID, state gen.Atom, data PluginUpdateData, operation PluginOperatorRetry, proc gen.Process) (gen.Atom, PluginUpdateData, []statemachine.Action, error) {
+	var nextState gen.Atom
+	var newData PluginUpdateData
+	var progress TrackedProgress
+	var actions []statemachine.Action
+	var pluginErr error
+
+	data.attempts++
+
+	// Use data.requestedBy (the original caller) instead of from (which is the PluginOperator's own PID
+	// when retry messages are sent via SendAfter). This preserves the correct recipient for progress updates.
+	switch operation.ResourceOperation {
+	case resource.OperationRead:
+		nextState, newData, progress, actions, pluginErr = read(data.requestedBy, state, data, operation.Request.(ReadResource), proc)
+	case resource.OperationCreate:
+		nextState, newData, progress, actions, pluginErr = create(data.requestedBy, state, data, operation.Request.(CreateResource), proc)
+	case resource.OperationUpdate:
+		nextState, newData, progress, actions, pluginErr = update(data.requestedBy, state, data, operation.Request.(UpdateResource), proc)
+	case resource.OperationDelete:
+		nextState, newData, progress, actions, pluginErr = delete(data.requestedBy, state, data, operation.Request.(DeleteResource), proc)
+	default:
+		proc.Log().Error("PluginOperator: cannot retry unsupported operation %s", operation.ResourceOperation)
+		nextState, newData = StateFinishedWithError, data
+		progress = data.newUnforeseenError()
+		progress.Operation = operation.ResourceOperation
+		progress.StatusMessage = fmt.Sprintf("cannot retry unsupported operation %s", operation.ResourceOperation)
+	}
+
+	proc.Log().Debug("PluginOperator: sending progress update to resource updater %v", data.requestedBy)
+	err := proc.Send(data.requestedBy, progress)
+	if err != nil {
+		proc.Log().Error("PluginOperator: failed to send status result: %v", err)
+		return StateFinishedWithError, data, nil, fmt.Errorf("pluginOperator: failed to send status result: %v", err)
+	}
+
+	return nextState, newData, actions, pluginErr
+}
+
+func resume(from gen.PID, state gen.Atom, data PluginUpdateData, operation ResumeWaitingForResource, proc gen.Process) (gen.Atom, PluginUpdateData, TrackedProgress, []statemachine.Action, error) {
+	data.requestedBy = from
+	if !validateNamespace(data, operation.Namespace, proc) {
+		return StateFinishedWithError, data, data.newNamespaceMismatchError(), nil, nil
+	}
+
+	data.attempts = operation.PreviousAttempts
+	proc.Log().Debug("PluginOperator: resume waiting for resource %s", operation.Request.RequestID)
+
+	result, err := data.plugin.Status(data.context, &resource.StatusRequest{
+		RequestID:    operation.Request.RequestID,
+		NativeID:     operation.Request.NativeID,
+		ResourceType: operation.Request.ResourceType,
+		TargetConfig: operation.Request.TargetConfig,
+	})
+	if err != nil {
+		proc.Log().Error("PluginOperator: failed to get resume waiting for resource: %v", err)
+		errProgress := data.newUnforeseenError()
+		errProgress.StatusMessage = err.Error()
+		return StateFinishedWithError, data, errProgress, nil, nil
+	}
+
+	return handlePluginResult(data, operation.Request, proc, result.ProgressResult)
+}
+
+// isThrottlingError checks if an error is a throttling/rate limit error.
+// This checks for common throttling indicators in error messages since
+// the AWS SDK wraps errors when retries are exhausted.
+func isThrottlingError(err error) bool {
+	if err == nil {
+		return false
+	}
+	errStr := err.Error()
+	return strings.Contains(errStr, "ThrottlingException") ||
+		strings.Contains(errStr, "Throttling") ||
+		strings.Contains(errStr, "Rate exceeded") ||
+		strings.Contains(errStr, "TooManyRequestsException") ||
+		strings.Contains(errStr, "RequestLimitExceeded")
+}
+
+func handlePluginResult(data PluginUpdateData, operation StatusCheck, proc gen.Process, result *resource.ProgressResult) (gen.Atom, PluginUpdateData, TrackedProgress, []statemachine.Action, error) {
+	maxAttempts := int(data.config.MaxRetries) + 1
+	progress := TrackedProgress{
+		ProgressResult: *result,
+		ResourceType:   operation.GetResourceType(),
+		StartTs:        data.operationStartTime,
+		Attempts:       data.attempts,
+		MaxAttempts:    maxAttempts,
+		ModifiedTs:     time.Now(),
+	}
+
+	if data.attempts > 1 {
+		progress.StatusMessage = data.LastStatusMessage
+	}
+
+	// Record metrics when operation finishes (success or final failure)
+	if progress.FinishedSuccessfully() || (progress.OperationStatus == resource.OperationStatusFailure && data.attempts >= maxAttempts) {
+		recordPluginMetrics(data, operation, &progress)
+	}
+
+	if progress.FinishedSuccessfully() {
+		proc.Log().Debug("PluginOperator: %T operation finished successfully", operation)
+		return StateFinishedSuccessfully, data, progress, nil, nil
+	}
+	if progress.OperationStatus == resource.OperationStatusFailure {
+		if resource.IsRecoverable(progress.ErrorCode) && data.attempts <= maxAttempts {
+			// Use exponential backoff for throttling errors to avoid thundering herd
+			retryDelay := data.config.RetryDelay
+			if progress.ErrorCode == resource.OperationErrorCodeThrottling {
+				retryDelay = resource.RetryStrategy{BaseDelay: data.config.RetryDelay}.Backoff(data.attempts)
+				proc.Log().Debug("PluginOperator: %T throttled, backing off for %v before retry (%d/%d)", operation, retryDelay, data.attempts, maxAttempts)
+			} else {
+				proc.Log().Info("PluginOperator: %T operation failed with recoverable error code %s. Status message: %s. Retrying (%d/%d)", operation, progress.ErrorCode, progress.StatusMessage, data.attempts, maxAttempts)
+			}
+			data.LastStatusMessage = progress.StatusMessage
+
+			// Build the retry message. When coming from the cross-node resume
+			// path, PluginOperatorCheckStatus.Request is nil (not serialized)
+			// so we fall back to scheduling another status check instead of
+			// retrying the original operation.
+			var retryMessage any
+			if val, ok := operation.(PluginOperatorCheckStatus); ok && val.Request != nil {
+				retryMessage = PluginOperatorRetry{ResourceOperation: val.ResourceOperation, Request: val.Request}
+			} else if _, ok := operation.(PluginOperatorCheckStatus); ok {
+				retryMessage = operation.StatusCheck(&progress.ProgressResult)
+			} else {
+				retryMessage = PluginOperatorRetry{ResourceOperation: operation.Operation(), Request: operation}
+			}
+
+			_, err := proc.SendAfter(proc.PID(), retryMessage, retryDelay)
+			if err != nil {
+				proc.Log().Error("PluginOperator: failed to send retry message: %v", err)
+				return StateFinishedWithError, data, data.newUnforeseenError(), nil, nil
+			}
+
+			// When falling back to a status check, stay in waiting_for_resource
+			// (the status handler) instead of retrying (which needs the original request).
+			if _, isRetry := retryMessage.(PluginOperatorRetry); !isRetry {
+				return StateWaitingForResource, data, progress, nil, nil
+			}
+			return StateRetrying, data, progress, nil, nil
+		}
+
+		proc.Log().Error("PluginOperator: %T operation failed with error code %s. Status message: %s", operation, progress.ErrorCode, progress.StatusMessage)
+		return StateFinishedWithError, data, progress, nil, nil
+	}
+
+	// If we get here, it means the operation is still in progress and we schedule a status check.
+	proc.Log().Debug("PluginOperator: %T operation is still in progress, scheduling status check after %d seconds", operation, data.config.StatusCheckInterval.Seconds())
+	statusCheck := statemachine.GenericTimeout{
+		Name:     "CheckStatus",
+		Duration: data.config.StatusCheckInterval,
+		Message:  operation.StatusCheck(&progress.ProgressResult),
+	}
+
+	return StateWaitingForResource, data, progress, []statemachine.Action{statusCheck}, nil
+}
+
+func list(from gen.PID, state gen.Atom, data PluginUpdateData, operation ListResources, proc gen.Process) (gen.Atom, PluginUpdateData, []statemachine.Action, error) {
+	data.requestedBy = from
+	if !validateNamespace(data, operation.Namespace, proc) {
+		return StateFinishedWithError, data, nil, nil
+	}
+
+	proc.Log().Debug("PluginOperator: listing resources of type %s with list parameters %v", operation.ResourceType, operation.ListParameters)
+	var nextPageToken *string
+	pagenr := 1
+	var listedResources []ListedResource
+
+	const maxListAttempts = 4 // Total attempts including initial
+
+	for {
+		additionalProps := make(map[string]string)
+		for _, v := range operation.ListParameters {
+			additionalProps[v.ListParam] = v.ListValue
+		}
+
+		var result *resource.ListResult
+		var err error
+
+		// Retry loop with exponential backoff for throttling
+		for attempt := 1; attempt <= maxListAttempts; attempt++ {
+			result, err = data.plugin.List(data.context, &resource.ListRequest{
+				ResourceType:         operation.ResourceType,
+				TargetConfig:         operation.TargetConfig,
+				PageSize:             100,
+				PageToken:            nextPageToken,
+				AdditionalProperties: additionalProps,
+			})
+			if err == nil {
+				break // Success
+			}
+
+			// Check if this is a throttling error worth retrying
+			if isThrottlingError(err) && attempt < maxListAttempts {
+				backoff := resource.RetryStrategy{BaseDelay: data.config.RetryDelay}.Backoff(attempt)
+				proc.Log().Debug("PluginOperator: list %s throttled, backing off for %v before retry (%d/%d)",
+					operation.ResourceType, backoff, attempt, maxListAttempts)
+				time.Sleep(backoff)
+				continue
+			}
+
+			// Non-throttling error or max attempts reached
+			break
+		}
+
+		if err != nil {
+			proc.Log().Error("PluginOperator: failed to list resources of type %s with list parameters %v: %v", operation.ResourceType, operation.ListParameters, err)
+
+			// Important: Retain resource type + target so discovery can remove the resource (and eventually return to idle)
+			sendErr := proc.Send(data.requestedBy, Listing{
+				Namespace:      operation.Namespace,
+				TargetLabel:    operation.TargetLabel,
+				Resources:      nil,
+				ResourceType:   operation.ResourceType,
+				ListParameters: operation.ListParameters,
+				TargetConfig:   operation.TargetConfig,
+				Error:          err.Error(),
+			})
+			if sendErr != nil {
+				proc.Log().Error("PluginOperator: failed to send empty list result: %v", sendErr)
+			}
+			return StateFinishedWithError, data, nil, nil
+		}
+		proc.Log().Debug("PluginOperator: received %d resources in page %d for resources of type %s", len(result.NativeIDs), pagenr, operation.ResourceType)
+		pagenr++
+		// Convert NativeIDs to ListedResource (adding ResourceType for discovery)
+		for _, nativeID := range result.NativeIDs {
+			listedResources = append(listedResources, ListedResource{
+				NativeID:     nativeID,
+				ResourceType: operation.ResourceType,
+			})
+		}
+		nextPageToken = result.NextPageToken
+		if nextPageToken == nil || *nextPageToken == "" {
+			break
+		}
+	}
+
+	proc.Log().Debug("PluginOperator: sending %d listed resources", len(listedResources))
+
+	sendErr := proc.Send(data.requestedBy, Listing{
+		Namespace:      operation.Namespace,
+		TargetLabel:    operation.TargetLabel,
+		Resources:      listedResources,
+		ResourceType:   operation.ResourceType,
+		ListParameters: operation.ListParameters,
+		TargetConfig:   operation.TargetConfig,
+	})
+	if sendErr != nil {
+		proc.Log().Error("PluginOperator: failed to send list result: %v", sendErr)
+		return StateFinishedWithError, data, nil, fmt.Errorf("pluginOperator: failed to send list result: %v", sendErr)
+	}
+
+	return StateFinishedSuccessfully, data, nil, nil
+}
+
+// setupPluginOperatorMetrics initializes OTel metrics for plugin operations
+func setupPluginOperatorMetrics(data *PluginUpdateData) error {
+	meter := otel.Meter("formae/plugin_operator")
+
+	var err error
+	data.operationDuration, err = meter.Float64Histogram(
+		"formae.plugin.operation.duration_ms",
+		otelmetric.WithDescription("Duration of plugin operations"),
+		otelmetric.WithUnit("ms"),
+	)
+	if err != nil {
+		return fmt.Errorf("failed to create operation duration histogram: %w", err)
+	}
+
+	data.operationCounter, err = meter.Int64Counter(
+		"formae.plugin.operation.total",
+		otelmetric.WithDescription("Total plugin operations"),
+	)
+	if err != nil {
+		return fmt.Errorf("failed to create operation counter: %w", err)
+	}
+
+	data.retryCounter, err = meter.Int64Counter(
+		"formae.plugin.operation.retries.total",
+		otelmetric.WithDescription("Total plugin operation retries"),
+	)
+	if err != nil {
+		return fmt.Errorf("failed to create retry counter: %w", err)
+	}
+
+	return nil
+}
+
+// recordPluginMetrics records metrics for a completed plugin operation
+func recordPluginMetrics(data PluginUpdateData, operation StatusCheck, progress *TrackedProgress) {
+	if !data.operationStartTime.IsZero() {
+		duration := time.Since(data.operationStartTime).Milliseconds()
+
+		// Determine result status
+		var result string
+		if progress.FinishedSuccessfully() {
+			result = "success"
+		} else if progress.OperationStatus == resource.OperationStatusFailure {
+			result = "failure"
+		} else {
+			result = "unknown"
+		}
+
+		attrs := []attribute.KeyValue{
+			attribute.String("plugin", data.plugin.Namespace()),
+			attribute.String("operation", string(operation.Operation())),
+			attribute.String("result", result),
+		}
+
+		// Add resource type if available
+		if resourceType := operation.GetResourceType(); resourceType != "" {
+			attrs = append(attrs, attribute.String("resource_type", resourceType))
+		}
+
+		// Record duration
+		if data.operationDuration != nil {
+			data.operationDuration.Record(data.context, float64(duration), otelmetric.WithAttributes(attrs...))
+		}
+
+		// Record operation count
+		if data.operationCounter != nil {
+			data.operationCounter.Add(data.context, 1, otelmetric.WithAttributes(attrs...))
+		}
+
+		// Record retries if there were any
+		if data.attempts > 1 && data.retryCounter != nil {
+			retryAttrs := append(attrs, attribute.Int("attempts", data.attempts))
+			if progress.ErrorCode != "" {
+				retryAttrs = append(retryAttrs, attribute.String("error_code", string(progress.ErrorCode)))
+			}
+			data.retryCounter.Add(data.context, int64(data.attempts-1), otelmetric.WithAttributes(retryAttrs...))
+		}
+	}
+}

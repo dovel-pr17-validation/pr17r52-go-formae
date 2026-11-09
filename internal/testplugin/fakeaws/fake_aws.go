@@ -1,0 +1,460 @@
+// © 2025 Platform Engineering Labs Inc.
+//
+// SPDX-License-Identifier: FSL-1.1-ALv2
+
+package fakeaws
+
+import (
+	"context"
+	"encoding/json"
+	"sync"
+
+	"github.com/masterminds/semver"
+	"github.com/platform-engineering-labs/formae/pkg/model"
+	"github.com/platform-engineering-labs/formae/pkg/plugin"
+	"github.com/platform-engineering-labs/formae/pkg/plugin/resource"
+)
+
+// secretsManagerSecretType is the FakeAWS SecretsManager::Secret resource
+// type, mirroring the real AWS resource for opaque-value test coverage.
+const secretsManagerSecretType = "FakeAWS::SecretsManager::Secret"
+
+// defaultSecretString enriches a Read for a secret whose plaintext wasn't
+// captured locally (e.g. a Read with no prior Create in this plugin
+// instance, such as a discovered secret).
+const defaultSecretString = "fake-secret-value"
+
+type FakeAWS struct {
+	// pendingCreates tracks in-progress creates by RequestID so Status can
+	// return the original properties when the resource "completes".
+	mu             sync.Mutex
+	pendingCreates map[string][]byte
+
+	// secrets tracks created SecretsManager::Secret properties by NativeID
+	// so Read can enrich later reads with the bare secret value, mimicking
+	// AWS's GetSecretValue which returns SecretString envelope-less rather
+	// than wrapped in the opaque {"$value": ...} structure used at rest.
+	secrets map[string]json.RawMessage
+}
+
+// Compile time checks to satisfy protocol
+var _ plugin.FullResourcePlugin = &FakeAWS{}
+
+// RateLimitMaxRPS allows tests to control the rate limit
+var RateLimitMaxRPS int = 5
+
+// NewFakeAWS creates a new FakeAWS test plugin instance.
+func NewFakeAWS() *FakeAWS {
+	return &FakeAWS{
+		pendingCreates: make(map[string][]byte),
+		secrets:        make(map[string]json.RawMessage),
+	}
+}
+
+func (s *FakeAWS) Name() string {
+	return "fake-aws"
+}
+
+func (s *FakeAWS) Version() *semver.Version {
+	return semver.MustParse("0.0.1")
+}
+
+func (s *FakeAWS) Type() plugin.Type {
+	return plugin.Resource
+}
+
+func (s *FakeAWS) Namespace() string {
+	return "FakeAWS"
+}
+
+func (s *FakeAWS) overrides(context context.Context) *plugin.ResourcePluginOverrides {
+	if f, ok := context.Value(plugin.ResourcePluginOverridesContextKey).(*plugin.ResourcePluginOverrides); ok {
+		return f
+	}
+
+	return nil
+}
+
+func (s *FakeAWS) SupportedResources() []plugin.ResourceDescriptor {
+	return []plugin.ResourceDescriptor{
+		{
+			Type: "FakeAWS::S3::Bucket",
+
+			Discoverable: true,
+		},
+		{
+			Type:         "FakeAWS::EC2::VPC",
+			Discoverable: true,
+		},
+		{
+			Type: "FakeAWS::EC2::VPCCidrBlock",
+			ParentResourceTypesWithMappingProperties: map[string][]plugin.ListParameter{
+				"FakeAWS::EC2::VPC": {{ParentProperty: "VpcId", ListProperty: "VpcId", QueryPath: "$.VpcId"}},
+			},
+			Discoverable: true,
+		},
+		{
+			Type:         "FakeAWS::EC2::Instance",
+			Discoverable: true,
+		},
+		// Versioned::Parent + Versioned::Consumer model the cascade-update
+		// case: a parent whose CreateOnly field forces Replace, and a
+		// consumer referencing it via a non-CreateOnly field. Used to
+		// verify that the planner does NOT cascade-replace the consumer
+		// in that situation.
+		{
+			Type:         "FakeAWS::Versioned::Parent",
+			Discoverable: false,
+		},
+		{
+			Type:         "FakeAWS::Versioned::Consumer",
+			Discoverable: false,
+		},
+		// SecretsManager::Secret models a resource with an opaque field
+		// (SecretString), used to test schema-keyed secret hashing end to
+		// end.
+		{
+			Type:         secretsManagerSecretType,
+			Discoverable: false,
+		},
+		// Custom::Resource models an opaque-bodied resource whose Spec is a
+		// user-owned document: hinted Atomic (whole-value diff) and
+		// preserveEmptyValues (empty collections inside it are values).
+		{
+			Type:         "FakeAWS::Custom::Resource",
+			Discoverable: false,
+		},
+	}
+}
+
+func (s *FakeAWS) RateLimit() model.RateLimitConfig {
+	return model.RateLimitConfig{
+		Scope:                            model.RateLimitScopeNamespace,
+		MaxRequestsPerSecondForNamespace: RateLimitMaxRPS,
+	}
+}
+
+func (s *FakeAWS) SchemaForResourceType(resourceType string) (model.Schema, error) {
+	switch resourceType {
+	case "FakeAWS::EC2::VPCCidrBlock":
+		return model.Schema{
+			Identifier: "Id",
+			Fields: []string{
+				"AmazonProvidedIpv6CidrBlock",
+				"CidrBlock",
+				"Ipv4IpamPoolId",
+				"Ipv4NetmaskLength",
+				"Ipv6CidrBlock",
+				"Ipv6CidrBlockNetworkBorderGroup",
+				"Ipv6IpamPoolId",
+				"Ipv6NetmaskLength",
+				"Ipv6Pool",
+				"VpcId"},
+			Hints: map[string]model.FieldHint{
+				"VpcId": {AttachesTo: true},
+			},
+		}, nil
+	case "FakeAWS::Versioned::Parent":
+		return model.Schema{
+			Identifier: "Name",
+			Fields:     []string{"Name", "Value"},
+			Hints: map[string]model.FieldHint{
+				"Name": {CreateOnly: true},
+			},
+		}, nil
+	case "FakeAWS::Versioned::Consumer":
+		return model.Schema{
+			Identifier: "Name",
+			Fields:     []string{"Name", "ParentRef"},
+			Hints: map[string]model.FieldHint{
+				"Name":      {CreateOnly: true},
+				"ParentRef": {CreateOnly: false},
+			},
+		}, nil
+	case secretsManagerSecretType:
+		return model.Schema{
+			Identifier: "Id",
+			Fields:     []string{"Name", "Description", "SecretString", "Tags"},
+			Hints: map[string]model.FieldHint{
+				"SecretString": {Opaque: true},
+			},
+		}, nil
+	case "FakeAWS::Custom::Resource":
+		return model.Schema{
+			Identifier: "FormaeId",
+			Fields:     []string{"ApiVersion", "Kind", "FormaeId", "Spec"},
+			Hints: map[string]model.FieldHint{
+				"Spec": {UpdateMethod: model.FieldUpdateMethodAtomic, PreserveEmptyValues: true},
+			},
+		}, nil
+	default:
+		return model.Schema{
+			Identifier: "BucketName",
+			Portable:   true,
+			Fields: []string{
+				"AccelerateConfiguration",
+				"AccessControl",
+				"AnalyticsConfigurations",
+				"BucketEncryption",
+				"BucketName",
+				"CorsConfiguration",
+				"IntelligentTieringConfigurations",
+				"InventoryConfigurations",
+				"LifecycleConfiguration",
+				"LoggingConfiguration",
+				"MetricsConfigurations",
+				"NotificationConfiguration",
+				"ObjectLockEnabled",
+				"ObjectLockConfiguration",
+				"OwnershipControls",
+				"PublicAccessBlockConfiguration",
+				"ReplicationConfiguration",
+				"Tags",
+				"VersioningConfiguration",
+				"WebsiteConfiguration"},
+			Hints: map[string]model.FieldHint{
+				"BucketEncryption": {
+					HasProviderDefault: true,
+				},
+				"OwnershipControls": {
+					HasProviderDefault: true,
+				},
+			},
+		}, nil
+	}
+}
+
+func (s *FakeAWS) Create(context context.Context, request *resource.CreateRequest) (*resource.CreateResult, error) {
+	overrides := s.overrides(context)
+	if overrides != nil && overrides.Create != nil {
+		ret, err := (overrides.Create)(request)
+		if err != nil {
+			return nil, err
+		}
+
+		if ret != nil {
+			return ret, nil
+		}
+	}
+
+	requestID := "1234"
+	s.mu.Lock()
+	s.pendingCreates[requestID] = request.Properties
+	s.mu.Unlock()
+	return &resource.CreateResult{
+		ProgressResult: &resource.ProgressResult{
+			Operation:       resource.OperationCreate,
+			OperationStatus: resource.OperationStatusInProgress,
+			RequestID:       requestID,
+		},
+	}, nil
+}
+
+func (s *FakeAWS) Update(context context.Context, request *resource.UpdateRequest) (*resource.UpdateResult, error) {
+	overrides := s.overrides(context)
+	if overrides != nil && overrides.Update != nil {
+		ret, err := (overrides.Update)(request)
+		if err != nil {
+			return nil, err
+		}
+
+		if ret != nil {
+			return ret, nil
+		}
+	}
+
+	if request.ResourceType == secretsManagerSecretType {
+		// Store the updated secret so a later Read enriches with the NEW bare
+		// value, the way AWS's GetSecretValue reflects a PutSecretValue.
+		s.mu.Lock()
+		s.secrets[request.NativeID] = request.DesiredProperties
+		s.mu.Unlock()
+		return &resource.UpdateResult{
+			ProgressResult: &resource.ProgressResult{
+				Operation:          resource.OperationUpdate,
+				OperationStatus:    resource.OperationStatusSuccess,
+				RequestID:          "secret-update-1",
+				NativeID:           request.NativeID,
+				ResourceProperties: request.DesiredProperties,
+			},
+		}, nil
+	}
+
+	return nil, nil
+}
+
+func (s *FakeAWS) Delete(context context.Context, request *resource.DeleteRequest) (*resource.DeleteResult, error) {
+	overrides := s.overrides(context)
+	if overrides != nil && overrides.Delete != nil {
+		ret, err := (overrides.Delete)(request)
+		if err != nil {
+			return nil, err
+		}
+
+		if ret != nil {
+			return ret, nil
+		}
+	}
+
+	if request.NativeID != "" {
+		return &resource.DeleteResult{
+			ProgressResult: &resource.ProgressResult{
+				Operation:       resource.OperationDelete,
+				OperationStatus: resource.OperationStatusSuccess,
+				RequestID:       "delete-123",
+				NativeID:        request.NativeID,
+			},
+		}, nil
+	}
+
+	// Otherwise, perform the default (no delete operation).
+	return nil, nil
+}
+
+func (s *FakeAWS) Status(ctx context.Context, request *resource.StatusRequest) (*resource.StatusResult, error) {
+	overrides := s.overrides(ctx)
+	if overrides != nil && overrides.Status != nil {
+		ret, err := (overrides.Status)(request)
+		if err != nil {
+			return nil, err
+		}
+
+		if ret != nil {
+			return ret, nil
+		}
+	}
+	s.mu.Lock()
+	props := s.pendingCreates[request.RequestID]
+	delete(s.pendingCreates, request.RequestID)
+	nativeID := "5678"
+	if request.ResourceType == secretsManagerSecretType {
+		// Remember what was created so a later Read can enrich with the
+		// bare secret value (mimicking AWS's GetSecretValue), the same
+		// way a real secret store would.
+		s.secrets[nativeID] = props
+	}
+	s.mu.Unlock()
+	return &resource.StatusResult{
+		ProgressResult: &resource.ProgressResult{
+			Operation:          resource.OperationCreate,
+			OperationStatus:    resource.OperationStatusSuccess,
+			RequestID:          request.RequestID,
+			NativeID:           nativeID,
+			ResourceProperties: props,
+		},
+	}, nil
+}
+
+func (s *FakeAWS) Read(context context.Context, request *resource.ReadRequest) (*resource.ReadResult, error) {
+	overrides := s.overrides(context)
+	if overrides != nil && overrides.Read != nil {
+		ret, err := (overrides.Read)(request)
+		if err != nil {
+			return nil, err
+		}
+
+		if ret != nil {
+			return ret, nil
+		}
+	}
+
+	if request.NativeID != "" {
+		if request.ResourceType == secretsManagerSecretType {
+			return &resource.ReadResult{
+				ResourceType: request.ResourceType,
+				Properties:   s.readSecretProperties(request.NativeID),
+			}, nil
+		}
+
+		return &resource.ReadResult{
+			ResourceType: request.ResourceType,
+			Properties:   "{}",
+		}, nil
+	}
+
+	return nil, nil
+}
+
+// readSecretProperties builds the enriched Read payload for a
+// SecretsManager::Secret. Real AWS's GetSecretValue returns the secret as a
+// bare, envelope-less string rather than the opaque {"$value": ...} wrapper
+// used at rest — this reproduces that shape so callers can exercise the
+// bare-string leak vector the plugin boundary must guard against.
+func (s *FakeAWS) readSecretProperties(nativeID string) string {
+	s.mu.Lock()
+	stored := s.secrets[nativeID]
+	s.mu.Unlock()
+
+	if len(stored) > 0 {
+		return string(stored)
+	}
+
+	props, err := json.Marshal(map[string]string{"SecretString": defaultSecretString})
+	if err != nil {
+		return "{}"
+	}
+	return string(props)
+}
+
+func (s *FakeAWS) List(context context.Context, request *resource.ListRequest) (*resource.ListResult, error) {
+	overrides := s.overrides(context)
+	if overrides != nil && overrides.List != nil {
+		ret, err := (overrides.List)(request)
+		if err != nil {
+			return nil, err
+		}
+
+		if ret != nil {
+			return ret, nil
+		}
+	}
+
+	return &resource.ListResult{
+		NativeIDs: []string{"1234", "5678"},
+	}, nil
+}
+
+// DiscoveryFilters returns declarative filters for testing discovery exclusion
+func (s *FakeAWS) DiscoveryFilters() []model.MatchFilter {
+	return []model.MatchFilter{
+		{
+			// Filter 1: Exclude by top-level property
+			ResourceTypes: []string{"FakeAWS::S3::Bucket"},
+			Conditions: []model.FilterCondition{
+				{
+					PropertyPath:  "$.SkipDiscovery",
+					PropertyValue: "true",
+				},
+			},
+		},
+		{
+			// Filter 2: Exclude by tag in array format [{"Key": "...", "Value": "..."}]
+			ResourceTypes: []string{"FakeAWS::S3::Bucket"},
+			Conditions: []model.FilterCondition{
+				{
+					PropertyPath:  `$.Tags[?(@.Key=="SkipDiscovery")].Value`,
+					PropertyValue: "true",
+				},
+			},
+		},
+		{
+			// Filter 3: Exclude by tag in map format {"key": "value"}
+			ResourceTypes: []string{"FakeAWS::S3::Bucket"},
+			Conditions: []model.FilterCondition{
+				{
+					PropertyPath:  "$.Tags.SkipDiscovery",
+					PropertyValue: "true",
+				},
+			},
+		},
+	}
+}
+
+// LabelConfig returns the label extraction configuration for discovered FakeAWS resources.
+// Uses the same pattern as the real AWS plugin for testing.
+func (s *FakeAWS) LabelConfig() model.LabelConfig {
+	return model.LabelConfig{
+		DefaultQuery:      `$.Tags[?(@.Key=='Name')].Value`,
+		ResourceOverrides: map[string]string{},
+	}
+}

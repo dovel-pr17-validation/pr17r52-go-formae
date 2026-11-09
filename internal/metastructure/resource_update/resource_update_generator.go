@@ -1,0 +1,2980 @@
+// © 2025 Platform Engineering Labs Inc.
+//
+// SPDX-License-Identifier: FSL-1.1-ALv2
+
+package resource_update
+
+import (
+	"encoding/json"
+	"fmt"
+	"log/slog"
+	"maps"
+	"strings"
+
+	"github.com/tidwall/gjson"
+	"github.com/tidwall/sjson"
+
+	"github.com/platform-engineering-labs/formae/internal/constants"
+	"github.com/platform-engineering-labs/formae/internal/metastructure/pathkey"
+	"github.com/platform-engineering-labs/formae/internal/metastructure/resolver"
+	"github.com/platform-engineering-labs/formae/internal/metastructure/target_update"
+	"github.com/platform-engineering-labs/formae/internal/metastructure/transformations"
+	"github.com/platform-engineering-labs/formae/internal/metastructure/util"
+	apimodel "github.com/platform-engineering-labs/formae/pkg/api/model"
+	pkgmodel "github.com/platform-engineering-labs/formae/pkg/model"
+)
+
+// GenerateResourceUpdates converts a Forma and command parameters into ResourceUpdates that can be executed
+func GenerateResourceUpdates(
+	forma *pkgmodel.Forma,
+	command pkgmodel.Command,
+	mode pkgmodel.FormaApplyMode,
+	source FormaCommandSource,
+	existingTargets []*pkgmodel.Target,
+	ds ResourceDataLookup,
+	replacedTargets map[string]bool,
+	deletedTargets map[string]bool,
+	force bool,
+) ([]ResourceUpdate, error) {
+
+	var referenceLabels map[string]string
+	var err error
+
+	// Only translate references for commands that contain new/modified resources with triplet URIs.
+	// Skip for synchronization (database reads), discovery (pre-assigned KSUIDs), and destroy (database resources).
+	// Also skip if TranslateFormaeReferencesToKsuid was already called upstream (e.g., from FormaCommandFromForma)
+	// — detected by checking if resources already have KSUIDs assigned.
+	alreadyTranslated := len(forma.Resources) > 0 && forma.Resources[0].Ksuid != ""
+	doTranslateFormaeReferencesToKsuid := !alreadyTranslated &&
+		source != FormaCommandSourceSynchronize &&
+		source != FormaCommandSourceDiscovery &&
+		command != pkgmodel.CommandDestroy
+
+	if doTranslateFormaeReferencesToKsuid {
+		// The generator KSUID map this also resolves is discarded here: this
+		// entry point never calls GenerateGeneratorUpdates, so there is
+		// nothing downstream to thread it into. Only the production path
+		// through metastructure.FormaCommandFromForma (which calls
+		// TranslateFormaeReferencesToKsuid directly, not through this
+		// function) needs it.
+		referenceLabels, _, err = translateFormaeReferencesToKsuid(forma, ds)
+		if err != nil {
+			return nil, fmt.Errorf("failed to translate references to KSUID: %w", err)
+		}
+	}
+
+	var resourceUpdates []ResourceUpdate
+
+	existingTargetMap, desiredTargetMap := buildTargetMaps(forma, existingTargets)
+
+	// Validate stack references for commands that modify resources, sync commands are triggered from the agent
+	// and are guaranteed to reference existing stacks only
+	if command == pkgmodel.CommandDestroy || command == pkgmodel.CommandApply {
+		if err := validateStackReferences(forma, ds); err != nil {
+			return nil, err
+		}
+	}
+
+	// Reject forma-authoring errors around `alias` before generating
+	// updates. Only Apply commands carry user-authored aliases; sync/discovery
+	// commands construct resources programmatically and never set Alias.
+	if command == pkgmodel.CommandApply {
+		if err := validateAliasUsage(forma, ds); err != nil {
+			return nil, err
+		}
+	}
+
+	for _, r := range forma.Resources {
+		if _, exists := desiredTargetMap[r.Target]; !exists {
+			return nil, apimodel.TargetReferenceNotFoundError{
+				TargetLabel: r.Target,
+			}
+		}
+	}
+
+	switch command {
+	case pkgmodel.CommandDestroy:
+		resourceUpdates, err = generateResourceUpdatesForDestroy(forma, source, existingTargetMap, ds, deletedTargets)
+	case pkgmodel.CommandApply:
+		resourceUpdates, err = generateResourceUpdatesForApply(forma, mode, source, existingTargetMap, desiredTargetMap, ds, replacedTargets, force)
+	case pkgmodel.CommandSync:
+		resourceUpdates, err = generateResourceUpdatesForSync(forma, source, existingTargetMap, ds)
+	default:
+		return nil, fmt.Errorf("unsupported command type: %s", command)
+	}
+
+	if err != nil {
+		return nil, err
+	}
+
+	if doTranslateFormaeReferencesToKsuid {
+		for i := range resourceUpdates {
+			resourceUpdates[i].ReferenceLabels = referenceLabels
+		}
+	}
+
+	return resourceUpdates, nil
+}
+
+// buildTargetMaps derives the prior and desired views of this command's
+// targets. It is shared by the ordinary planning pass and by the co-planning
+// pass that follows a generator draw, so both hand NewResourceUpdateForExisting
+// the same target on either side.
+//
+// existingTargetMap contains targets as they currently exist in the DB. It is
+// used for delete operations and as the "prior state" of a resource's target.
+//
+// desiredTargetMap starts as a copy of existingTargetMap with configs converted
+// to plugin format (stripping $ref/$value metadata from target resolvables).
+// Then overridden with forma targets for new targets only. For existing targets,
+// the DB config is preferred because it contains resolved values; but we must
+// convert it because Ergo Framework cannot serialize json.RawMessage with nested
+// $ref/$value objects (ETF encoding silently drops the message).
+func buildTargetMaps(
+	forma *pkgmodel.Forma,
+	existingTargets []*pkgmodel.Target,
+) (map[string]*pkgmodel.Target, map[string]*pkgmodel.Target) {
+	existingTargetMap := make(map[string]*pkgmodel.Target)
+	for _, target := range existingTargets {
+		existingTargetMap[target.Label] = target
+	}
+
+	desiredTargetMap := make(map[string]*pkgmodel.Target)
+	for _, target := range existingTargets {
+		t := *target
+		if converted, err := resolver.ConvertToPluginFormat(t.Config); err == nil {
+			t.Config = converted
+		}
+		tCopy := t
+		desiredTargetMap[target.Label] = &tCopy
+	}
+	for _, target := range forma.Targets {
+		t := target
+		if _, exists := existingTargetMap[target.Label]; !exists {
+			desiredTargetMap[target.Label] = &t
+			slog.Debug("Target does not exist in existing targets - adding it", "target", target.Label)
+			existingTargetMap[target.Label] = &t
+		}
+		// Existing targets: keep the DB config (already converted above)
+	}
+
+	return existingTargetMap, desiredTargetMap
+}
+
+// matchExistingForDesired finds the existing managed resource that corresponds
+// to a desired-state declaration. The match is by (Type, Label) within the
+// caller's already-narrowed stack scope.
+//
+// When the desired declaration carries an `Alias`, a miss on the
+// current label falls through to a second lookup by the alias label. This is
+// the resource label rename path: the existing managed row sits at the old
+// label, the new declaration is at the new label, and the alias tells the
+// generator they are the same resource. The caller pairs them so
+// NewResourceUpdateForExisting can emit a single update carrying the label
+// delta in PriorState/DesiredState.
+//
+// Returns nil if no match.
+func matchExistingForDesired(existingResources []*pkgmodel.Resource, newResource pkgmodel.Resource) *pkgmodel.Resource {
+	for _, existingResource := range existingResources {
+		if existingResource.Label == newResource.Label && existingResource.Type == newResource.Type {
+			return existingResource
+		}
+	}
+	if newResource.Alias == "" {
+		return nil
+	}
+	for _, existingResource := range existingResources {
+		if existingResource.Label == newResource.Alias && existingResource.Type == newResource.Type {
+			return existingResource
+		}
+	}
+	return nil
+}
+
+// reconcileMatchesExisting reports whether a forma resource and an existing
+// managed row refer to the same logical resource under reconcile semantics.
+// Matches require Type / Target equality and either the same stack or the
+// $unmanaged stack on the existing side. Labels match by either the current
+// label OR the forma resource's `alias` against the existing label.
+//
+// Without the alias arm the reconcile path treats a rename as
+// `delete(old) + create(new)`, destroying the cloud object.
+func reconcileMatchesExisting(newResource, existingResource pkgmodel.Resource) bool {
+	if newResource.Type != existingResource.Type {
+		return false
+	}
+	if newResource.Target != existingResource.Target {
+		return false
+	}
+	if newResource.Stack != existingResource.Stack && existingResource.Stack != constants.UnmanagedStack {
+		return false
+	}
+	if newResource.Label == existingResource.Label {
+		return true
+	}
+	return newResource.Alias != "" && newResource.Alias == existingResource.Label
+}
+
+// skipResurrectionForReapedTarget reports whether a candidate create/sync
+// update for a resource on the given target must be dropped because the
+// target has been reaped. Once PersistTargetReap tombstones a target's
+// resources, they become invisible to every live-resource query (task 5).
+// Without this guard, Synchronize (whose desired state can be built from a
+// baseline unaware of reaping — see GetResourcesAtLastReconcile) and
+// auto-reconcile (which diffs that same baseline against the live view)
+// would read the target's absence from the live view as "missing" and
+// re-create its resources.
+//
+// Destroy is deliberately NOT guarded here: destroying a reaped target's
+// leftover rows is the explicit cleanup path (destroy-of-reaped), not a
+// resurrection risk.
+func skipResurrectionForReapedTarget(source FormaCommandSource, target *pkgmodel.Target) bool {
+	if source != FormaCommandSourceSynchronize && source != FormaCommandSourcePolicyAutoReconcile {
+		return false
+	}
+	return target != nil && target.Health != nil && target.Health.State == pkgmodel.TargetHealthStateReaped
+}
+
+// stackExistsInForma checks if a stack label exists in the Forma.Stacks slice
+func stackExistsInForma(forma *pkgmodel.Forma, stackLabel string) bool {
+	for _, stack := range forma.Stacks {
+		if stack.Label == stackLabel {
+			return true
+		}
+	}
+	return false
+}
+
+// validateAliasUsage rejects two forma-authoring errors that the
+// generator would otherwise swallow:
+//
+//  1. Duplicate claim: two forma resources match the same existing managed
+//     row — one via the current label, the other via `alias`. The reconcile
+//     loop has no break after the first match, so both would emit updates
+//     against the same existing row and the final label would be
+//     nondeterministic. Most likely the user forgot to delete the old
+//     declaration during a refactor.
+//  2. Dead alias: a resource declares `alias` that matches no existing
+//     managed (same stack) or unmanaged resource. Without rejection the
+//     resource falls through to Create with a stale alias persisted into
+//     the metastructure and round-tripped through `formae extract`.
+//     Creating-and-renaming-in-one-step is almost always a stale alias from
+//     a prior refactor.
+func validateAliasUsage(forma *pkgmodel.Forma, ds ResourceDataLookup) error {
+	for _, stack := range forma.SplitByStack() {
+		stackLabel := stack.SingleStackLabel()
+		existing, err := ds.LoadResourcesByStack(stackLabel)
+		if err != nil {
+			return fmt.Errorf("failed to load stack %s for alias validation: %w", stackLabel, err)
+		}
+		if len(existing) == 0 {
+			continue
+		}
+
+		// Per existing managed row, collect every forma resource that
+		// claims it (via current label or via alias). A row with two or
+		// more claimants is the duplicate-claim error.
+		type claim struct {
+			formaLabel string
+			viaAlias   bool
+		}
+		claims := make(map[string][]claim, len(existing))
+		for _, r := range stack.Resources {
+			for _, ex := range existing {
+				if ex.Type != r.Type {
+					continue
+				}
+				switch {
+				case ex.Label == r.Label:
+					claims[ex.Ksuid] = append(claims[ex.Ksuid], claim{r.Label, false})
+				case r.Alias != "" && ex.Label == r.Alias:
+					claims[ex.Ksuid] = append(claims[ex.Ksuid], claim{r.Label, true})
+				}
+			}
+		}
+		for ksuid, cs := range claims {
+			if len(cs) < 2 {
+				continue
+			}
+			var existingLabel string
+			for _, ex := range existing {
+				if ex.Ksuid == ksuid {
+					existingLabel = ex.Label
+					break
+				}
+			}
+			parts := make([]string, 0, len(cs))
+			for _, c := range cs {
+				via := "label"
+				if c.viaAlias {
+					via = "alias"
+				}
+				parts = append(parts, fmt.Sprintf("`%s` (via %s)", c.formaLabel, via))
+			}
+			return fmt.Errorf(
+				"resources %s both claim the existing managed resource `%s` in stack %q — remove the duplicate declaration",
+				strings.Join(parts, " and "), existingLabel, stackLabel,
+			)
+		}
+	}
+
+	// Dead alias: declared but matches no existing managed (current stack)
+	// or unmanaged resource of the same type.
+	var allResources map[string][]*pkgmodel.Resource
+	for _, r := range forma.Resources {
+		if r.Alias == "" {
+			continue
+		}
+		if r.Alias == r.Label {
+			return fmt.Errorf(
+				"resource `%s` declares `alias` equal to its `label` — alias must reference a different prior label",
+				r.Label,
+			)
+		}
+		if allResources == nil {
+			loaded, err := ds.LoadAllResourcesByStack()
+			if err != nil {
+				return fmt.Errorf("failed to load resources for alias validation: %w", err)
+			}
+			allResources = loaded
+		}
+		found := false
+		for _, ex := range allResources[r.Stack] {
+			if ex.Type == r.Type && ex.Label == r.Alias {
+				found = true
+				break
+			}
+		}
+		if !found {
+			resolver.ObservePlanningStack(ds, constants.UnmanagedStack)
+			for _, ex := range allResources[constants.UnmanagedStack] {
+				if ex.Type == r.Type && ex.Label == r.Alias {
+					found = true
+					break
+				}
+			}
+		}
+		if !found {
+			return fmt.Errorf(
+				"resource `%s` declares alias `%s` but no existing managed (stack %q) or unmanaged resource of type %s matches that label — drop the alias if this is a fresh resource",
+				r.Label, r.Alias, r.Stack, r.Type,
+			)
+		}
+	}
+
+	return nil
+}
+
+func validateStackReferences(forma *pkgmodel.Forma, ds ResourceDataLookup) error {
+	// Find all stacks referenced by resources that aren't in Forma.Stacks
+	stacksToValidate := make(map[string]bool)
+	for _, resource := range forma.Resources {
+		if !stackExistsInForma(forma, resource.Stack) {
+			stacksToValidate[resource.Stack] = true
+		}
+	}
+
+	// Validate each of these stacks exists in the database
+	for stackLabel := range stacksToValidate {
+		existingResources, err := ds.LoadResourcesByStack(stackLabel)
+		if err != nil {
+			return fmt.Errorf("failed to load stack %s: %w", stackLabel, err)
+		}
+		if len(existingResources) == 0 {
+			return apimodel.StackReferenceNotFoundError{
+				StackLabel: stackLabel,
+			}
+		}
+	}
+
+	return nil
+}
+
+func generateResourceUpdatesForDestroy(
+	forma *pkgmodel.Forma,
+	source FormaCommandSource,
+	existingTargetMap map[string]*pkgmodel.Target,
+	ds ResourceDataLookup,
+	deletedTargets map[string]bool,
+) ([]ResourceUpdate, error) {
+
+	var resourceDestroys []ResourceUpdate
+
+	// Track KSUIDs of resources being explicitly deleted
+	explicitDeleteKSUIDs := make(map[string]bool)
+
+	for _, stack := range forma.SplitByStack() {
+		existingResources, err := ds.LoadResourcesByStack(stack.SingleStackLabel())
+		if err != nil {
+			slog.Error("Failed to load stack", "error", err)
+			continue
+		}
+
+		if len(existingResources) == 0 {
+			// Stack doesn't exist, nothing to delete
+			continue
+		}
+
+		// Create delete resource updates for existing resources
+		for _, existingResource := range existingResources {
+			for _, formaResource := range forma.Resources {
+				if formaResource.Stack == stack.SingleStackLabel() &&
+					formaResource.Label == existingResource.Label &&
+					formaResource.Type == existingResource.Type {
+					resourceDestroy, err := NewResourceUpdateForDestroy(
+						*existingResource,
+						*existingTargetMap[existingResource.Target],
+						source,
+					)
+					if err != nil {
+						return nil, fmt.Errorf("failed to create resource destroy for %s: %w", existingResource.Label, err)
+					}
+
+					explicitDeleteKSUIDs[existingResource.Ksuid] = true
+					resourceDestroys = append(resourceDestroys, resourceDestroy)
+				}
+			}
+		}
+	}
+
+	// Build KSUID→label lookup for human-readable cascade sources
+	ksuidToLabel := make(map[string]string, len(resourceDestroys))
+	for _, rd := range resourceDestroys {
+		ksuidToLabel[rd.DesiredState.Ksuid] = rd.DesiredState.Label
+	}
+
+	// Find cascade deletes - resources that reference the resources being deleted
+	cascadeDeletes, err := findCascadeDeletes(explicitDeleteKSUIDs, ksuidToLabel, existingTargetMap, source, ds)
+	if err != nil {
+		return nil, fmt.Errorf("failed to find cascade deletes: %w", err)
+	}
+
+	resourceDestroys = append(resourceDestroys, cascadeDeletes...)
+
+	// Collect all KSUIDs that are already being deleted (explicit + cascade)
+	allDeleteKSUIDs := make(map[string]bool)
+	for ksuid := range explicitDeleteKSUIDs {
+		allDeleteKSUIDs[ksuid] = true
+	}
+	for _, cd := range cascadeDeletes {
+		allDeleteKSUIDs[cd.DesiredState.Ksuid] = true
+	}
+
+	// Generate deletes for remaining managed resources in deleted targets.
+	// Resources already covered by explicit or cascade deletes are skipped.
+	if len(deletedTargets) > 0 {
+		for target := range deletedTargets {
+			resolver.ObservePlanningTargetInventory(ds, target)
+		}
+		allResourcesByStack, err := ds.LoadAllResourcesByStack()
+		if err != nil {
+			return nil, fmt.Errorf("failed to load resources for target cascade delete: %w", err)
+		}
+
+		for _, resources := range allResourcesByStack {
+			for _, res := range resources {
+				if !res.Managed || !deletedTargets[res.Target] {
+					continue
+				}
+				if allDeleteKSUIDs[res.Ksuid] {
+					continue // Already being deleted (explicit or cascade)
+				}
+
+				target, ok := existingTargetMap[res.Target]
+				if !ok {
+					continue
+				}
+
+				resourceDestroy, err := NewResourceUpdateForDestroy(*res, *target, source)
+				if err != nil {
+					return nil, fmt.Errorf("failed to create target-cascade resource destroy for %s: %w", res.Label, err)
+				}
+				resourceDestroy.IsCascade = true
+				resourceDestroy.CascadeSource = res.Target
+
+				resourceDestroys = append(resourceDestroys, resourceDestroy)
+			}
+		}
+	}
+
+	return resourceDestroys, nil
+}
+
+// findCascadeDeletes finds all resources that must be deleted because they reference
+// resources being deleted. Uses level-by-level BFS with batched queries to find the full cascade chain.
+func findCascadeDeletes(
+	toDelete map[string]bool,
+	ksuidToLabel map[string]string,
+	existingTargetMap map[string]*pkgmodel.Target,
+	source FormaCommandSource,
+	ds ResourceDataLookup) ([]ResourceUpdate, error) {
+
+	var cascadeDeletes []ResourceUpdate
+	processed := make(map[string]bool)
+
+	// Copy toDelete to processed - these are already being deleted
+	for ksuid := range toDelete {
+		processed[ksuid] = true
+	}
+
+	// BFS level - start with all explicit deletes
+	currentLevel := make([]string, 0, len(toDelete))
+	for ksuid := range toDelete {
+		currentLevel = append(currentLevel, ksuid)
+	}
+
+	// Process level by level with batched queries (O(depth) queries instead of O(N))
+	for len(currentLevel) > 0 {
+		// Batch query: find all resources that depend on any KSUID in the current level
+		dependentsMap, err := ds.FindResourcesDependingOnMany(currentLevel)
+		if err != nil {
+			return nil, fmt.Errorf("failed to find resources depending on batch: %w", err)
+		}
+
+		var nextLevel []string
+
+		// Process all dependents found in this level
+		for sourceKSUID, dependents := range dependentsMap {
+			for _, dependent := range dependents {
+				if processed[dependent.Ksuid] {
+					continue
+				}
+				processed[dependent.Ksuid] = true
+
+				// Skip unmanaged (discovered) resources - they have implicit lifecycle
+				// ties to their parents and the provider will handle their deletion automatically.
+				// If they can't be deleted, the user will see an error from the provider explaining why.
+				if dependent.Stack == constants.UnmanagedStack {
+					slog.Debug("Skipping cascade delete for unmanaged resource",
+						"resource", dependent.Label,
+						"type", dependent.Type,
+						"dependsOn", sourceKSUID)
+					continue
+				}
+
+				// Use human-readable label for the cascade source
+				sourceLabel := ksuidToLabel[sourceKSUID]
+				if sourceLabel == "" {
+					sourceLabel = sourceKSUID
+				}
+
+				target, ok := existingTargetMap[dependent.Target]
+				if !ok {
+					slog.Warn("Target not found for cascade delete", "target", dependent.Target, "resource", dependent.Label)
+					continue
+				}
+
+				resourceDestroy, err := NewResourceUpdateForDestroy(
+					*dependent,
+					*target,
+					source,
+				)
+				if err != nil {
+					return nil, fmt.Errorf("failed to create cascade destroy for %s: %w", dependent.Label, err)
+				}
+
+				resourceDestroy.IsCascade = true
+				resourceDestroy.CascadeSource = sourceLabel
+
+				cascadeDeletes = append(cascadeDeletes, resourceDestroy)
+
+				// Add to next level for further cascade detection and update label lookup
+				nextLevel = append(nextLevel, dependent.Ksuid)
+				ksuidToLabel[dependent.Ksuid] = dependent.Label
+			}
+		}
+
+		currentLevel = nextLevel
+	}
+
+	return cascadeDeletes, nil
+}
+
+func generateResourceUpdatesForApply(
+	forma *pkgmodel.Forma,
+	mode pkgmodel.FormaApplyMode,
+	source FormaCommandSource,
+	existingTargetMap map[string]*pkgmodel.Target,
+	desiredTargetMap map[string]*pkgmodel.Target,
+	ds ResourceDataLookup,
+	replacedTargets map[string]bool,
+	force bool,
+) ([]ResourceUpdate, error) {
+
+	for _, target := range forma.Targets {
+		if existingTarget, ok := existingTargetMap[target.Label]; ok {
+			if replacedTargets[target.Label] {
+				continue // Config change is handled via target replace
+			}
+
+			if existingTarget.Namespace != target.Namespace {
+				return nil, apimodel.TargetAlreadyExistsError{
+					TargetLabel:       target.Label,
+					ExistingNamespace: existingTarget.Namespace,
+					FormaNamespace:    target.Namespace,
+					MismatchType:      "namespace",
+				}
+			}
+
+			// Skip raw config comparison when config contains resolvables ($ref).
+			// The TargetUpdateGenerator handles resolvable-aware comparison.
+			if len(resolver.ExtractResolvableURIsFromJSON(target.Config)) == 0 {
+				// Strip $ref metadata from existing config so that a stored
+				// value with $ref wrappers compares correctly against a plain
+				// value in the new config.
+				existingResolved, err := resolver.ConvertToPluginFormat(existingTarget.Config)
+				if err != nil {
+					existingResolved = existingTarget.Config
+				}
+				// Prefer the incoming schema — it represents the current plugin
+				// version and may have new or updated hints. Fall back to the
+				// existing schema only when the incoming has none.
+				schema := target.ConfigSchema
+				if len(schema.Hints) == 0 {
+					schema = existingTarget.ConfigSchema
+				}
+				configChange := target_update.ClassifyConfigChange(existingResolved, target.Config, schema)
+				if configChange == target_update.ConfigImmutableChange {
+					return nil, apimodel.TargetAlreadyExistsError{
+						TargetLabel:    target.Label,
+						MismatchType:   "config",
+						ExistingConfig: existingTarget.Config,
+						FormaConfig:    target.Config,
+					}
+				}
+			}
+		}
+	}
+
+	switch mode {
+	case pkgmodel.FormaApplyModeReconcile:
+		return generateResourceUpdatesForReconcile(forma, mode, source, existingTargetMap, desiredTargetMap, ds, replacedTargets, force)
+	case pkgmodel.FormaApplyModePatch:
+		return generateResourceUpdatesForPatch(forma, mode, source, existingTargetMap, desiredTargetMap, ds, replacedTargets, force)
+	default:
+		return nil, fmt.Errorf("forma apply mode %s not supported", mode)
+	}
+}
+
+func generateResourceUpdatesForSync(
+	forma *pkgmodel.Forma,
+	source FormaCommandSource,
+	existingTargetMap map[string]*pkgmodel.Target,
+	ds ResourceDataLookup) ([]ResourceUpdate, error) {
+
+	var resourceUpdates []ResourceUpdate
+
+	for _, stack := range forma.SplitByStack() {
+		existingResources, err := ds.LoadResourcesByStack(stack.SingleStackLabel())
+		if err != nil {
+			slog.Error("Failed to load stack", "error", err)
+			continue
+		}
+
+		if source == FormaCommandSourceDiscovery {
+			for _, r := range forma.Resources {
+				if r.Stack == stack.SingleStackLabel() {
+					// When a target has been deleted but resources referencing it
+					// remain in the DB (e.g., unmanaged resources from discovery),
+					// pass an empty sentinel Target. The ResourceUpdater will
+					// detect the nil Config and short-circuit to NotFound, causing
+					// the resource to be cleaned up via the "deleted OOB" path.
+					target := existingTargetMap[r.Target]
+					if target == nil {
+						target = &pkgmodel.Target{Label: r.Target}
+					}
+					ru, err := NewResourceUpdateForSyncWithFilter(r, *target, source)
+					if err != nil {
+						return nil, fmt.Errorf("failed to create resource update sync for %s: %w", r.Label, err)
+					}
+					resourceUpdates = append(resourceUpdates, ru)
+				}
+			}
+
+			// Avoid accessing existingResources for alternate code path below
+			continue
+		}
+
+		// Refresh each freshly-loaded existing resource's schema from the forma
+		// resource (which may carry a plugin-refreshed schema) before anything
+		// downstream reads opacity from it.
+		for _, existingResource := range existingResources {
+			for _, resource := range forma.Resources {
+				if resource.Stack == stack.SingleStackLabel() &&
+					resource.Label == existingResource.Label &&
+					resource.Type == existingResource.Type {
+					existingResource.Schema = resource.Schema
+				}
+			}
+		}
+
+		// Normalize inherited-Opaque $res resolvables on the freshly-loaded rows
+		// before they become ResourceUpdates. A structured $res reference pointing at
+		// another resource's Opaque property is itself opaque, but the pre-resolution
+		// $res shape that reaches at-rest storage on non-translating paths carries no
+		// $visibility marker — so without this the sync merge refreshes its $value from
+		// the plugin's live read yet the persist transformer never hashes it, leaking
+		// the resolved secret in CLEARTEXT at rest (sibling of the cleartext-at-rest case). Here — with every
+		// sibling row of the stack in hand — we stamp $visibility:Opaque on such $res
+		// envelopes so the merge drops any stale $hashed and persist re-hashes.
+		markInheritedOpaqueResolvables(existingResources)
+
+		// Normal sync - create one read resource update per existing resource.
+		// The match against forma resources is by (stack, label, type), which is
+		// NOT unique: discovery labeling can leave two rows sharing a label. Emit
+		// at most one update per row — a second update for the same ksuid would
+		// collide downstream (the changeset DAG keeps one node per operation URI
+		// and the command never terminalizes the dropped duplicate).
+		for _, existingResource := range existingResources {
+			matched := false
+			for _, resource := range forma.Resources {
+				if resource.Stack == stack.SingleStackLabel() &&
+					resource.Label == existingResource.Label &&
+					resource.Type == existingResource.Type {
+
+					// Use the schema from the forma resource (which may have been refreshed
+					// from the plugin) rather than the stale schema stored in the DB
+					existingResource.Schema = resource.Schema
+					matched = true
+					break
+				}
+			}
+			if !matched {
+				continue
+			}
+
+			// See comment above: pass empty sentinel when target is gone.
+			target := existingTargetMap[existingResource.Target]
+			if target == nil {
+				target = &pkgmodel.Target{Label: existingResource.Target}
+			}
+			if skipResurrectionForReapedTarget(source, target) {
+				continue
+			}
+			resourceUpdate, err := NewResourceUpdateForSync(
+				*existingResource,
+				*target,
+				source,
+			)
+			if err != nil {
+				return nil, fmt.Errorf("failed to create resource update sync for %s: %w", existingResource.Label, err)
+			}
+			resourceUpdates = append(resourceUpdates, resourceUpdate)
+		}
+	}
+
+	return resourceUpdates, nil
+}
+
+func generateResourceUpdatesForReconcile(
+	forma *pkgmodel.Forma,
+	mode pkgmodel.FormaApplyMode,
+	source FormaCommandSource,
+	existingTargetMap map[string]*pkgmodel.Target,
+	desiredTargetMap map[string]*pkgmodel.Target,
+	ds ResourceDataLookup,
+	replacedTargets map[string]bool,
+	force bool,
+) ([]ResourceUpdate, error) {
+
+	var resourceCreates []ResourceUpdate
+	var resourceUpdates []ResourceUpdate
+	var resourceReplaces []ResourceUpdate
+	var implicitDeleteResources []ResourceUpdate
+
+	for target := range replacedTargets {
+		resolver.ObservePlanningTargetInventory(ds, target)
+	}
+	allResourcesByStack, err := ds.LoadAllResourcesByStack()
+	if err != nil {
+		return nil, fmt.Errorf("failed to load existing stacks: %w", err)
+	}
+	allResourcesByStack, err = acceptedOwnershipView(ds, forma, allResourcesByStack)
+	if err != nil {
+		return nil, err
+	}
+
+	// Pre-flight portability check for target replace. Every managed resource
+	// on a replaced target is deleted and recreated — including resources in
+	// stacks the forma does not reconcile, which are recreated to preserve
+	// those stacks. The only exception is a resource in a reconciled stack
+	// that the forma no longer declares: that one is implicitly deleted, and
+	// deletion needs no portability.
+	if len(replacedTargets) > 0 {
+		formaStacks := make(map[string]bool)
+		formaResourceKeys := make(map[string]bool)
+		for _, r := range forma.Resources {
+			formaStacks[r.Stack] = true
+			if replacedTargets[r.Target] {
+				formaResourceKeys[fmt.Sprintf("%s/%s/%s", r.Stack, r.Type, r.Label)] = true
+			}
+		}
+
+		var nonPortable []string
+		var nonPortableTarget string
+		for stackLabel, resources := range allResourcesByStack {
+			if stackLabel == constants.UnmanagedStack {
+				continue
+			}
+			for _, resource := range resources {
+				if !resource.Managed || !replacedTargets[resource.Target] {
+					continue
+				}
+				if resource.Schema.Portable {
+					continue
+				}
+				key := fmt.Sprintf("%s/%s/%s", resource.Stack, resource.Type, resource.Label)
+				implicitlyDeleted := formaStacks[resource.Stack] && !formaResourceKeys[key]
+				if !implicitlyDeleted {
+					nonPortable = append(nonPortable, key)
+					if nonPortableTarget == "" {
+						nonPortableTarget = resource.Target
+					}
+				}
+			}
+		}
+		if len(nonPortable) > 0 {
+			return nil, apimodel.NonPortableResourcesError{
+				TargetLabel: nonPortableTarget,
+				Resources:   nonPortable,
+			}
+		}
+	}
+
+	// Build a separate map that includes forma resources for resolvable lookups.
+	// This allows forward references to new resources in the same command.
+	resolvableLookup := resourcesForResolvables(forma, allResourcesByStack)
+
+	effectiveDesired, err := ComputeEffectiveDesired(forma, allResourcesByStack, resolver.PlanningResourceObserver(ds))
+	if err != nil {
+		return nil, fmt.Errorf("failed to compute effective desired state: %w", err)
+	}
+
+	generatorGenerationLookup, err := generatorGenerations(forma, ds)
+	if err != nil {
+		return nil, fmt.Errorf("failed to resolve generator generations: %w", err)
+	}
+
+	// Explicit empty stacks still declare a complete reconciliation boundary:
+	// omitting their final resource must schedule its ordinary deletion.
+	reconcileStacks := forma.SplitByStack()
+	includedStacks := make(map[string]bool, len(reconcileStacks))
+	for _, stack := range reconcileStacks {
+		includedStacks[stack.SingleStackLabel()] = true
+	}
+	for _, stack := range forma.Stacks {
+		if !includedStacks[stack.Label] {
+			reconcileStacks = append(reconcileStacks, pkgmodel.Forma{Stacks: []pkgmodel.Stack{stack}})
+			includedStacks[stack.Label] = true
+		}
+	}
+	for _, stack := range reconcileStacks {
+		existingResources, err := ds.LoadResourcesByStack(stack.SingleStackLabel())
+		if err != nil {
+			return nil, fmt.Errorf("failed to load reconcile stack: %w", err)
+		}
+		ownedView, e := acceptedOwnershipView(ds, &stack, map[string][]*pkgmodel.Resource{stack.SingleStackLabel(): existingResources})
+		if e != nil {
+			return nil, e
+		}
+		existingResources = ownedView[stack.SingleStackLabel()]
+
+		// Existing stack not found which means that all resources will be created.
+		if len(existingResources) == 0 {
+			for _, newResource := range stack.Resources {
+				if skipResurrectionForReapedTarget(source, existingTargetMap[newResource.Target]) {
+					continue
+				}
+				if existingUnmanaged, ok := findUnmanagedResource(newResource, allResourcesByStack, ds); ok {
+					readOnlyProperties, err := resolver.LoadResolvablePropertiesFromStacks(newResource, resolvableLookup, effectiveDesired, generatorGenerationLookup, resolver.PlanningResourceObserver(ds))
+					if err != nil {
+						return nil, fmt.Errorf("failed to load resolvable properties: %w", err)
+					}
+
+					resourceUpdate, err := NewResourceUpdateForExisting(
+						readOnlyProperties,
+						effectiveDesired[existingUnmanaged.Ksuid],
+						existingUnmanaged,
+						newResource,
+						*existingTargetMap[existingUnmanaged.Target],
+						*desiredTargetMap[newResource.Target],
+						mode,
+						source,
+						force,
+						false,
+					)
+					if err != nil {
+						return nil, fmt.Errorf("failed to generate resource update for existing unmanaged resource: %w", err)
+					}
+
+					for _, update := range resourceUpdate {
+						switch update.Operation {
+						case OperationUpdate:
+							resourceUpdates = append(resourceUpdates, update)
+						case OperationDelete:
+							resourceReplaces = append(resourceReplaces, update)
+						case OperationCreate:
+							resourceReplaces = append(resourceReplaces, update)
+						default:
+							resourceReplaces = append(resourceReplaces, update)
+						}
+					}
+				} else {
+					resourceCreate, err := NewResourceUpdateForCreate(
+						newResource,
+						*desiredTargetMap[newResource.Target],
+						source,
+					)
+					if err != nil {
+						return nil, err
+					}
+					resourceCreates = append(resourceCreates, resourceCreate)
+				}
+			}
+			continue
+		}
+
+		// Now process existing resources
+		for _, existingResource := range existingResources {
+			found := false
+			for _, newResource := range stack.Resources {
+				if reconcileMatchesExisting(newResource, *existingResource) {
+
+					found = true
+
+					readOnlyProperties, err := resolver.LoadResolvablePropertiesFromStacks(newResource, resolvableLookup, effectiveDesired, generatorGenerationLookup, resolver.PlanningResourceObserver(ds))
+
+					if err != nil {
+						return nil, fmt.Errorf("failed to load resolvable properties: %w", err)
+					}
+					existingResourceUpdates, err := NewResourceUpdateForExisting(
+						readOnlyProperties,
+						effectiveDesired[existingResource.Ksuid],
+						*existingResource,
+						newResource,
+						*existingTargetMap[existingResource.Target],
+						*desiredTargetMap[newResource.Target],
+						mode,
+						source,
+						force,
+						false,
+					)
+
+					if err != nil {
+						return nil, fmt.Errorf("failed to generate resource update for existing resource: %w",
+							err)
+					}
+
+					if len(existingResourceUpdates) == 0 {
+						slog.Debug("No changes detected for resource", "resource", existingResource.Label)
+						continue
+					}
+					if len(existingResourceUpdates) == 1 {
+						slog.Debug("Update resource update generated", "resource", existingResource.Label)
+					}
+
+					if len(existingResourceUpdates) == 2 {
+						slog.Debug("Replace resource update generated", "resource", existingResource.Label)
+
+					}
+
+					for _, update := range existingResourceUpdates {
+						switch update.Operation {
+						case OperationUpdate:
+							resourceUpdates = append(resourceUpdates, update)
+						case OperationDelete:
+							resourceReplaces = append(resourceReplaces, update)
+						case OperationCreate:
+							resourceReplaces = append(resourceReplaces, update)
+						default:
+							// For any other operations, add to resourceReplaces
+							resourceReplaces = append(resourceReplaces, update)
+						}
+					}
+				}
+			}
+
+			if !found {
+				// Resource exists in the stack but not in the new resources, so it will be deleted implicitly
+				resourceDelete, err := NewResourceUpdateForDestroy(
+					*existingResource,
+					*existingTargetMap[existingResource.Target],
+					source,
+				)
+				if err != nil {
+					return nil, fmt.Errorf("failed to create resource delete for %s: %w", existingResource.Label, err)
+				}
+				implicitDeleteResources = append(implicitDeleteResources, resourceDelete)
+			}
+		}
+
+		for _, newResource := range stack.Resources {
+			found := false
+			for _, existingResource := range existingResources {
+				if reconcileMatchesExisting(newResource, *existingResource) {
+					found = true
+					break
+				}
+			}
+
+			if !found {
+				if skipResurrectionForReapedTarget(source, existingTargetMap[newResource.Target]) {
+					continue
+				}
+				// Check if this resource exists as an unmanaged resource
+				if existingUnmanaged, ok := findUnmanagedResource(newResource, allResourcesByStack, ds); ok {
+					readOnlyProperties, err := resolver.LoadResolvablePropertiesFromStacks(newResource, resolvableLookup, effectiveDesired, generatorGenerationLookup, resolver.PlanningResourceObserver(ds))
+					if err != nil {
+						return nil, fmt.Errorf("failed to load resolvable properties: %w", err)
+					}
+
+					resourceUpdate, err := NewResourceUpdateForExisting(
+						readOnlyProperties,
+						effectiveDesired[existingUnmanaged.Ksuid],
+						existingUnmanaged,
+						newResource,
+						*existingTargetMap[existingUnmanaged.Target],
+						*desiredTargetMap[newResource.Target],
+						mode,
+						source,
+						force,
+						false,
+					)
+					if err != nil {
+						return nil, fmt.Errorf("failed to generate resource update for unmanaged resource: %w", err)
+					}
+
+					for _, update := range resourceUpdate {
+						switch update.Operation {
+						case OperationUpdate:
+							resourceUpdates = append(resourceUpdates, update)
+						case OperationDelete:
+							resourceReplaces = append(resourceReplaces, update)
+						case OperationCreate:
+							resourceReplaces = append(resourceReplaces, update)
+						default:
+							resourceReplaces = append(resourceReplaces, update)
+						}
+					}
+				} else {
+					// New resource that doesn't exist anywhere, so it will be created
+					resourceCreate, err := NewResourceUpdateForCreate(
+						newResource,
+						*desiredTargetMap[newResource.Target],
+						source,
+					)
+					if err != nil {
+						return nil, err
+					}
+
+					resourceCreates = append(resourceCreates, resourceCreate)
+				}
+			}
+		}
+	}
+
+	// Handle target replace: force-replace resources on replaced targets
+	if len(replacedTargets) > 0 {
+		// Convert updates to replaces for resources on replaced targets
+		var newResourceUpdates []ResourceUpdate
+		for _, update := range resourceUpdates {
+			if update.Operation == OperationUpdate && replacedTargets[update.DesiredState.Target] {
+				replaceOps, err := NewResourceUpdateForReplace(
+					update.PriorState, update.DesiredState,
+					update.ExistingTarget, update.ResourceTarget, source, nil,
+				)
+				if err != nil {
+					return nil, fmt.Errorf("failed to create replace for target replace: %w", err)
+				}
+				resourceReplaces = append(resourceReplaces, replaceOps...)
+			} else {
+				newResourceUpdates = append(newResourceUpdates, update)
+			}
+		}
+		resourceUpdates = newResourceUpdates
+
+		// Generate replaces for stacks NOT in forma on replaced targets
+		handledKeys := make(map[string]bool)
+		for _, u := range resourceCreates {
+			handledKeys[fmt.Sprintf("%s/%s/%s", u.DesiredState.Stack, u.DesiredState.Label, u.DesiredState.Type)] = true
+		}
+		for _, u := range resourceUpdates {
+			handledKeys[fmt.Sprintf("%s/%s/%s", u.DesiredState.Stack, u.DesiredState.Label, u.DesiredState.Type)] = true
+		}
+		for _, u := range resourceReplaces {
+			handledKeys[fmt.Sprintf("%s/%s/%s", u.DesiredState.Stack, u.DesiredState.Label, u.DesiredState.Type)] = true
+		}
+		for _, u := range implicitDeleteResources {
+			handledKeys[fmt.Sprintf("%s/%s/%s", u.DesiredState.Stack, u.DesiredState.Label, u.DesiredState.Type)] = true
+		}
+
+		// Generate replaces for managed resources on replaced targets not yet handled.
+		// This covers both stacks NOT in forma (preserving those stacks) and
+		// resources in forma stacks that had no property changes (no-op updates).
+		for stackLabel, resources := range allResourcesByStack {
+			if stackLabel == constants.UnmanagedStack {
+				continue
+			}
+			for _, resource := range resources {
+				if !resource.Managed || !replacedTargets[resource.Target] {
+					continue
+				}
+				key := fmt.Sprintf("%s/%s/%s", resource.Stack, resource.Label, resource.Type)
+				if handledKeys[key] {
+					continue
+				}
+				replaceOps, err := NewResourceUpdateForReplace(
+					*resource, *resource,
+					*existingTargetMap[resource.Target], *desiredTargetMap[resource.Target],
+					source, nil,
+				)
+				if err != nil {
+					return nil, fmt.Errorf("failed to create replace for non-forma resource: %w", err)
+				}
+				resourceReplaces = append(resourceReplaces, replaceOps...)
+				handledKeys[key] = true
+			}
+		}
+	}
+
+	// After processing all stacks, find dependencies for delete operations
+	allDeleteUpdates := append(resourceReplaces, implicitDeleteResources...)
+
+	replacedKsuids := make(map[string]bool)
+	for _, ru := range resourceReplaces {
+		if ru.Operation == OperationDelete && ru.DesiredState.Ksuid != "" {
+			replacedKsuids[ru.DesiredState.Ksuid] = true
+		}
+	}
+	dependencyDeletes, cascadeUpdates := findDependencyUpdates(allDeleteUpdates, replacedKsuids, allResourcesByStack, existingTargetMap, source, forma, resolver.PlanningResourceObserver(ds))
+
+	// Convert updates to replacements if they have dependency deletes
+
+	// Combine all updates
+	var allResourceUpdates []ResourceUpdate
+	allResourceUpdates = append(allResourceUpdates, resourceCreates...)
+	allResourceUpdates = append(allResourceUpdates, resourceReplaces...)
+	allResourceUpdates = append(allResourceUpdates, resourceUpdates...)
+	allResourceUpdates = append(allResourceUpdates, implicitDeleteResources...)
+
+	// Convert dependency deletes to replacements if the resource is in Forma
+	// and has no update or create operation
+	convertedDependencyDeletes := convertDependencyDeletesToReplacements(allResourceUpdates, dependencyDeletes, forma, desiredTargetMap, source)
+	allResourceUpdates = append(allResourceUpdates, convertedDependencyDeletes...)
+
+	finalResourceUpdates := convertUpdatesToReplacementsForDependencies(allResourceUpdates, dependencyDeletes, source)
+
+	// Append cascade-updates from findDependencyUpdates' non-CreateOnly
+	// branch AFTER the convert* steps so they're not re-promoted to
+	// Replace. Skip any cascade-update whose resource is already
+	// represented by a user-driven update/create or by an existing
+	// delete (those paths already cover the dependent).
+	finalResourceUpdates = appendCascadeUpdatesIfAbsent(finalResourceUpdates, cascadeUpdates)
+
+	if err := validateReferencesAgainstRemovals(finalResourceUpdates, forma); err != nil {
+		return nil, err
+	}
+
+	return finalResourceUpdates, nil
+}
+
+// appendCascadeUpdatesIfAbsent merges cascade-updates into out. When the
+// dependent has no user-driven op for the same resource, the cascade-update
+// is appended as-is. When the dependent already has a user-driven Update,
+// the cascade-update is dropped but the existing Update is marked
+// IsCascade=true so the executor regenerates its PatchDocument at apply
+// time — the user's plan-time patch only reflects user changes, but the
+// resolvable's new value from the parent's replacement only becomes
+// available after the resolver runs, and the provider's Update needs both
+// in a single patch.
+//
+// If the existing op is a Create/Delete/Replace (not Update), the cascade-
+// update is dropped without altering the existing op: those operations are
+// "complete" and don't need patch augmentation.
+func appendCascadeUpdatesIfAbsent(out []ResourceUpdate, cascadeUpdates []ResourceUpdate) []ResourceUpdate {
+	if len(cascadeUpdates) == 0 {
+		return out
+	}
+	indexByURI := make(map[pkgmodel.FormaeURI]int, len(out))
+	for i, ru := range out {
+		indexByURI[ru.DesiredState.URI().Stripped()] = i
+	}
+	for _, cu := range cascadeUpdates {
+		key := cu.DesiredState.URI().Stripped()
+		if idx, exists := indexByURI[key]; exists {
+			if out[idx].Operation == OperationUpdate {
+				out[idx].IsCascade = true
+				if out[idx].CascadeSource == "" {
+					out[idx].CascadeSource = cu.CascadeSource
+				}
+				// Merge the cascade-update's synthesized ops into the
+				// existing user-driven patch so simulate output covers
+				// both the user's direct changes AND the cascading
+				// resolvable-driven changes in one document.
+				merged, err := mergeJSONPatchDocuments(out[idx].DesiredState.PatchDocument, cu.DesiredState.PatchDocument)
+				if err != nil {
+					slog.Warn("Failed to merge cascade-update patch into existing user Update",
+						"resource", out[idx].DesiredState.Label, "error", err)
+				} else {
+					out[idx].DesiredState.PatchDocument = merged
+				}
+			}
+			continue
+		}
+		out = append(out, cu)
+		indexByURI[key] = len(out) - 1
+	}
+	return out
+}
+
+// mergeJSONPatchDocuments concatenates two JSON-Patch documents (each a JSON
+// array of ops) into a single document. Used to fuse a user-driven Update's
+// patch with the planner's cascade-update synthesized ops. Skips ops in the
+// addition whose `path` already appears in the base (user wins on conflict).
+func mergeJSONPatchDocuments(base, addition json.RawMessage) (json.RawMessage, error) {
+	var baseOps, addOps []json.RawMessage
+	if len(base) > 0 {
+		if err := json.Unmarshal(base, &baseOps); err != nil {
+			return nil, fmt.Errorf("failed to parse base patch document: %w", err)
+		}
+	}
+	if len(addition) > 0 {
+		if err := json.Unmarshal(addition, &addOps); err != nil {
+			return nil, fmt.Errorf("failed to parse addition patch document: %w", err)
+		}
+	}
+	if len(addOps) == 0 {
+		if len(baseOps) == 0 {
+			return nil, nil
+		}
+		return base, nil
+	}
+	// Build a set of paths already covered by the base so duplicate ops
+	// don't override the user's intent.
+	covered := make(map[string]bool, len(baseOps))
+	for _, op := range baseOps {
+		if p := gjson.GetBytes(op, "path").String(); p != "" {
+			covered[p] = true
+		}
+	}
+	merged := append(baseOps[:0:0], baseOps...)
+	for _, op := range addOps {
+		if p := gjson.GetBytes(op, "path").String(); p != "" && covered[p] {
+			continue
+		}
+		merged = append(merged, op)
+	}
+	return json.Marshal(merged)
+}
+
+func findUnmanagedResource(resource pkgmodel.Resource, allResources map[string][]*pkgmodel.Resource, lookups ...any) (pkgmodel.Resource, bool) {
+	for _, ds := range lookups {
+		resolver.ObservePlanningStack(ds, constants.UnmanagedStack)
+	}
+	unmanagedResources, exists := allResources[constants.UnmanagedStack]
+	if !exists {
+		return pkgmodel.Resource{}, false
+	}
+	for _, res := range unmanagedResources {
+		if res.Type == resource.Type && res.Label == resource.Label {
+			return *res, true
+		}
+	}
+	// Bring-under-management + rename in one apply. The forma's
+	// resource declares the NEW human label, but the unmanaged row sits at
+	// the discovery default (recorded as `alias`). Without this fallback the
+	// generator emits a Create for the new label and orphans the unmanaged
+	// row — duplicate inventory entries for the same NativeID. Match by the
+	// alias label too so both transitions (label rename + import) fold into
+	// a single OperationUpdate driven by NewResourceUpdateForExisting.
+	if resource.Alias != "" {
+		for _, res := range unmanagedResources {
+			if res.Type == resource.Type && res.Label == resource.Alias {
+				return *res, true
+			}
+		}
+	}
+	return pkgmodel.Resource{}, false
+}
+
+func generateResourceUpdatesForPatch(
+	forma *pkgmodel.Forma,
+	mode pkgmodel.FormaApplyMode,
+	source FormaCommandSource,
+	existingTargetMap map[string]*pkgmodel.Target,
+	desiredTargetMap map[string]*pkgmodel.Target,
+	ds ResourceDataLookup,
+	replacedTargets map[string]bool,
+	force bool,
+) ([]ResourceUpdate, error) {
+
+	var resourceCreates []ResourceUpdate
+	var resourceUpdates []ResourceUpdate
+	var resourceReplaces []ResourceUpdate
+
+	for target := range replacedTargets {
+		resolver.ObservePlanningTargetInventory(ds, target)
+	}
+	allResourcesByStack, err := ds.LoadAllResourcesByStack()
+	if err != nil {
+		return nil, fmt.Errorf("failed to load existing stacks: %w", err)
+	}
+
+	// Pre-flight portability check for target replace
+	// In patch mode, ALL managed resources on replaced targets will be recreated, so check all
+	if len(replacedTargets) > 0 {
+		var nonPortable []string
+		var nonPortableTarget string
+		for stackLabel, resources := range allResourcesByStack {
+			if stackLabel == constants.UnmanagedStack {
+				continue
+			}
+			for _, resource := range resources {
+				if !resource.Managed || !replacedTargets[resource.Target] {
+					continue
+				}
+				if !resource.Schema.Portable {
+					nonPortable = append(nonPortable, fmt.Sprintf("%s/%s/%s", resource.Stack, resource.Type, resource.Label))
+					if nonPortableTarget == "" {
+						nonPortableTarget = resource.Target
+					}
+				}
+			}
+		}
+		if len(nonPortable) > 0 {
+			return nil, apimodel.NonPortableResourcesError{
+				TargetLabel: nonPortableTarget,
+				Resources:   nonPortable,
+			}
+		}
+	}
+
+	// Build a separate map that includes forma resources for resolvable lookups.
+	// This allows forward references to new resources in the same command.
+	resolvableLookup := resourcesForResolvables(forma, allResourcesByStack)
+
+	effectiveDesired, err := ComputeEffectiveDesired(forma, allResourcesByStack, resolver.PlanningResourceObserver(ds))
+	if err != nil {
+		return nil, fmt.Errorf("failed to compute effective desired state: %w", err)
+	}
+
+	generatorGenerationLookup, err := generatorGenerations(forma, ds)
+	if err != nil {
+		return nil, fmt.Errorf("failed to resolve generator generations: %w", err)
+	}
+
+	for _, stack := range forma.SplitByStack() {
+		stackResources, err := ds.LoadResourcesByStack(stack.SingleStackLabel())
+		if err != nil {
+			slog.Error("Failed to load stack", "error", err)
+			continue
+		}
+
+		// Existing stack not found which means that all resources will be created.
+		if len(stackResources) == 0 {
+			for _, newResource := range stack.Resources {
+				resourceCreate, err := NewResourceUpdateForCreate(
+					newResource,
+					*desiredTargetMap[newResource.Target],
+					source,
+				)
+				if err != nil {
+					return nil, err
+				}
+				resourceCreates = append(resourceCreates, resourceCreate)
+			}
+			continue
+		}
+
+		// Process new resources in the stack - include unmanaged resources
+		existingResources := make([]*pkgmodel.Resource, 0, len(stackResources))
+		existingResources = append(existingResources, stackResources...)
+		resolver.ObservePlanningStack(ds, constants.UnmanagedStack)
+		if unmanagedResources, ok := allResourcesByStack[constants.UnmanagedStack]; ok {
+			existingResources = append(existingResources, unmanagedResources...)
+		}
+
+		for _, newResource := range stack.Resources {
+			matched := matchExistingForDesired(existingResources, newResource)
+
+			if matched != nil {
+				// Use NewResourceUpdateForExisting to handle all the logic
+				readOnlyProperties, err := resolver.LoadResolvablePropertiesFromStacks(newResource, resolvableLookup, effectiveDesired, generatorGenerationLookup, resolver.PlanningResourceObserver(ds))
+				if err != nil {
+					return nil, fmt.Errorf("failed to load resolvable properties: %w", err)
+				}
+
+				existingResourceUpdates, err := NewResourceUpdateForExisting(
+					readOnlyProperties,
+					effectiveDesired[matched.Ksuid],
+					*matched,
+					newResource,
+					*existingTargetMap[matched.Target],
+					*desiredTargetMap[newResource.Target],
+					mode,
+					source,
+					force,
+					false,
+				)
+
+				if err != nil {
+					return nil, fmt.Errorf("failed to generate resource update for existing resource: %w", err)
+				}
+
+				// Process the returned updates
+				for _, update := range existingResourceUpdates {
+					switch update.Operation {
+					case OperationUpdate:
+						resourceUpdates = append(resourceUpdates, update)
+					case OperationDelete:
+						resourceReplaces = append(resourceReplaces, update)
+					case OperationCreate:
+						resourceReplaces = append(resourceReplaces, update)
+					default:
+						// For any other operations, add to resourceReplaces
+						resourceReplaces = append(resourceReplaces, update)
+					}
+				}
+				continue
+			}
+
+			// If resource doesn't exist in the existing stack, create it
+			resourceCreate, err := NewResourceUpdateForCreate(
+				newResource,
+				*desiredTargetMap[newResource.Target],
+				source,
+			)
+			if err != nil {
+				return nil, err
+			}
+			resourceCreates = append(resourceCreates, resourceCreate)
+		}
+	}
+
+	// Handle target replace: force-replace resources on replaced targets
+	if len(replacedTargets) > 0 {
+		// Convert updates to replaces
+		var newResourceUpdates []ResourceUpdate
+		for _, update := range resourceUpdates {
+			if update.Operation == OperationUpdate && replacedTargets[update.DesiredState.Target] {
+				replaceOps, err := NewResourceUpdateForReplace(
+					update.PriorState, update.DesiredState,
+					update.ExistingTarget, update.ResourceTarget, source, nil,
+				)
+				if err != nil {
+					return nil, fmt.Errorf("failed to create replace for target replace: %w", err)
+				}
+				resourceReplaces = append(resourceReplaces, replaceOps...)
+			} else {
+				newResourceUpdates = append(newResourceUpdates, update)
+			}
+		}
+		resourceUpdates = newResourceUpdates
+
+		// Generate replaces for ALL managed resources on replaced targets not yet handled
+		handledKeys := make(map[string]bool)
+		for _, u := range resourceCreates {
+			handledKeys[fmt.Sprintf("%s/%s/%s", u.DesiredState.Stack, u.DesiredState.Label, u.DesiredState.Type)] = true
+		}
+		for _, u := range resourceUpdates {
+			handledKeys[fmt.Sprintf("%s/%s/%s", u.DesiredState.Stack, u.DesiredState.Label, u.DesiredState.Type)] = true
+		}
+		for _, u := range resourceReplaces {
+			handledKeys[fmt.Sprintf("%s/%s/%s", u.DesiredState.Stack, u.DesiredState.Label, u.DesiredState.Type)] = true
+		}
+
+		for stackLabel, resources := range allResourcesByStack {
+			if stackLabel == constants.UnmanagedStack {
+				continue
+			}
+			for _, resource := range resources {
+				if !resource.Managed || !replacedTargets[resource.Target] {
+					continue
+				}
+				key := fmt.Sprintf("%s/%s/%s", resource.Stack, resource.Label, resource.Type)
+				if handledKeys[key] {
+					continue
+				}
+				replaceOps, err := NewResourceUpdateForReplace(
+					*resource, *resource,
+					*existingTargetMap[resource.Target], *desiredTargetMap[resource.Target],
+					source, nil,
+				)
+				if err != nil {
+					return nil, fmt.Errorf("failed to create replace for non-forma resource: %w", err)
+				}
+				resourceReplaces = append(resourceReplaces, replaceOps...)
+				handledKeys[key] = true
+			}
+		}
+	}
+
+	allUpdates := append(append(resourceCreates, resourceUpdates...), resourceReplaces...)
+
+	replacedKsuids := make(map[string]bool)
+	for _, ru := range resourceReplaces {
+		if ru.Operation == OperationDelete && ru.DesiredState.Ksuid != "" {
+			replacedKsuids[ru.DesiredState.Ksuid] = true
+		}
+	}
+	dependencyDeletes, cascadeUpdates := findDependencyUpdates(resourceReplaces, replacedKsuids, allResourcesByStack, existingTargetMap, source, forma, resolver.PlanningResourceObserver(ds))
+	finalResourceUpdates := convertUpdatesToReplacementsForDependencies(allUpdates, dependencyDeletes, source)
+	finalResourceUpdates = appendCascadeUpdatesIfAbsent(finalResourceUpdates, cascadeUpdates)
+	return finalResourceUpdates, nil
+}
+
+// findResourcesThatDependOn finds all resources that have dependencies on the given resource
+func findResourcesThatDependOn(targetResource pkgmodel.Resource, allResources map[string][]*pkgmodel.Resource, observers ...resolver.ResourceObserver) ([]pkgmodel.Resource, error) {
+	var dependentResources []pkgmodel.Resource
+	targetURI := targetResource.URI()
+
+	for _, resources := range allResources {
+		for _, resource := range resources {
+			// Skip the target resource itself
+			if resource.Label == targetResource.Label &&
+				resource.Stack == targetResource.Stack &&
+				resource.Type == targetResource.Type {
+				continue
+			}
+
+			// Check if this resource has a dependency on the target resource
+			uris := resolver.ExtractResolvableURIs(*resource)
+			for _, uri := range uris {
+				if uri.Stripped() == targetURI.Stripped() {
+					resolver.ObservePlanningResource(observers, resource.Ksuid, resource)
+					dependentResources = append(dependentResources, *resource)
+					break
+				}
+			}
+		}
+	}
+
+	return dependentResources, nil
+}
+
+// findDependencyUpdates finds resources affected by deletes/replaces and
+// classifies each by the dependent's referring FieldHint: if any of a
+// dependent's references to a resource being deleted lands on a CreateOnly
+// field, the dependent must be cascade-deleted (the same call site
+// converts the delete to a Replace if the dependent is in the forma). If
+// all such references land on mutable fields, the dependent is cascade-
+// updated instead — the resolvable re-resolves at execution time and the
+// new value flows through Update rather than tearing the dependent down.
+//
+// The cascade-update path covers cases like ECS Service consuming a
+// versioned TaskDefinition (Service.taskDefinition is mutable; UpdateService
+// accepts a new TaskDefinitionArn — no tear-down needed when a new TD
+// revision is created).
+func findDependencyUpdates(allDeleteUpdates []ResourceUpdate, replacedKsuids map[string]bool, allResources map[string][]*pkgmodel.Resource, existingTargetMap map[string]*pkgmodel.Target, source FormaCommandSource, forma *pkgmodel.Forma, observers ...resolver.ResourceObserver) ([]ResourceUpdate, []ResourceUpdate) {
+	// Collect ksuids of resources being deleted so dependents can decide
+	// whether their refs land on a deletion target. Also build a label
+	// lookup so cascade-update synthesis can name the source resource for
+	// the user, and a forma-by-ksuid index so the synthesizer can recover
+	// the parent's new property values where the user supplied them.
+	deletedKsuids := make(map[string]bool)
+	ksuidToLabel := make(map[string]string)
+	for _, du := range allDeleteUpdates {
+		if du.Operation == OperationDelete {
+			deletedKsuids[du.DesiredState.Ksuid] = true
+			ksuidToLabel[du.DesiredState.Ksuid] = du.DesiredState.Label
+		}
+	}
+	formaByKsuid := make(map[string]*pkgmodel.Resource)
+	if forma != nil {
+		for i := range forma.Resources {
+			r := &forma.Resources[i]
+			if r.Ksuid != "" {
+				formaByKsuid[r.Ksuid] = r
+			}
+		}
+	}
+
+	var dependencyDeletes []ResourceUpdate
+	var dependencyUpdates []ResourceUpdate
+
+	for _, deleteUpdate := range allDeleteUpdates {
+		if deleteUpdate.Operation != OperationDelete {
+			continue
+		}
+		// Find all resources that depend on this resource being deleted
+		dependentResources, err := findResourcesThatDependOn(deleteUpdate.DesiredState, allResources, observers...)
+		if err != nil {
+			slog.Warn("Failed to find dependent resources",
+				"resource", deleteUpdate.DesiredState.Label,
+				"error", err)
+			continue
+		}
+
+		for _, dependentRes := range dependentResources {
+			if dependentRes.Stack == constants.UnmanagedStack {
+				continue
+			}
+			// Check if this dependent resource is not already being deleted
+			alreadyBeingDeleted := false
+			for _, existingDelete := range allDeleteUpdates {
+				if existingDelete.DesiredState.Label == dependentRes.Label &&
+					existingDelete.DesiredState.Stack == dependentRes.Stack &&
+					existingDelete.DesiredState.Type == dependentRes.Type {
+					alreadyBeingDeleted = true
+					break
+				}
+			}
+			if alreadyBeingDeleted {
+				continue
+			}
+
+			target, ok := existingTargetMap[dependentRes.Target]
+			if !ok || target == nil {
+				slog.Warn("Target not found for cascade",
+					"target", dependentRes.Target, "resource", dependentRes.Label)
+				continue
+			}
+
+			// Cascade decision: cascade-delete only when at least one ref
+			// from dependentRes to a deletion target lands on a CreateOnly
+			// field. Otherwise emit a cascade-update so the resolvable
+			// re-resolves against the new parent without tearing the
+			// dependent down.
+			if anyRefIsCreateOnly(dependentRes, deletedKsuids) {
+				dependencyDelete, err := NewResourceUpdateForDestroy(dependentRes, *target, source)
+				if err != nil {
+					slog.Error("Failed to create dependency delete for resource",
+						"resource", dependentRes.Label,
+						"error", err)
+					continue
+				}
+				dependencyDeletes = append(dependencyDeletes, dependencyDelete)
+				slog.Debug("Adding dependency delete",
+					"dependent", dependentRes.Label,
+					"dependsOn", deleteUpdate.DesiredState.Label)
+			} else {
+				cu := newCascadeUpdate(dependentRes, *target, source, deleteUpdate.DesiredState.Label)
+				// Synthesize a plan-time patch so simulate output names the
+				// cascading field change instead of showing an empty Update.
+				// The executor's apply-time regen overwrites this with the
+				// concrete diff against the resolver-updated DesiredState.
+				if synthOps, err := synthesizeCascadeUpdatePatch(dependentRes, deletedKsuids, replacedKsuids, ksuidToLabel, formaByKsuid); err != nil {
+					slog.Warn("Failed to synthesize cascade-update patch for simulate output",
+						"resource", dependentRes.Label, "error", err)
+				} else if len(synthOps) > 0 {
+					cu.DesiredState.PatchDocument = synthOps
+				}
+				dependencyUpdates = append(dependencyUpdates, cu)
+				slog.Debug("Adding cascade update",
+					"dependent", dependentRes.Label,
+					"dependsOn", deleteUpdate.DesiredState.Label)
+			}
+		}
+	}
+
+	return dependencyDeletes, dependencyUpdates
+}
+
+// anyRefIsCreateOnly reports whether any of dep's resolvable references
+// points at a resource in deletedKsuids via a CreateOnly field on dep's
+// schema. A single CreateOnly ref to a deletion target forces cascade-replace
+// for the whole dependent (mixed-refs case).
+//
+// A reference counts as CreateOnly when its destination path sits at or below
+// a CreateOnly-hinted field — the same at-or-below matching the patch
+// pipeline uses to classify createOnly ops — so a hint on a wrapper object
+// covers a reference on one of its members, matching how such an update
+// would be judged at execution time.
+func anyRefIsCreateOnly(dep pkgmodel.Resource, deletedKsuids map[string]bool) bool {
+	createOnlyFields := dep.Schema.CreateOnly()
+	for _, ref := range resolver.ExtractResolvableRefs(dep) {
+		ksuid := strings.TrimPrefix(string(ref.URI), "formae://")
+		if !deletedKsuids[ksuid] {
+			continue
+		}
+		if pathIsAtOrBelowAnyField(ref.TargetPath, createOnlyFields) {
+			return true
+		}
+	}
+	return false
+}
+
+// pathIsAtOrBelowAnyField reports whether a destination path (pathkey-escaped,
+// possibly with array-index segments) targets one of the dotted schema field
+// paths or a nested path within one. Comparison is by segments so a literal
+// dotted key stays one segment and never matches a field that merely spells
+// its dot-prefix.
+func pathIsAtOrBelowAnyField(path string, fields []string) bool {
+	segments := pathkey.Split(path)
+	var pathSegments []string
+	for _, segment := range segments {
+		// A lone all-digits segment is a top-level field name, not an array
+		// index — an index can only appear under a field.
+		if isAllDigits(segment) && len(segments) > 1 {
+			continue
+		}
+		pathSegments = append(pathSegments, segment)
+	}
+	for _, field := range fields {
+		fieldSegments := strings.Split(field, ".")
+		if len(pathSegments) < len(fieldSegments) {
+			continue
+		}
+		matched := true
+		for i, fs := range fieldSegments {
+			if pathSegments[i] != fs {
+				matched = false
+				break
+			}
+		}
+		if matched {
+			return true
+		}
+	}
+	return false
+}
+
+// synthesizeCascadeUpdatePatch builds a JSON-Patch document describing the
+// resolvable-driven changes a cascade-update will introduce at apply time.
+// Used by the planner so simulate/preview output names every cascading
+// change, not just the user's direct property edits.
+//
+// For each resolvable in dep that points at a resource in deletedKsuids:
+//
+//   - If the parent's forma resource carries a concrete (non-resolvable)
+//     value for the resolvable's source property — i.e. a user-set field
+//     like Name — emit a normal `replace` op with that new value. The
+//     standard renderer then prints `from "old" to "new"`.
+//
+//   - If the source property is provider-assigned (not present in the
+//     forma at plan time — e.g. TaskDefinitionArn assigned by AWS at
+//     Create), emit a `replace` op whose value is a `$cascade-resolvable`
+//     marker object. The CLI renderer translates this into "to point at
+//     the new <source-label> (current: <value>)". The executor's apply-
+//     time regen overwrites this with the concrete diff, so the marker
+//     never reaches a provider.
+//
+// Returns (nil, nil) when dep has no refs to deletion targets.
+func synthesizeCascadeUpdatePatch(
+	dep pkgmodel.Resource,
+	deletedKsuids map[string]bool,
+	replacedKsuids map[string]bool,
+	ksuidToLabel map[string]string,
+	formaByKsuid map[string]*pkgmodel.Resource,
+) (json.RawMessage, error) {
+	type op struct {
+		Op    string `json:"op"`
+		Path  string `json:"path"`
+		Value any    `json:"value"`
+	}
+	var ops []op
+	for _, ref := range resolver.ExtractResolvableRefs(dep) {
+		ksuid := strings.TrimPrefix(string(ref.URI), "formae://")
+		if !deletedKsuids[ksuid] {
+			continue
+		}
+		path := jsonPointerFromDotPath(ref.TargetPath)
+
+		// A secret never travels in this document. What is synthesized here is
+		// presentation data — it reaches simulate output, the CLI, the stored
+		// changeset and the logs — and it is built from the incoming forma,
+		// which has not been through the persist-time hashing, so a secret
+		// written as a literal arrives in cleartext. The change is still
+		// named: only the value is withheld.
+		opaqueSource := cascadeSourceIsOpaque(dep, ref, formaByKsuid[ksuid])
+
+		// Try to recover the new value from the forma's parent state.
+		// For REPLACE'd parents, the recovered value is only trustworthy
+		// for user-provided source fields. Provider-assigned fields
+		// (HasProviderDefault=true) get their value from the provider at
+		// apply time, so any value sitting in the forma now is the stale
+		// cached one — emit the marker so the renderer uses the friendly
+		// "to point at the new <source>" phrasing instead of misleading
+		// the operator with a stale concrete value.
+		if parent, ok := formaByKsuid[ksuid]; ok && !opaqueSource && parent != nil && ref.SourcePropertyName != "" && len(parent.Properties) > 0 {
+			sourceFieldIsProviderAssigned := false
+			if replacedKsuids[ksuid] {
+				if hint, hintOk := parent.Schema.Hints[stripArrayIndicesForHintLookup(ref.SourcePropertyName)]; hintOk && hint.HasProviderDefault {
+					sourceFieldIsProviderAssigned = true
+				}
+			}
+			if !sourceFieldIsProviderAssigned {
+				extracted := resolver.LookupSourceProperty(parent.Properties, ref.SourcePropertyName)
+				if extracted.Exists() && !looksLikeResolvable(extracted) {
+					ops = append(ops, op{Op: "replace", Path: path, Value: extracted.Value()})
+					continue
+				}
+			}
+		}
+
+		// Provider-assigned source on a REPLACE'd parent, an opaque source, or
+		// no recoverable value at all: emit a marker the CLI renderer
+		// recognises. An opaque source carries no current value; the renderer
+		// omits the "(current: …)" clause and still names the source.
+		currentValue := ref.CurrentValue
+		if opaqueSource {
+			currentValue = ""
+		}
+		ops = append(ops, op{
+			Op:   "replace",
+			Path: path,
+			Value: map[string]any{
+				"$cascade-resolvable": true,
+				"$source-label":       ksuidToLabel[ksuid],
+				"$current-value":      currentValue,
+			},
+		})
+	}
+	if len(ops) == 0 {
+		return nil, nil
+	}
+	return json.Marshal(ops)
+}
+
+// cascadeSourceIsOpaque reports whether the value a cascade op would carry for
+// this reference is a secret, asking all three places that can know it.
+//
+// The consumer's own envelope is asked first because it is the only one always
+// present: the parent may be absent from the forma entirely, and a reference
+// into a secret carries the visibility it inherited from the source's schema.
+// The parent, when present, is asked both by schema (the declaration, via the
+// same union of schema hints and the agent-side known-opaque table that
+// persistence hashes on) and by value (an inline opaque envelope), since a
+// value can be opaque either way.
+func cascadeSourceIsOpaque(dep pkgmodel.Resource, ref resolver.ResolvableRef, parent *pkgmodel.Resource) bool {
+	if gjson.GetBytes(dep.Properties, ref.TargetPath).Get("$visibility").String() == pkgmodel.VisibilityOpaque {
+		return true
+	}
+	if parent == nil || ref.SourcePropertyName == "" {
+		return false
+	}
+	property := stripArrayIndicesForHintLookup(ref.SourcePropertyName)
+	if referencesOpaqueProperty(transformations.OpaqueFields(parent.Schema, parent.Type), property) {
+		return true
+	}
+	return resolver.LookupSourceProperty(parent.Properties, ref.SourcePropertyName).Get("$visibility").String() == pkgmodel.VisibilityOpaque
+}
+
+// looksLikeResolvable reports whether a gjson Result is itself a $ref/$value
+// wrapper — used to skip parent fields that are themselves resolvables
+// (cross-stack chains), since we can't substitute a concrete value for them.
+func looksLikeResolvable(r gjson.Result) bool {
+	if !r.IsObject() {
+		return false
+	}
+	return r.Get("$ref").Exists() || r.Get("$value").Exists()
+}
+
+// jsonPointerFromDotPath converts the resolver's dot-separated TargetPath
+// (e.g. "Refs.0.Target") into a JSON Pointer (e.g. "/Refs/0/Target") that
+// JSON-Patch consumers expect.
+//
+// The two notations escape different things, so this is a translation and not a
+// character swap: the path escapes each literal map key against gjson's and
+// sjson's grammars, while a pointer segment escapes "~" as "~0" and "/" as "~1"
+// (RFC 6901, in that order). Each segment is therefore unescaped out of the path
+// and re-escaped into the pointer.
+func jsonPointerFromDotPath(p string) string {
+	if p == "" {
+		return ""
+	}
+	segments := pathkey.Split(p)
+	escaped := make([]string, len(segments))
+	for i, segment := range segments {
+		escaped[i] = jsonPointerEscaper.Replace(segment)
+	}
+	return "/" + strings.Join(escaped, "/")
+}
+
+// jsonPointerEscaper applies RFC 6901 reference-token escaping. "~" must be
+// replaced before "/" so the "~1" it produces is not itself re-escaped;
+// strings.Replacer scans once and never rewrites its own output, which gives
+// that ordering for free.
+var jsonPointerEscaper = strings.NewReplacer("~", "~0", "/", "~1")
+
+// newCascadeUpdate constructs an Update on dep for the cascade-update
+// path. DesiredState carries dep's stored properties, including any
+// resolvable URIs; the executor re-reads the (now replaced) parent at
+// apply time and resolves $value fresh, so the new parent value flows to
+// dep through Update rather than a destroy+create.
+func newCascadeUpdate(dep pkgmodel.Resource, target pkgmodel.Target, source FormaCommandSource, cascadeSourceLabel string) ResourceUpdate {
+	return ResourceUpdate{
+		PriorState:           dep,
+		DesiredState:         dep,
+		ExistingTarget:       target,
+		ResourceTarget:       target,
+		Operation:            OperationUpdate,
+		State:                ResourceUpdateStateNotStarted,
+		Source:               source,
+		StackLabel:           dep.Stack,
+		RemainingResolvables: resolver.ExtractResolvableURIs(dep),
+		IsCascade:            true,
+		CascadeSource:        cascadeSourceLabel,
+	}
+}
+
+// stripArrayIndicesForHintLookup mirrors changeset.stripArrayIndices: dotted
+// path with numeric segments removed, suitable for Schema.Hints key lookup.
+// Duplicated rather than imported because changeset depends on
+// resource_update. The path escapes each literal map key as it is built, so it
+// is split on unescaped dots only and the segments are unescaped back to the
+// field names a schema declares its hints under.
+func stripArrayIndicesForHintLookup(path string) string {
+	if path == "" {
+		return path
+	}
+	parts := pathkey.Split(path)
+	out := make([]string, 0, len(parts))
+	for _, part := range parts {
+		if isAllDigits(part) && len(parts) > 1 {
+			continue
+		}
+		out = append(out, part)
+	}
+	return strings.Join(out, ".")
+}
+
+func isAllDigits(s string) bool {
+	if s == "" {
+		return false
+	}
+	for _, c := range s {
+		if c < '0' || c > '9' {
+			return false
+		}
+	}
+	return true
+}
+
+func convertUpdatesToReplacementsForDependencies(allResourceUpdates []ResourceUpdate, dependencyDeletes []ResourceUpdate, source FormaCommandSource) []ResourceUpdate {
+	var finalResourceUpdates []ResourceUpdate
+
+	for _, update := range allResourceUpdates {
+		if update.Operation == OperationUpdate {
+			// Check if this update resource depends on any resources being deleted
+			hasDependencyOnDeletedResource := false
+
+			for _, depDelete := range dependencyDeletes {
+				deletedResourceURI := depDelete.DesiredState.URI()
+				if update.DesiredState.URI().Stripped() == deletedResourceURI.Stripped() {
+					hasDependencyOnDeletedResource = true
+					break
+				}
+			}
+
+			if hasDependencyOnDeletedResource {
+				// Convert update to replacement (delete + create) because it depends on a resource being deleted
+				replaceUpdates, err := NewResourceUpdateForReplace(
+					update.PriorState,
+					update.DesiredState,
+					update.ExistingTarget,
+					update.ResourceTarget,
+					source,
+					nil,
+				)
+				if err != nil {
+					slog.Error("Failed to create replacement updates for resource",
+						"resource", update.DesiredState.Label,
+						"error", err)
+					continue
+				}
+
+				finalResourceUpdates = append(finalResourceUpdates, replaceUpdates...)
+				for i, depDelete := range dependencyDeletes {
+					if depDelete.DesiredState.URI().Stripped() == update.DesiredState.URI().Stripped() {
+						// Remove this dependency delete as it has been converted to an update
+						dependencyDeletes = append(dependencyDeletes[:i], dependencyDeletes[i+1:]...)
+						break
+					}
+				}
+
+			} else {
+				// Keep as update
+				finalResourceUpdates = append(finalResourceUpdates, update)
+			}
+		} else {
+			// Keep non-update operations as is
+			finalResourceUpdates = append(finalResourceUpdates, update)
+		}
+	}
+
+	//Aftewards it should add the dependency deletes to the final updates that are not part yet based on the forma uri and delete
+	for _, depDelete := range dependencyDeletes {
+		// Check if this dependency delete is already in the final updates
+		found := false
+		for _, finalUpdate := range finalResourceUpdates {
+			if finalUpdate.DesiredState.URI().Stripped() == depDelete.DesiredState.URI().Stripped() && finalUpdate.Operation == OperationDelete {
+				found = true
+				break
+			}
+		}
+		if !found {
+			finalResourceUpdates = append(finalResourceUpdates, depDelete)
+		}
+	}
+	return finalResourceUpdates
+}
+
+func convertDependencyDeletesToReplacements(allResourceUpdates []ResourceUpdate, dependencyDeletes []ResourceUpdate, forma *pkgmodel.Forma, desiredTargetMap map[string]*pkgmodel.Target, source FormaCommandSource) []ResourceUpdate {
+	var finalResourceUpdates []ResourceUpdate
+	var remainingDependencyDeletes []ResourceUpdate
+
+	// Create a map of Forma resources for quick lookup
+	formaResourceMap := make(map[string]pkgmodel.Resource)
+	for _, resource := range forma.Resources {
+		key := fmt.Sprintf("%s|%s|%s", resource.Stack, resource.Label, resource.Type)
+		formaResourceMap[key] = resource
+	}
+
+	for _, depDelete := range dependencyDeletes {
+		key := fmt.Sprintf("%s|%s|%s", depDelete.DesiredState.Stack, depDelete.DesiredState.Label, depDelete.DesiredState.Type)
+		// Check if this dependency delete resource is in the Forma
+		if formaResource, isInFormaCommand := formaResourceMap[key]; isInFormaCommand {
+			// Check if there's already an update or create operation for this resource
+			hasUpdateOrCreate := false
+			for _, update := range allResourceUpdates {
+				if update.DesiredState.URI().Stripped() == depDelete.DesiredState.URI().Stripped() &&
+					(update.Operation == OperationUpdate || update.Operation == OperationCreate) {
+					hasUpdateOrCreate = true
+					break
+				}
+			}
+
+			if !hasUpdateOrCreate {
+				// Convert dependency delete to replacement since the resource is in Forma
+				// but has no update/create operation
+				replaceUpdates, err := NewResourceUpdateForReplace(
+					depDelete.DesiredState, // existing resource
+					formaResource,          // new resource from forma
+					depDelete.ResourceTarget,
+					*desiredTargetMap[formaResource.Target],
+					source,
+					nil,
+				)
+				if err != nil {
+					slog.Error("Failed to create replacement updates for dependency delete",
+						"resource", depDelete.DesiredState.Label,
+						"error", err)
+					remainingDependencyDeletes = append(remainingDependencyDeletes, depDelete)
+					continue
+				}
+
+				finalResourceUpdates = append(finalResourceUpdates, replaceUpdates...)
+				slog.Debug("Converted dependency delete to replacement",
+					"resource", depDelete.DesiredState.Label,
+					"reason", "resource is in Forma but has no update/create operation")
+			} else {
+				// Keep as dependency delete since there's already an update/create
+				remainingDependencyDeletes = append(remainingDependencyDeletes, depDelete)
+			}
+		} else {
+			// Keep as dependency delete since resource is not in Forma
+			remainingDependencyDeletes = append(remainingDependencyDeletes, depDelete)
+		}
+	}
+
+	return append(finalResourceUpdates, remainingDependencyDeletes...)
+}
+
+// resourcesForResolvables creates a copy of allResourcesByStack and merges
+// forma resources into it. This allows resolvable lookups to find new resources
+// being created in the same command (forward references), without affecting
+// other uses of allResourcesByStack like dependency tracking.
+func resourcesForResolvables(forma *pkgmodel.Forma, allResourcesByStack map[string][]*pkgmodel.Resource) map[string][]*pkgmodel.Resource {
+	result := make(map[string][]*pkgmodel.Resource, len(allResourcesByStack))
+	for k, v := range allResourcesByStack {
+		result[k] = v
+	}
+	for i := range forma.Resources {
+		r := &forma.Resources[i]
+		found := false
+		if stackResources, ok := result[r.Stack]; ok {
+			for _, existing := range stackResources {
+				if existing.Ksuid == r.Ksuid {
+					found = true
+					break
+				}
+			}
+		}
+		if !found {
+			result[r.Stack] = append(result[r.Stack], r)
+		}
+	}
+	return result
+}
+
+// assignKSUIDs looks for existing KSUIDs and if not found, generates new KSUIDs
+func assignKSUIDs(resources []pkgmodel.Resource, ds ResourceDataLookup) ([]pkgmodel.Resource, map[string]string) {
+	var tripletsToLookup []pkgmodel.TripletKey
+	var needsLookupIndices []int
+
+	for i, resource := range resources {
+		if resource.Ksuid == "" {
+			triplet := pkgmodel.TripletKey{
+				Stack: resource.Stack,
+				Label: resource.Label,
+				Type:  resource.Type,
+			}
+			tripletsToLookup = append(tripletsToLookup, triplet)
+			needsLookupIndices = append(needsLookupIndices, i)
+		}
+	}
+
+	ksuidToLabel := make(map[string]string)
+	if len(tripletsToLookup) == 0 {
+		for _, resource := range resources {
+			if resource.Ksuid != "" {
+				ksuidToLabel[resource.Ksuid] = resource.Label
+			}
+		}
+		return resources, ksuidToLabel
+	}
+
+	ksuidMap, err := ds.BatchGetKSUIDsByTriplets(tripletsToLookup)
+
+	// If the batch get KSUIDs by triplets fails, generate new KSUIDs + ksuidToLabel mapping
+	if err != nil {
+		slog.Error("BatchGetKSUIDsByTriplets failed",
+			"error", err,
+			"triplets", tripletsToLookup)
+		for _, idx := range needsLookupIndices {
+			resources[idx].Ksuid = util.NewID()
+		}
+		for _, resource := range resources {
+			if resource.Ksuid != "" {
+				ksuidToLabel[resource.Ksuid] = resource.Label
+			}
+		}
+		return resources, ksuidToLabel
+	}
+
+	for i, idx := range needsLookupIndices {
+		triplet := tripletsToLookup[i]
+		if existingKSUID, ok := ksuidMap[triplet]; ok {
+			// Found by triplet in the target stack
+			resources[idx].Ksuid = existingKSUID
+			continue
+		}
+
+		// A forma resource that declares `alias` is asking to take
+		// over an existing managed row at the old label. Look up the existing
+		// KSUID by the alias triplet BEFORE falling through to the $unmanaged
+		// scan or minting a fresh KSUID. Without this, a rename mints a brand
+		// new KSUID and the persister writes a second row with the same
+		// NativeID as the existing row — visible as duplicate inventory rows.
+		if resources[idx].Alias != "" {
+			aliasKSUID, err := ds.GetKSUIDByTriplet(
+				triplet.Stack,
+				resources[idx].Alias,
+				triplet.Type,
+			)
+			if err == nil && aliasKSUID != "" {
+				slog.Debug("Preserving KSUID via alias",
+					"newLabel", triplet.Label,
+					"alias", resources[idx].Alias,
+					"type", triplet.Type,
+					"ksuid", aliasKSUID)
+				resources[idx].Ksuid = aliasKSUID
+				ksuidToLabel[aliasKSUID] = triplet.Label
+				continue
+			}
+		}
+
+		// Not found in target stack - check if it exists in $unmanaged
+		// This handles the case where we're bringing unmanaged resources under management
+		unmanagedKSUID, err := ds.GetKSUIDByTriplet(
+			constants.UnmanagedStack,
+			triplet.Label,
+			triplet.Type,
+		)
+		if err == nil && unmanagedKSUID != "" {
+			// Found in $unmanaged - preserve that KSUID
+			slog.Debug("Preserving KSUID from $unmanaged stack",
+				"label", triplet.Label,
+				"type", triplet.Type,
+				"ksuid", unmanagedKSUID)
+			resources[idx].Ksuid = unmanagedKSUID
+			ksuidToLabel[unmanagedKSUID] = triplet.Label
+			continue
+		}
+
+		// Edge case: bringing under management + renaming in one apply.
+		// The existing row is in $unmanaged under the alias's discovery default
+		// label, not the new label. Try $unmanaged with the alias label too.
+		if resources[idx].Alias != "" {
+			unmanagedAliasKSUID, err := ds.GetKSUIDByTriplet(
+				constants.UnmanagedStack,
+				resources[idx].Alias,
+				triplet.Type,
+			)
+			if err == nil && unmanagedAliasKSUID != "" {
+				slog.Debug("Preserving KSUID via alias in $unmanaged stack",
+					"newLabel", triplet.Label,
+					"alias", resources[idx].Alias,
+					"type", triplet.Type,
+					"ksuid", unmanagedAliasKSUID)
+				resources[idx].Ksuid = unmanagedAliasKSUID
+				ksuidToLabel[unmanagedAliasKSUID] = triplet.Label
+				continue
+			}
+		}
+
+		// Truly doesn't exist! Generate new KSUID
+		resources[idx].Ksuid = util.NewID()
+	}
+
+	for tripletKey, ksuid := range ksuidMap {
+		ksuidToLabel[ksuid] = tripletKey.Label
+	}
+
+	for _, resource := range resources {
+		if resource.Ksuid != "" {
+			ksuidToLabel[resource.Ksuid] = resource.Label
+		}
+	}
+
+	return resources, ksuidToLabel
+}
+
+// TranslateFormaeReferencesToKsuid translates resolvables values to KSUID refs in both
+// resource properties and target configs. Must be called before GenerateTargetUpdates
+// so that target config resolvables are translated to $ref URIs for extraction.
+func TranslateFormaeReferencesToKsuid(forma *pkgmodel.Forma, ds ResourceDataLookup) (map[string]string, map[pkgmodel.GeneratorKey]string, error) {
+	return translateFormaeReferencesToKsuid(forma, ds)
+}
+
+// translateFormaeReferencesToKsuid translates resolvables values to KSUID refs
+func translateFormaeReferencesToKsuid(forma *pkgmodel.Forma, ds ResourceDataLookup) (map[string]string, map[pkgmodel.GeneratorKey]string, error) {
+	resources, ksuidToLabel := assignKSUIDs(forma.Resources, ds)
+	forma.Resources = resources
+
+	tupleToKsuid := make(map[pkgmodel.TripletKey]string)
+	for _, resource := range forma.Resources {
+		tripletKey := pkgmodel.TripletKey{
+			Stack: resource.Stack,
+			Label: resource.Label,
+			Type:  resource.Type,
+		}
+		tupleToKsuid[tripletKey] = resource.Ksuid
+	}
+
+	genKeyToKsuid, err := assignGeneratorKSUIDs(forma.Generators, ds)
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to resolve generator identities: %w", err)
+	}
+
+	for i, resource := range forma.Resources {
+		if resource.Properties != nil {
+			translatedProperties, externalLabels, err := translatePropertiesJSON(resource.Properties, tupleToKsuid, genKeyToKsuid, ds)
+			if err != nil {
+				return nil, nil, fmt.Errorf("failed to translate properties for resource %s: %w", resource.Label, err)
+			}
+			forma.Resources[i].Properties = translatedProperties
+			maps.Copy(ksuidToLabel, externalLabels)
+		}
+
+		if resource.ReadOnlyProperties != nil {
+			translatedReadOnlyProperties, externalLabels, err := translatePropertiesJSON(resource.ReadOnlyProperties, tupleToKsuid, genKeyToKsuid, ds)
+			if err != nil {
+				return nil, nil, fmt.Errorf("failed to translate read-only properties for resource %s: %w", resource.Label, err)
+			}
+			forma.Resources[i].ReadOnlyProperties = translatedReadOnlyProperties
+			maps.Copy(ksuidToLabel, externalLabels)
+		}
+	}
+
+	for i, target := range forma.Targets {
+		if target.Config != nil {
+			translatedConfig, externalLabels, err := translatePropertiesJSON(target.Config, tupleToKsuid, genKeyToKsuid, ds)
+			if err != nil {
+				return nil, nil, fmt.Errorf("failed to translate target config for %s: %w", target.Label, err)
+			}
+			forma.Targets[i].Config = translatedConfig
+			maps.Copy(ksuidToLabel, externalLabels)
+		}
+	}
+
+	return ksuidToLabel, genKeyToKsuid, nil
+}
+
+// generatorGenerations builds the resolver's view of the generators this
+// command's resources are bound to: for a generator KSUID, the generation
+// that generator currently holds and the spec this command declares for it.
+//
+// The desired spec is nil for a generator this command only REFERENCES —
+// one declared by an earlier apply. Nothing this command does can have
+// edited its spec, so the generation it holds still satisfies it and the
+// resolver skips the satisfaction check. That nil is an untyped nil
+// interface, never a typed nil pointer, which would read as a resolved
+// generator with no fields.
+//
+// The KSUIDs come from assignGeneratorKSUIDs, the same resolution the $gen
+// envelopes were translated with, so a declared generator that already has a
+// row is keyed by the KSUID its envelopes carry. A generator with no row yet
+// gets a freshly minted KSUID that matches no envelope; the lookup then
+// answers a zero identity for the envelope's KSUID, which is the same "no
+// generation yet" answer the row's absence means on its own.
+func generatorGenerations(forma *pkgmodel.Forma, ds ResourceDataLookup) (resolver.GeneratorGenerationLookup, error) {
+	declaredByKsuid := make(map[string]pkgmodel.Generator)
+	if len(forma.Generators) > 0 {
+		declared, err := pkgmodel.ParseGenerators(forma.Generators)
+		if err != nil {
+			return nil, fmt.Errorf("failed to parse generators: %w", err)
+		}
+		keyToKsuid, err := assignGeneratorKSUIDs(forma.Generators, ds)
+		if err != nil {
+			return nil, err
+		}
+		for _, gen := range declared {
+			if ksuid := keyToKsuid[pkgmodel.GeneratorKey{Label: gen.GetLabel(), Stack: gen.GetStack()}]; ksuid != "" {
+				declaredByKsuid[ksuid] = gen
+			}
+		}
+	}
+
+	identities := make(map[string]pkgmodel.GeneratorIdentity)
+	return func(ksuid string) (pkgmodel.GeneratorIdentity, pkgmodel.Generator) {
+		identity, memoized := identities[ksuid]
+		if !memoized {
+			var err error
+			identity, err = ds.GetGeneratorIdentityByID(ksuid)
+			if err != nil {
+				// A generator whose identity cannot be read has unknown
+				// movement, which plans the occurrence and converges it. That
+				// is the safe direction: failing the whole apply on a lookup
+				// this command can recover from on its own is not.
+				slog.Warn("Failed to look up generator identity; treating its generation as moved",
+					"generator", ksuid, "error", err)
+				identity = pkgmodel.GeneratorIdentity{}
+			}
+			identities[ksuid] = identity
+		}
+		return identity, declaredByKsuid[ksuid]
+	}, nil
+}
+
+// assignGeneratorKSUIDs resolves every generator forma.Generators declares to
+// a KSUID, mirroring assignKSUIDs' resource pattern: the datastore's live
+// identity when this same generator already has one (an update-in-place, so
+// the KSUID must not change), or a freshly minted KSUID when it does not (a
+// first apply that declares a generator and a secret bound to it together —
+// the generator has no row yet, and a datastore-only lookup would hard-error
+// on the most common authoring shape).
+//
+// Unlike assignKSUIDs, which writes straight onto pkgmodel.Resource.Ksuid,
+// this function cannot assign onto the generator objects that reach
+// persistence directly: forma.Generators is raw JSON at this layer, and the
+// typed pkgmodel.Generator values GenerateGeneratorUpdates eventually
+// persists are parsed independently, in a different package, later in the
+// same command. The returned map is therefore the assignment: the caller
+// (translateFormaeReferencesToKsuid, via TranslateFormaeReferencesToKsuid)
+// must hand it to generator_update.GenerateGeneratorUpdates, which calls
+// Generator.SetID on its own freshly-parsed declared generators — see that
+// function's doc comment. Without that second step this function's minted
+// KSUID reaches only the resource's translated $gen envelope, and
+// CreateGenerator would still mint an unrelated one for the generator's own
+// row.
+func assignGeneratorKSUIDs(rawGenerators []json.RawMessage, ds ResourceDataLookup) (map[pkgmodel.GeneratorKey]string, error) {
+	generators, err := pkgmodel.ParseGenerators(rawGenerators)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse generators: %w", err)
+	}
+
+	keyToKsuid := make(map[pkgmodel.GeneratorKey]string, len(generators))
+	for _, gen := range generators {
+		key := pkgmodel.GeneratorKey{Label: gen.GetLabel(), Stack: gen.GetStack()}
+		if _, done := keyToKsuid[key]; done {
+			continue
+		}
+
+		identity, err := ds.GetGeneratorIdentity(gen.GetLabel(), gen.GetStack())
+		if err != nil {
+			return nil, fmt.Errorf("failed to look up generator %q in stack %q: %w", gen.GetLabel(), gen.GetStack(), err)
+		}
+
+		// A declared generator that carries Alias is asking to take over an
+		// existing row at the old label (see PasswordGenerator.GetAlias) — a
+		// miss on the current label falls back to the alias before minting,
+		// mirroring assignKSUIDs' identical resource-rename handling. Without
+		// this, a $gen reference to the generator's new label in the same
+		// command that renames it would mint an orphan KSUID no stored row
+		// will ever carry.
+		if identity.ID == "" && gen.GetAlias() != "" {
+			identity, err = ds.GetGeneratorIdentity(gen.GetAlias(), gen.GetStack())
+			if err != nil {
+				return nil, fmt.Errorf("failed to look up generator %q by alias %q in stack %q: %w", gen.GetLabel(), gen.GetAlias(), gen.GetStack(), err)
+			}
+		}
+
+		if identity.ID != "" {
+			keyToKsuid[key] = identity.ID
+			continue
+		}
+
+		keyToKsuid[key] = util.NewID()
+	}
+
+	return keyToKsuid, nil
+}
+
+// translatePropertiesJSON translates all resolvable objects to KSUID URIs
+
+// stripUntrustedProvenance deletes the $resolvedFrom key from every
+// REFERENCE ENVELOPE in a user-authored properties document. Only STORED
+// envelopes carry trusted provenance; the desired side never does. The strip
+// is scoped to envelopes ($ref/$res shaped maps) because that is the only
+// place provenance is ever read from: the same key inside an ordinary map is
+// user data and must round-trip.
+func stripUntrustedProvenance(properties string) (string, error) {
+	var v any
+	if err := json.Unmarshal([]byte(properties), &v); err != nil {
+		return properties, nil // not JSON we manage; translation will handle it
+	}
+	cleaned, changed := withoutEnvelopeProvenance(v)
+	if !changed {
+		return properties, nil
+	}
+	out, err := json.Marshal(cleaned)
+	if err != nil {
+		return "", fmt.Errorf("failed to re-serialize properties after provenance strip: %w", err)
+	}
+	return string(out), nil
+}
+
+// withoutEnvelopeProvenance returns v with $resolvedFrom removed from every
+// reference envelope, and whether any removal happened. (Rebuilds rather than
+// mutating: this package shadows the delete builtin with an actor handler of
+// the same name.)
+func withoutEnvelopeProvenance(v any) (any, bool) {
+	switch t := v.(type) {
+	case map[string]any:
+		_, hasRef := t["$ref"]
+		_, hasRes := t["$res"]
+		_, hasGen := t["$gen"]
+		isEnvelope := hasRef || hasRes || hasGen
+		changed := false
+		out := make(map[string]any, len(t))
+		for k, child := range t {
+			if isEnvelope && k == "$resolvedFrom" {
+				changed = true
+				continue
+			}
+			cleanedChild, childChanged := withoutEnvelopeProvenance(child)
+			out[k] = cleanedChild
+			changed = changed || childChanged
+		}
+		return out, changed
+	case []any:
+		changed := false
+		out := make([]any, len(t))
+		for i, child := range t {
+			cleanedChild, childChanged := withoutEnvelopeProvenance(child)
+			out[i] = cleanedChild
+			changed = changed || childChanged
+		}
+		return out, changed
+	default:
+		return v, false
+	}
+}
+
+func translatePropertiesJSON(properties json.RawMessage, tripletToKsuid map[pkgmodel.TripletKey]string, genKeyToKsuid map[pkgmodel.GeneratorKey]string, ds ResourceDataLookup) (json.RawMessage, map[string]string, error) {
+	// genKeyToKsuid doubles as a memoization cache for datastore-tier $gen
+	// lookups below (and in the embed-span pass this function calls into),
+	// so it must be a real map even when a caller passes nil for "no
+	// in-command generators" — production callers (translateFormaeReferencesToKsuid)
+	// always pass a non-nil map already; this guard is for direct callers.
+	if genKeyToKsuid == nil {
+		genKeyToKsuid = make(map[pkgmodel.GeneratorKey]string)
+	}
+
+	// Trust boundary: $resolvedFrom is a formae-written provenance record,
+	// never a user-writable key. $res envelopes are rewritten wholesale below
+	// (dropping any forged sibling by construction), but a raw $ref envelope
+	// authored directly would carry one through - strip it everywhere before
+	// anything downstream can mistake it for trusted provenance.
+	stripped, err := stripUntrustedProvenance(string(properties))
+	if err != nil {
+		return nil, nil, err
+	}
+	result, externalLabels, resolvables := stripped, make(map[string]string), pkgmodel.FindResolvablesFromProperties(stripped)
+	var (
+		formaeURI        pkgmodel.FormaeURI
+		missingResources []*pkgmodel.Resource
+	)
+
+	for _, resolvable := range resolvables {
+		ksuid, ok := tripletToKsuid[resolvable.ToTripletKey()]
+		if ok {
+			formaeURI = resolvable.ToFormaeURI(ksuid)
+		} else {
+			// Look up the KSUID directly from the datastore
+			if resolvable.Label == "" || resolvable.Type == "" || resolvable.Stack == "" {
+				missingResources = append(missingResources, &pkgmodel.Resource{
+					Label: resolvable.Label,
+					Type:  resolvable.Type,
+					Stack: resolvable.Stack,
+				})
+				continue
+			}
+
+			ksuid, err = ds.GetKSUIDByTriplet(resolvable.Stack, resolvable.Label, resolvable.Type)
+			if err != nil || ksuid == "" {
+				// Fallback: This handles the case where we're bringing unmanaged resources under management
+				// and the resolvable points to the target stack but the resource still exists in $unmanaged
+				ksuid, err = ds.GetKSUIDByTriplet(constants.UnmanagedStack, resolvable.Label, resolvable.Type)
+				if err != nil || ksuid == "" {
+					missingResources = append(missingResources, &pkgmodel.Resource{
+						Label: resolvable.Label,
+						Type:  resolvable.Type,
+						Stack: resolvable.Stack,
+					})
+					continue
+				}
+			}
+			formaeURI = resolvable.ToFormaeURI(ksuid)
+		}
+		refObject := map[string]any{"$ref": string(formaeURI)}
+		if resolvable.JSONPath != "" {
+			refObject["$json"] = resolvable.JSONPath
+		}
+
+		result, err = sjson.Set(result, resolvable.Path, refObject)
+		if err != nil {
+			return nil, nil, fmt.Errorf("failed to replace resolvable object at path %s: %w", resolvable.Path, err)
+		}
+
+		if resolvable.Label != "" {
+			externalLabels[formaeURI.KSUID()] = resolvable.Label
+		}
+	}
+
+	if len(missingResources) > 0 {
+		return nil, nil, apimodel.FormaReferencedResourcesNotFoundError{
+			MissingResources: missingResources,
+		}
+	}
+
+	// $gen pass: resolve every generator reference to a generator KSUID,
+	// mirroring the $res pass above. Resolution order is in-command first
+	// (genKeyToKsuid, built from this command's own forma.Generators — a
+	// generator this command declares is resolvable even though it is not
+	// yet persisted), then the datastore. Neither finding it is a dangling
+	// reference and a hard error: PKL cannot reject a $gen naming a
+	// generator that is never declared (a bare `local` still renders a
+	// well-formed envelope), so this is the only check standing between
+	// such a forma and an apply.
+	var missingGenerators []pkgmodel.MissingGenerator
+	for _, genObject := range pkgmodel.FindGenObjectsFromProperties(json.RawMessage(result)) {
+		// Idempotency: a $gen node keeps the same $gen:true key across
+		// translation (unlike $res->$ref, which changes key), so a second
+		// translation pass over already-translated output must recognize an
+		// already-resolved node ($generator present) and leave it alone
+		// rather than treating its missing $label/$stack as dangling.
+		if gjson.Get(result, genObject.Path).Get("$generator").Exists() {
+			continue
+		}
+
+		if genObject.Label == "" || genObject.Stack == "" || !pkgmodel.KnownGeneratorOutputs[genObject.Output] {
+			missingGenerators = append(missingGenerators, pkgmodel.MissingGenerator{
+				Label:  genObject.Label,
+				Stack:  genObject.Stack,
+				Output: genObject.Output,
+			})
+			continue
+		}
+
+		genKey := pkgmodel.GeneratorKey{Label: genObject.Label, Stack: genObject.Stack}
+		generatorKsuid, ok := genKeyToKsuid[genKey]
+		if !ok {
+			identity, identityErr := ds.GetGeneratorIdentity(genObject.Label, genObject.Stack)
+			if identityErr != nil {
+				return nil, nil, fmt.Errorf("failed to look up generator %q in stack %q: %w", genObject.Label, genObject.Stack, identityErr)
+			}
+			if identity.ID == "" {
+				missingGenerators = append(missingGenerators, pkgmodel.MissingGenerator{
+					Label:  genObject.Label,
+					Stack:  genObject.Stack,
+					Output: genObject.Output,
+				})
+				continue
+			}
+			generatorKsuid = identity.ID
+			// Memoize: genKeyToKsuid is shared across every property document
+			// this command translates (all resources, read-only properties,
+			// target configs), so caching a datastore-tier hit here spares a
+			// repeat GetGeneratorIdentity call for every other occurrence of
+			// the same generator in the same command.
+			genKeyToKsuid[genKey] = generatorKsuid
+		}
+
+		genEnvelope := map[string]any{
+			"$gen":        true,
+			"$generator":  generatorKsuid,
+			"$output":     genObject.Output,
+			"$visibility": "Opaque",
+		}
+		result, err = sjson.Set(result, genObject.Path, genEnvelope)
+		if err != nil {
+			return nil, nil, fmt.Errorf("failed to replace generator reference at path %s: %w", genObject.Path, err)
+		}
+	}
+
+	if len(missingGenerators) > 0 {
+		return nil, nil, apimodel.FormaReferencedGeneratorsNotFoundError{
+			Missing: missingGenerators,
+		}
+	}
+
+	// Third pass: translate $res and $gen envelopes framed inside
+	// $embed.$template strings. FindResolvablesFromProperties/
+	// FindGenObjectsFromProperties do not scan string contents, so embedded
+	// spans are invisible to the flat-list passes above. We walk the tree
+	// explicitly here.
+	result, err = translateEmbedSpans(result, tripletToKsuid, genKeyToKsuid, ds, externalLabels)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	return json.RawMessage(result), externalLabels, nil
+}
+
+// appendPathSegment appends one literal JSON map key or array index to a
+// gjson/sjson path, escaping it as it is appended. The walkers below build their
+// paths out of data-derived keys, and a key carrying path syntax would otherwise
+// address a nested tree — reading nothing, and writing the key's exploded
+// duplicate beside the key itself.
+func appendPathSegment(basePath, key string) string {
+	escaped := pathkey.Escape(key)
+	if basePath == "" {
+		return escaped
+	}
+	return basePath + "." + escaped
+}
+
+// translateEmbedSpans walks the JSON tree for objects with $embed==true and
+// rewrites any framed RS<base64>US $res envelopes in $template to $ref+KSUID form.
+func translateEmbedSpans(jsonStr string, tripletToKsuid map[pkgmodel.TripletKey]string, genKeyToKsuid map[pkgmodel.GeneratorKey]string, ds ResourceDataLookup, externalLabels map[string]string) (string, error) {
+	return translateEmbedSpansAtPath("", gjson.Parse(jsonStr), jsonStr, tripletToKsuid, genKeyToKsuid, ds, externalLabels)
+}
+
+func translateEmbedSpansAtPath(basePath string, value gjson.Result, jsonStr string, tripletToKsuid map[pkgmodel.TripletKey]string, genKeyToKsuid map[pkgmodel.GeneratorKey]string, ds ResourceDataLookup, externalLabels map[string]string) (string, error) {
+	var err error
+	if value.IsObject() {
+		if value.Get("$embed").Bool() {
+			tmplResult := value.Get("$template")
+			if tmplResult.Exists() && tmplResult.Type == gjson.String {
+				tmpl := tmplResult.String()
+				tmpl, err = translateEmbedSpansInTemplate(tmpl, tripletToKsuid, genKeyToKsuid, ds, externalLabels)
+				if err != nil {
+					return jsonStr, err
+				}
+				templatePath := basePath
+				if templatePath == "" {
+					templatePath = "$template"
+				} else {
+					templatePath = templatePath + ".$template"
+				}
+				jsonStr, err = sjson.Set(jsonStr, templatePath, tmpl)
+				if err != nil {
+					return jsonStr, fmt.Errorf("failed to update $embed.$template at path %s: %w", templatePath, err)
+				}
+			}
+			return jsonStr, nil
+		}
+		// Recurse into child fields
+		var walkErr error
+		value.ForEach(func(key, val gjson.Result) bool {
+			childPath := appendPathSegment(basePath, key.String())
+			jsonStr, walkErr = translateEmbedSpansAtPath(childPath, val, jsonStr, tripletToKsuid, genKeyToKsuid, ds, externalLabels)
+			return walkErr == nil
+		})
+		if walkErr != nil {
+			return jsonStr, walkErr
+		}
+	} else if value.IsArray() {
+		var walkErr error
+		value.ForEach(func(key, val gjson.Result) bool {
+			childPath := appendPathSegment(basePath, key.String())
+			jsonStr, walkErr = translateEmbedSpansAtPath(childPath, val, jsonStr, tripletToKsuid, genKeyToKsuid, ds, externalLabels)
+			return walkErr == nil
+		})
+		if walkErr != nil {
+			return jsonStr, walkErr
+		}
+	}
+	return jsonStr, nil
+}
+
+// uniqueKsuidByLabelAndType resolves a (label, type) pair to a KSUID when exactly
+// one resource in the forma matches it regardless of stack. It mirrors forma.pkl's
+// getResource(label, type) lookup and is used to default the stack of a bare embed
+// reference whose $stack was omitted at PKL render time. It returns false when the
+// match is absent or ambiguous, so the caller can surface the incomplete-triplet
+// error and the user disambiguates with an explicit stack.
+func uniqueKsuidByLabelAndType(tripletToKsuid map[pkgmodel.TripletKey]string, label, resourceType string) (string, bool) {
+	var ksuid string
+	count := 0
+	for tk, ks := range tripletToKsuid {
+		if tk.Label == label && tk.Type == resourceType {
+			ksuid = ks
+			count++
+		}
+	}
+	return ksuid, count == 1
+}
+
+// translateEmbedSpansInTemplate rewrites every framed $res envelope in a $template
+// string to its $ref+KSUID equivalent using the same lookup logic as the flat pass.
+func translateEmbedSpansInTemplate(tmpl string, tripletToKsuid map[pkgmodel.TripletKey]string, genKeyToKsuid map[pkgmodel.GeneratorKey]string, ds ResourceDataLookup, externalLabels map[string]string) (string, error) {
+	spans, err := pkgmodel.ScanEmbedSpans(tmpl)
+	if err != nil || len(spans) == 0 {
+		return tmpl, err
+	}
+
+	// Process in reverse offset order so earlier offsets stay valid.
+	for i := len(spans) - 1; i >= 0; i-- {
+		span := spans[i]
+		parsed := gjson.Parse(span.EnvelopeJSON)
+
+		if pkgmodel.IsGenObject(parsed) {
+			// Idempotency: skip a span already carrying $generator (already
+			// translated) rather than misreading its missing $label/$stack as
+			// a dangling reference — mirrors the flat-pass guard above.
+			if parsed.Get("$generator").Exists() {
+				continue
+			}
+
+			genObject := pkgmodel.GenObject{
+				Label:  parsed.Get("$label").String(),
+				Stack:  parsed.Get("$stack").String(),
+				Output: parsed.Get("$output").String(),
+			}
+			if genObject.Label == "" || genObject.Stack == "" || !pkgmodel.KnownGeneratorOutputs[genObject.Output] {
+				return tmpl, apimodel.FormaReferencedGeneratorsNotFoundError{
+					Missing: []pkgmodel.MissingGenerator{{Label: genObject.Label, Stack: genObject.Stack, Output: genObject.Output}},
+				}
+			}
+
+			genKey := pkgmodel.GeneratorKey{Label: genObject.Label, Stack: genObject.Stack}
+			generatorKsuid, ok := genKeyToKsuid[genKey]
+			if !ok {
+				identity, identityErr := ds.GetGeneratorIdentity(genObject.Label, genObject.Stack)
+				if identityErr != nil {
+					return tmpl, fmt.Errorf("failed to look up generator %q in stack %q: %w", genObject.Label, genObject.Stack, identityErr)
+				}
+				if identity.ID == "" {
+					return tmpl, apimodel.FormaReferencedGeneratorsNotFoundError{
+						Missing: []pkgmodel.MissingGenerator{{Label: genObject.Label, Stack: genObject.Stack, Output: genObject.Output}},
+					}
+				}
+				generatorKsuid = identity.ID
+				// Memoize, same reasoning as the flat pass: spares a repeat
+				// GetGeneratorIdentity call for the same generator referenced
+				// again elsewhere in this command.
+				genKeyToKsuid[genKey] = generatorKsuid
+			}
+
+			genJSON, marshalErr := json.Marshal(map[string]any{
+				"$gen":        true,
+				"$generator":  generatorKsuid,
+				"$output":     genObject.Output,
+				"$visibility": "Opaque",
+			})
+			if marshalErr != nil {
+				return tmpl, fmt.Errorf("embed span: failed to marshal $gen envelope: %w", marshalErr)
+			}
+
+			framed := pkgmodel.FrameEnvelope(string(genJSON))
+			tmpl = tmpl[:span.Start] + framed + tmpl[span.End:]
+			continue
+		}
+
+		if !pkgmodel.IsResolvableObject(parsed) {
+			// Not a $res or $gen envelope — leave span unchanged.
+			continue
+		}
+		resolvable := pkgmodel.ResolvableObject{
+			Label:    parsed.Get("$label").String(),
+			Type:     parsed.Get("$type").String(),
+			Stack:    parsed.Get("$stack").String(),
+			Property: parsed.Get("$property").String(),
+			JSONPath: parsed.Get("$json").String(),
+		}
+
+		var formaeURI pkgmodel.FormaeURI
+		ksuid, ok := tripletToKsuid[resolvable.ToTripletKey()]
+		if !ok && resolvable.Stack == "" && resolvable.Label != "" && resolvable.Type != "" {
+			// A bare embed reference omits $stack: Resolvable.toString() renders
+			// the envelope at interpolation time, before forma.pkl applies
+			// single-stack defaulting, and the JSON renderer drops the null
+			// $stack key. The whole-value path is fixed up by forma.pkl's
+			// [formae.Resolvable] converter via getResource(label, type); mirror
+			// that here by resolving on (label, type) when it is unambiguous
+			// across the forma.
+			if k, found := uniqueKsuidByLabelAndType(tripletToKsuid, resolvable.Label, resolvable.Type); found {
+				ksuid, ok = k, true
+			}
+		}
+		if ok {
+			formaeURI = resolvable.ToFormaeURI(ksuid)
+		} else {
+			if resolvable.Label == "" || resolvable.Type == "" || resolvable.Stack == "" {
+				return tmpl, fmt.Errorf("embed span has incomplete triplet (label=%q type=%q stack=%q)", resolvable.Label, resolvable.Type, resolvable.Stack)
+			}
+			ksuid, err = ds.GetKSUIDByTriplet(resolvable.Stack, resolvable.Label, resolvable.Type)
+			if err != nil || ksuid == "" {
+				ksuid, err = ds.GetKSUIDByTriplet(constants.UnmanagedStack, resolvable.Label, resolvable.Type)
+				if err != nil || ksuid == "" {
+					return tmpl, fmt.Errorf("embed span references unknown resource (label=%q type=%q stack=%q)", resolvable.Label, resolvable.Type, resolvable.Stack)
+				}
+			}
+			formaeURI = resolvable.ToFormaeURI(ksuid)
+		}
+
+		refEnv := map[string]any{"$ref": string(formaeURI)}
+		if resolvable.JSONPath != "" {
+			refEnv["$json"] = resolvable.JSONPath
+		}
+		refJSON, marshalErr := json.Marshal(refEnv)
+		if marshalErr != nil {
+			return tmpl, fmt.Errorf("embed span: failed to marshal $ref envelope: %w", marshalErr)
+		}
+
+		framed := pkgmodel.FrameEnvelope(string(refJSON))
+		tmpl = tmpl[:span.Start] + framed + tmpl[span.End:]
+
+		if resolvable.Label != "" && externalLabels != nil {
+			externalLabels[formaeURI.KSUID()] = resolvable.Label
+		}
+	}
+	return tmpl, nil
+}
+
+// markInheritedOpaqueResolvables walks each resource's properties for structured
+// $res resolvables and, when a resolvable points at another resource's Opaque
+// property, stamps $visibility:Opaque on the $res envelope in place.
+//
+// A structured $res reference in its pre-resolution shape ({"$res":true,"$label":..,
+// "$type":..,"$stack":..,"$property":..[,"$value":..]}) survives at rest on the
+// non-translating paths (Synchronize/Discovery/Destroy/seed) where a user apply's
+// $res->$ref rewrite never runs. Unlike the resolved $ref shape — which inherits
+// opacity via preserveRefMetadata/the resolver at apply time — a raw $res carries no
+// $visibility marker, so on a sync the merge refreshes its $value from the plugin's
+// live read while the persist transformer never hashes it: the resolved secret leaks
+// in CLEARTEXT at rest (the sibling of the cleartext-at-rest case). Stamping $visibility:Opaque here lets
+// both the sync merge (drop stale $hashed) and the persist transformer (re-hash)
+// treat the field exactly like an Opaque $ref.
+//
+// Opacity is looked up strictly from the referenced resource (keyed by the
+// resolvable's $stack/$label/$type): a property counts as opaque if the referenced
+// resource's schema marks it Opaque OR its stored value already carries a
+// $visibility:Opaque envelope (the authoritative at-rest form, which survives even
+// when a plugin's runtime schema drops FieldHint.Opaque). Non-secret $res references
+// (native IDs, ARNs, etc.) are left untouched.
+func markInheritedOpaqueResolvables(resources []*pkgmodel.Resource) {
+	opaqueByTriplet := make(map[pkgmodel.TripletKey]map[string]bool)
+	for _, res := range resources {
+		set := make(map[string]bool)
+		for _, f := range res.Schema.Opaque() {
+			set[f] = true
+		}
+		gjson.ParseBytes(res.Properties).ForEach(func(key, val gjson.Result) bool {
+			if val.IsObject() && val.Get("$visibility").String() == pkgmodel.VisibilityOpaque {
+				set[key.String()] = true
+			}
+			return true
+		})
+		if len(set) == 0 {
+			continue
+		}
+		opaqueByTriplet[pkgmodel.TripletKey{Stack: res.Stack, Label: res.Label, Type: res.Type}] = set
+	}
+	if len(opaqueByTriplet) == 0 {
+		return
+	}
+
+	for _, res := range resources {
+		if len(res.Properties) == 0 {
+			continue
+		}
+		if updated, changed := markOpaqueResolvablesInProps(string(res.Properties), opaqueByTriplet); changed {
+			res.Properties = json.RawMessage(updated)
+		}
+	}
+}
+
+// markOpaqueResolvablesInProps returns props with $visibility:Opaque stamped on every
+// $res envelope that references a known Opaque property, and whether anything changed.
+func markOpaqueResolvablesInProps(propsJSON string, opaqueByTriplet map[pkgmodel.TripletKey]map[string]bool) (string, bool) {
+	var paths []string
+	collectOpaqueResolvablePaths("", gjson.Parse(propsJSON), opaqueByTriplet, &paths)
+	if len(paths) == 0 {
+		return propsJSON, false
+	}
+	result := propsJSON
+	for _, p := range paths {
+		result, _ = sjson.Set(result, p+".$visibility", pkgmodel.VisibilityOpaque)
+	}
+	return result, true
+}
+
+// referencesOpaqueProperty reports whether propertyName names an opaque property
+// of the source, given the source's set of opaque property names.
+//
+// A reference into a MAP-shaped secret selects one key and carries the key folded
+// into the property path (e.g. "data.token", produced by
+// secret.res.secretValue.at("token")). The opaque name is the parent field, since
+// the field is stored as a single envelope with no per-key sub-structure, so the
+// leaf path is never in the set and matching it alone would leave the reference
+// un-marked and its resolved value unhashed at rest. Test the top-level field too,
+// mirroring resolver.isSourcePropertyOpaque.
+//
+// The converse direction also holds: a hint nested under the referenced path
+// (an opaque descendant) makes the referenced container opaque, since resolving
+// the container would materialize the descendant. Same rule as the resolver's
+// oracle; keep the two in sync.
+func referencesOpaqueProperty(opaque map[string]bool, propertyName string) bool {
+	if propertyName == "" {
+		return false
+	}
+	if opaque[propertyName] {
+		return true
+	}
+	for key := range opaque {
+		if strings.HasPrefix(key, propertyName+".") {
+			return true
+		}
+	}
+	// Every ancestor prefix, not only the top-level root: the opaque parent of
+	// a map-shaped secret may itself be nested.
+	for i := len(propertyName) - 1; i > 0; i-- {
+		if propertyName[i] == '.' && opaque[propertyName[:i]] {
+			return true
+		}
+	}
+	return false
+}
+
+// collectOpaqueResolvablePaths records the gjson/sjson path of every $res envelope
+// that references a known Opaque property and does not already carry $visibility.
+func collectOpaqueResolvablePaths(basePath string, value gjson.Result, opaqueByTriplet map[pkgmodel.TripletKey]map[string]bool, paths *[]string) {
+	if !value.IsObject() && !value.IsArray() {
+		return
+	}
+	if value.IsObject() && pkgmodel.IsResolvableObject(value) {
+		if value.Get("$visibility").String() != "" {
+			return
+		}
+		triplet := pkgmodel.TripletKey{
+			Stack: value.Get("$stack").String(),
+			Label: value.Get("$label").String(),
+			Type:  value.Get("$type").String(),
+		}
+		property := value.Get("$property").String()
+		if set, ok := opaqueByTriplet[triplet]; ok && referencesOpaqueProperty(set, property) {
+			*paths = append(*paths, basePath)
+		}
+		return
+	}
+	value.ForEach(func(key, val gjson.Result) bool {
+		childPath := appendPathSegment(basePath, key.String())
+		collectOpaqueResolvablePaths(childPath, val, opaqueByTriplet, paths)
+		return true
+	})
+}

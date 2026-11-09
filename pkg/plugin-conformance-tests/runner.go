@@ -1,0 +1,2287 @@
+// © 2025 Platform Engineering Labs Inc.
+//
+// SPDX-License-Identifier: FSL-1.1-ALv2
+
+package conformance
+
+import (
+	"encoding/json"
+	"fmt"
+	"os"
+	"path/filepath"
+	"regexp"
+	"sort"
+	"strconv"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/platform-engineering-labs/formae/pkg/api/model"
+	pkgmodel "github.com/platform-engineering-labs/formae/pkg/model"
+)
+
+// testReporter abstracts the error/log reporting interface of testing.T so that
+// comparison functions can optionally collect error messages for the result matrix.
+type testReporter interface {
+	Errorf(format string, args ...any)
+	Logf(format string, args ...any)
+}
+
+// collectingReporter wraps a testing.T to intercept Errorf calls and collect
+// the formatted error messages for inclusion in the result matrix summary.
+type collectingReporter struct {
+	t      *testing.T
+	errors []string
+}
+
+func (r *collectingReporter) Errorf(format string, args ...any) {
+	msg := fmt.Sprintf(format, args...)
+	r.errors = append(r.errors, msg)
+	r.t.Errorf("%s", msg)
+}
+
+func (r *collectingReporter) Logf(format string, args ...any) {
+	r.t.Logf(format, args...)
+}
+
+// filterTestCases filters test cases based on the FORMAE_TEST_FILTER environment variable.
+// The filter matches against test case names (e.g., "AWS::s3-bucket") or file paths.
+// Multiple filters can be comma-separated (e.g., "s3-bucket,ec2-instance").
+// If no filter is set, all test cases are returned.
+func filterTestCases(t *testing.T, testCases []TestCase) []TestCase {
+	filter := os.Getenv("FORMAE_TEST_FILTER")
+	if filter == "" {
+		return testCases
+	}
+
+	// Split filter into multiple patterns (comma-separated)
+	patterns := strings.Split(filter, ",")
+	for i := range patterns {
+		patterns[i] = strings.TrimSpace(patterns[i])
+	}
+
+	// Separate regex patterns (/…/) from literal patterns.
+	// Regex patterns are compiled upfront; invalid regex causes immediate failure.
+	type compiledRegex struct {
+		re *regexp.Regexp
+	}
+	var regexPatterns []compiledRegex
+	var literalPatterns []string
+
+	for _, pattern := range patterns {
+		if pattern == "" {
+			continue
+		}
+		if strings.HasPrefix(pattern, "/") && strings.HasSuffix(pattern, "/") {
+			inner := pattern[1 : len(pattern)-1]
+			re, err := regexp.Compile(inner)
+			if err != nil {
+				t.Fatalf("FORMAE_TEST_FILTER: invalid regex %q: %v", pattern, err)
+			}
+			regexPatterns = append(regexPatterns, compiledRegex{re: re})
+		} else {
+			literalPatterns = append(literalPatterns, pattern)
+		}
+	}
+
+	// For each literal pattern, check if it exactly matches any ResourceType.
+	// If so, use exact matching for that pattern to avoid substring
+	// collisions (e.g. "s3-bucket" matching "s3-bucketpolicy").
+	// If no exact match exists, fall back to substring matching.
+	exactPatterns := make(map[string]bool)
+	for _, pattern := range literalPatterns {
+		for _, tc := range testCases {
+			if strings.EqualFold(tc.ResourceType, pattern) {
+				exactPatterns[strings.ToLower(pattern)] = true
+				break
+			}
+		}
+	}
+
+	var filtered []TestCase
+	for _, tc := range testCases {
+		// Check regex patterns first
+		matched := false
+		for _, rp := range regexPatterns {
+			if rp.re.MatchString(tc.Name) || rp.re.MatchString(tc.ResourceType) {
+				matched = true
+				break
+			}
+		}
+		if matched {
+			filtered = append(filtered, tc)
+			continue
+		}
+
+		// Check literal patterns
+		for _, pattern := range literalPatterns {
+			patternLower := strings.ToLower(pattern)
+
+			if exactPatterns[patternLower] {
+				// Exact match on ResourceType only
+				if strings.EqualFold(tc.ResourceType, pattern) {
+					filtered = append(filtered, tc)
+					break
+				}
+			} else {
+				// Substring match against test name, resource type, or PKL file path
+				if strings.Contains(strings.ToLower(tc.Name), patternLower) ||
+					strings.Contains(strings.ToLower(tc.ResourceType), patternLower) ||
+					strings.Contains(strings.ToLower(tc.PKLFile), patternLower) {
+					filtered = append(filtered, tc)
+					break
+				}
+			}
+		}
+	}
+
+	if len(filtered) == 0 {
+		t.Fatalf("FORMAE_TEST_FILTER=%q matched no test cases. Available: %v", filter, testCaseNames(testCases))
+	}
+
+	t.Logf("Filter %q matched %d of %d test case(s)", filter, len(filtered), len(testCases))
+	return filtered
+}
+
+// testCaseNames returns a slice of test case names for error messages.
+func testCaseNames(testCases []TestCase) []string {
+	names := make([]string, len(testCases))
+	for i, tc := range testCases {
+		names[i] = tc.Name
+	}
+	return names
+}
+
+// TestType represents the type of conformance tests to run.
+type TestType string
+
+const (
+	// TestTypeAll runs both CRUD and discovery tests (default).
+	TestTypeAll TestType = "all"
+	// TestTypeCRUD runs only CRUD lifecycle tests.
+	TestTypeCRUD TestType = "crud"
+	// TestTypeDiscovery runs only discovery tests.
+	TestTypeDiscovery TestType = "discovery"
+)
+
+// getTestType returns the test type from FORMAE_TEST_TYPE environment variable.
+// Valid values are: "all" (default), "crud", "discovery".
+func getTestType() TestType {
+	testType := strings.ToLower(os.Getenv("FORMAE_TEST_TYPE"))
+	switch testType {
+	case "crud":
+		return TestTypeCRUD
+	case "discovery":
+		return TestTypeDiscovery
+	default:
+		return TestTypeAll
+	}
+}
+
+// isParallelEnabled returns true if FORMAE_TEST_PARALLEL is set to a value > 1.
+// This enables parallel test execution when used with `go test -parallel N`.
+func isParallelEnabled() bool {
+	if val := os.Getenv("FORMAE_TEST_PARALLEL"); val != "" {
+		if n, err := strconv.Atoi(val); err == nil && n > 1 {
+			return true
+		}
+	}
+	return false
+}
+
+// getOperationTimeout returns the timeout duration for long-running operations.
+// It reads from FORMAE_TEST_TIMEOUT environment variable (in minutes).
+// Default is 5 minutes. For resources like Cloud SQL that take longer, set to 15.
+func getOperationTimeout() time.Duration {
+	if val := os.Getenv("FORMAE_TEST_TIMEOUT"); val != "" {
+		if minutes, err := strconv.Atoi(val); err == nil && minutes > 0 {
+			return time.Duration(minutes) * time.Minute
+		}
+	}
+	return 5 * time.Minute // Default timeout
+}
+
+// getCLIInvocationTimeout returns the bound for a single formae CLI
+// invocation. Every CLI call the harness makes either submits work and
+// returns or reads state, so none runs legitimately for minutes; the bound
+// exists so a CLI process that never exits surfaces as a test failure with a
+// diagnostic instead of a silent stall until the go-test deadline.
+// It reads from the FORMAE_TEST_CLI_TIMEOUT environment variable (in minutes).
+// Default is 5 minutes.
+func getCLIInvocationTimeout() time.Duration {
+	if val := os.Getenv("FORMAE_TEST_CLI_TIMEOUT"); val != "" {
+		if minutes, err := strconv.Atoi(val); err == nil && minutes > 0 {
+			return time.Duration(minutes) * time.Minute
+		}
+	}
+	return 5 * time.Minute
+}
+
+// getDiscoveryTimeout returns the timeout duration for discovery inventory polling.
+// It reads from FORMAE_TEST_DISCOVERY_TIMEOUT environment variable (in minutes).
+// Default is 2 minutes.
+func getDiscoveryTimeout() time.Duration {
+	if val := os.Getenv("FORMAE_TEST_DISCOVERY_TIMEOUT"); val != "" {
+		if minutes, err := strconv.Atoi(val); err == nil && minutes > 0 {
+			return time.Duration(minutes) * time.Minute
+		}
+	}
+	return 2 * time.Minute // Default timeout
+}
+
+// defaultSyncTimeout bounds the wait for a forced synchronization to report
+// completion.
+//
+// It has to clear the plugin-side retry budget, not just a typical sync. A
+// healthy sync settles in a few seconds, but plugins absorb recoverable
+// CloudControl errors with their own exponential backoff. The AWS plugin,
+// for instance, budgets ten attempts over a 1s..30s backoff, roughly three
+// minutes. Under the shared-account throttling the conformance matrix
+// generates, a sync that is still retrying is making progress, not hanging.
+// A shorter wait here turns that into a spurious failure on a random test
+// each run, so the default sits above the retry budget with headroom.
+const defaultSyncTimeout = 5 * time.Minute
+
+// getSyncTimeout returns the timeout duration for waiting on synchronization.
+// It reads from the FORMAE_TEST_SYNC_TIMEOUT environment variable (in minutes).
+func getSyncTimeout() time.Duration {
+	if val := os.Getenv("FORMAE_TEST_SYNC_TIMEOUT"); val != "" {
+		if minutes, err := strconv.Atoi(val); err == nil && minutes > 0 {
+			return time.Duration(minutes) * time.Minute
+		}
+	}
+	return defaultSyncTimeout
+}
+
+const (
+	// discoveryPollInterval is how often the discovery wait loop reads the local
+	// inventory while waiting for a scan to surface the resource.
+	discoveryPollInterval = 2 * time.Second
+	// discoveryRetriggerDefault is the default interval before the first
+	// discovery re-trigger; it then backs off exponentially toward the cap.
+	discoveryRetriggerDefault = 10 * time.Second
+	// discoveryRetriggerCap is the ceiling for the re-trigger interval.
+	discoveryRetriggerCap = 60 * time.Second
+	// discoveryRetriggerFloor is the minimum re-trigger interval. The conformance
+	// matrix runs ~100 jobs against one shared AWS account and CloudControl rate
+	// limiter, so the floor caps re-trigger pressure and cannot be configured away.
+	discoveryRetriggerFloor = 5 * time.Second
+)
+
+// getDiscoveryRetriggerBackoff returns the capped exponential backoff schedule
+// for re-triggering discovery in the discovery wait loop. The base interval is
+// read from FORMAE_TEST_DISCOVERY_RETRIGGER_INTERVAL (in seconds); empty,
+// non-numeric, or non-positive values fall back to the default, and the value is
+// clamped into [floor, cap] — up to the floor so the rate-limit guarantee holds,
+// and down to the cap so an oversized base interval can't push the first
+// re-trigger past the timeout and suppress retries entirely.
+func getDiscoveryRetriggerBackoff() backoffConfig {
+	initial := discoveryRetriggerDefault
+	if val := os.Getenv("FORMAE_TEST_DISCOVERY_RETRIGGER_INTERVAL"); val != "" {
+		if secs, err := strconv.Atoi(val); err == nil && secs > 0 {
+			initial = time.Duration(secs) * time.Second
+			if initial < discoveryRetriggerFloor {
+				initial = discoveryRetriggerFloor
+			}
+			if initial > discoveryRetriggerCap {
+				initial = discoveryRetriggerCap
+			}
+		}
+	}
+	return backoffConfig{initial: initial, max: discoveryRetriggerCap}
+}
+
+// getOOBDeleteTimeout returns the timeout duration for the OOB-delete phase's
+// wait-for-inventory-removal step (sync must tombstone the out-of-band
+// deletion). It reads from FORMAE_TEST_OOB_DELETE_TIMEOUT (in minutes).
+// Default is 2 minutes. Raise for slow backends (e.g. managed Kubernetes).
+func getOOBDeleteTimeout() time.Duration {
+	if val := os.Getenv("FORMAE_TEST_OOB_DELETE_TIMEOUT"); val != "" {
+		if minutes, err := strconv.Atoi(val); err == nil && minutes > 0 {
+			return time.Duration(minutes) * time.Minute
+		}
+	}
+	return 2 * time.Minute // Default timeout
+}
+
+const (
+	// oobSyncPollInterval is how often the OOB-delete wait loop re-reads the
+	// local inventory between sync re-triggers.
+	oobSyncPollInterval = 2 * time.Second
+	// oobSyncRetriggerDefault is the default interval before the first sync
+	// re-trigger in the OOB-delete wait; it then backs off toward the cap.
+	oobSyncRetriggerDefault = 10 * time.Second
+	// oobSyncRetriggerCap is the ceiling for the re-trigger interval.
+	oobSyncRetriggerCap = 30 * time.Second
+	// oobSyncRetriggerFloor is the minimum re-trigger interval. Sync walks every
+	// managed resource, and the conformance matrix runs ~150 jobs against one
+	// shared cloud account, so the floor caps re-trigger pressure and cannot be
+	// configured away.
+	oobSyncRetriggerFloor = 5 * time.Second
+)
+
+// getOOBSyncRetriggerBackoff returns the capped exponential backoff schedule for
+// re-triggering sync in the OOB-delete wait loop. The base interval is read from
+// FORMAE_TEST_OOB_SYNC_RETRIGGER_INTERVAL (in seconds); empty, non-numeric, or
+// non-positive values fall back to the default, and the value is clamped into
+// [floor, cap] - up to the floor so the rate-limit guarantee holds, and down to
+// the cap so an oversized base interval cannot push the first re-trigger past
+// the timeout and suppress retries entirely.
+func getOOBSyncRetriggerBackoff() backoffConfig {
+	initial := oobSyncRetriggerDefault
+	if val := os.Getenv("FORMAE_TEST_OOB_SYNC_RETRIGGER_INTERVAL"); val != "" {
+		if secs, err := strconv.Atoi(val); err == nil && secs > 0 {
+			initial = time.Duration(secs) * time.Second
+			if initial < oobSyncRetriggerFloor {
+				initial = oobSyncRetriggerFloor
+			}
+			if initial > oobSyncRetriggerCap {
+				initial = oobSyncRetriggerCap
+			}
+		}
+	}
+	return backoffConfig{initial: initial, max: oobSyncRetriggerCap}
+}
+
+// RunCRUDTests discovers test cases from the testdata directory and runs
+// the standard CRUD lifecycle test for each resource type.
+//
+// For each test case:
+//   - Evaluates the PKL file to get expected state
+//   - Waits for the plugin to register
+//   - Creates the resource via formae apply
+//   - Reads and verifies the resource via inventory
+//   - Extracts and verifies the resource (if extractable)
+//   - Forces synchronization to read actual state from cloud
+//   - Verifies idempotency (resource state unchanged after sync)
+//   - Updates the resource (if update file exists)
+//   - Replaces the resource (if replace file exists)
+//   - Deletes the resource via formae destroy
+//
+// Environment variables:
+//   - FORMAE_BINARY: Path to the formae binary (optional). If not set, the binary is
+//     downloaded automatically via orbital.
+//   - FORMAE_TEST_FILTER: Filter test cases by name, resource type, or file path (optional).
+//     Supports comma-separated patterns for multiple filters.
+//     Examples: "s3-bucket", "ec2-instance,vpc", "testdata/network"
+//   - FORMAE_TEST_TYPE: Select which tests to run (optional).
+//     Values: "all" (default), "crud", "discovery".
+//     When set to "discovery", CRUD tests are skipped.
+//   - FORMAE_TEST_UPDATE_MODE: Apply mode for the Update phase only (optional).
+//     Values: "patch" (default), "reconcile". Reconcile requires a complete
+//     stack declaration in the update fixture and allows collection removals.
+//     Create and Replace phases are unaffected; invalid values fail before setup.
+//   - FORMAE_TEST_TIMEOUT: Timeout in minutes for long-running operations (optional).
+//     Default is 5 minutes. Set to 15 for slow resources like Cloud SQL.
+//   - FORMAE_TEST_OOB_TIMEOUT: Timeout in minutes for a single OOB Create or
+//     Delete RPC to the plugin during the discovery test's CreateOOB phase
+//     (optional). Default is 30 minutes. Raise for resources with longer
+//     provisioning times (e.g. AWS::EKS::Cluster, managed-Kubernetes on
+//     other providers).
+//   - FORMAE_TEST_OOB_DELETE_TIMEOUT: Timeout in minutes for the OOB-delete phase's
+//     wait-for-inventory-removal step (optional). Default is 2 minutes. Raise
+//     for slow backends (e.g. managed Kubernetes).
+//   - FORMAE_TEST_TESTDATA_DIR: Override the directory containing test PKL files
+//     (optional). Absolute paths are used as-is; relative paths are resolved
+//     against the plugin directory. Defaults to "testdata". When the override
+//     points at a subdirectory without its own PklProject, the nearest ancestor
+//     containing one is used for `pkl project resolve`.
+//
+// This function should be called from a plugin's conformance_test.go:
+//
+//	func TestPluginConformance(t *testing.T) {
+//	    conformance.RunCRUDTests(t)
+//	}
+func RunCRUDTests(t *testing.T) {
+	// Skip if test type is discovery-only
+	if getTestType() == TestTypeDiscovery {
+		t.Skip("Skipping CRUD tests: FORMAE_TEST_TYPE=discovery")
+	}
+
+	// Validate before discovering fixtures or starting any cloud-backed work.
+	if _, err := getUpdateMode(); err != nil {
+		t.Fatal(err)
+	}
+
+	// Find plugin directory (where the test is running from)
+	pluginDir, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("failed to get working directory: %v", err)
+	}
+
+	// Discover test cases from testdata directory
+	testCases, err := DiscoverTestData(pluginDir)
+	if err != nil {
+		t.Fatalf("failed to discover test cases: %v", err)
+	}
+
+	// Apply filter if FORMAE_TEST_FILTER is set
+	testCases = filterTestCases(t, testCases)
+
+	rc := NewResultCollector()
+	t.Cleanup(func() { rc.PrintSummary() })
+
+	// The omit-and-observe sweep rides along on the CRUD run when an artifact
+	// path is configured; otherwise it is nil and inert.
+	sweep := newSweepFromEnv()
+	t.Cleanup(func() {
+		path := os.Getenv(envProviderDefaultObservations)
+		if sweep == nil || path == "" {
+			return
+		}
+		if err := sweep.writeTo(path); err != nil {
+			t.Errorf("writing provider-default observations to %s: %v", path, err)
+			return
+		}
+		t.Logf("Wrote %d provider-default observations to %s", len(sweep.observations()), path)
+	})
+
+	t.Logf("Discovered %d test case(s)", len(testCases))
+
+	for _, tc := range testCases {
+		t.Run(tc.Name, func(t *testing.T) {
+			runCRUDTest(t, tc, rc, sweep)
+		})
+	}
+}
+
+// findTargetResource finds the resource matching the test case's ResourceType from a list of resources.
+// Returns the matching resource, or falls back to the last resource if no match found (dependencies are listed first).
+func findTargetResource(resources []map[string]any, resourceType string) map[string]any {
+	targetTypeNorm := strings.ToLower(strings.ReplaceAll(resourceType, "-", ""))
+	for _, res := range resources {
+		if resType, ok := res["Type"].(string); ok {
+			// Normalize the type (e.g., "Provider::Service::ResourceName" -> "resourcename")
+			typeParts := strings.Split(resType, "::")
+			typeName := strings.ToLower(typeParts[len(typeParts)-1])
+			if typeName == targetTypeNorm {
+				return res
+			}
+		}
+	}
+	// Fallback to last resource if no match found
+	return resources[len(resources)-1]
+}
+
+// isResolvable checks if a value is a resolvable reference ($res: true)
+func isResolvable(value any) bool {
+	m, ok := value.(map[string]any)
+	if !ok {
+		return false
+	}
+	res, exists := m["$res"]
+	if !exists {
+		return false
+	}
+	resBool, ok := res.(bool)
+	return ok && resBool
+}
+
+// isEmbed reports whether value is a {$embed: true, $template: "..."} field
+// (an embedded resolvable inside a String-typed field).
+func isEmbed(value any) bool {
+	m, ok := value.(map[string]any)
+	if !ok {
+		return false
+	}
+	embed, ok := m["$embed"].(bool)
+	return ok && embed
+}
+
+// isOpaqueValue reports whether value is a serialized opaque secret value, i.e.
+// a model.Value with $visibility == "Opaque" (or the $hashed marker set). Secret
+// fields (schema FieldHint.Opaque) are hashed at rest, so the value read back
+// from inventory or emitted by `formae extract` is not the authored plaintext
+// but an opaque envelope: {"$visibility":"Opaque","$hashed":true,"$value":<sha256>}.
+func isOpaqueValue(value any) bool {
+	m, ok := value.(map[string]any)
+	if !ok {
+		return false
+	}
+	if vis, ok := m["$visibility"].(string); ok && vis == pkgmodel.VisibilityOpaque {
+		return true
+	}
+	hashed, ok := m["$hashed"].(bool)
+	return ok && hashed
+}
+
+// containsOpaqueValue reports whether an opaque secret envelope appears anywhere
+// in value, walking nested maps and arrays.
+func containsOpaqueValue(value any) bool {
+	if isOpaqueValue(value) {
+		return true
+	}
+	switch v := value.(type) {
+	case map[string]any:
+		for _, elem := range v {
+			if containsOpaqueValue(elem) {
+				return true
+			}
+		}
+	case []any:
+		for _, elem := range v {
+			if containsOpaqueValue(elem) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// compareOpaqueValue validates an actual opaque secret value against the authored
+// expected value. Because formae hashes secret values at rest (unsalted SHA-256)
+// and cannot recover the plaintext, we never compare plaintext directly. Instead:
+//   - when the actual value carries the $hashed digest, assert it equals
+//     ComputeValueHash(expected) — a real integrity check that the plugin stored
+//     the authored secret, not a blind skip;
+//   - when $value is absent (e.g. after extraction, where the digest may be
+//     omitted), accept the opaque envelope as-is, mirroring compareResolvable.
+//
+// The expected value is normally the authored plaintext scalar, but may itself
+// already be an opaque envelope (if the fixture authored a model.Value); both are
+// handled. Neither plaintext nor digest is ever echoed into error text.
+func compareOpaqueValue(r testReporter, name string, expected, actual any, context string) bool {
+	actualMap, ok := actual.(map[string]any)
+	if !ok {
+		// Should not happen — callers gate on isOpaqueValue(actual).
+		return true
+	}
+
+	digest, hasDigest := actualMap["$value"].(string)
+	hashed, _ := actualMap["$hashed"].(bool)
+	if !hasDigest || digest == "" || !hashed {
+		// No digest to verify (e.g. omitted on extract). The envelope is opaque
+		// by construction; accept it rather than leaking anything by comparing.
+		r.Logf("Opaque value %s present without a verifiable digest (%s); accepting", name, context)
+		return true
+	}
+
+	// Derive the expected plaintext. If the fixture authored an opaque envelope,
+	// prefer its plaintext $value; otherwise use the scalar as authored.
+	expectedPlaintext := fmt.Sprintf("%v", expected)
+	if expMap, ok := expected.(map[string]any); ok {
+		if ev, ok := expMap["$value"]; ok {
+			expectedPlaintext = fmt.Sprintf("%v", ev)
+		}
+	}
+
+	if pkgmodel.ComputeValueHash(expectedPlaintext) != digest {
+		r.Errorf("Opaque value %s digest does not match the authored secret (%s)", name, context)
+		return false
+	}
+	r.Logf("Opaque value %s verified against authored secret via SHA-256 digest (%s)", name, context)
+	return true
+}
+
+// normalizeEmbedTemplate canonicalizes a $embed $template for comparison: each
+// framed span's envelope is stripped of $value/$visibility/$strategy and
+// re-encoded with sorted keys. An authored template (pre-resolution, no $value,
+// PKL insertion-order keys) and a stored template (resolved $value, Go
+// sorted-key) then compare equal when they reference the same resolvable.
+// Literal segments are preserved verbatim. Mirrors normalizeResolvables.
+func normalizeEmbedTemplate(tmpl string) string {
+	spans, err := pkgmodel.ScanEmbedSpans(tmpl)
+	if err != nil {
+		return tmpl
+	}
+	out := tmpl
+	for i := len(spans) - 1; i >= 0; i-- {
+		var env map[string]any
+		if err := json.Unmarshal([]byte(spans[i].EnvelopeJSON), &env); err != nil {
+			continue
+		}
+		delete(env, "$value")
+		delete(env, "$visibility")
+		delete(env, "$strategy")
+		canonical, err := json.Marshal(env) // map keys marshal in sorted order
+		if err != nil {
+			continue
+		}
+		out = out[:spans[i].Start] + pkgmodel.FrameEnvelope(string(canonical)) + out[spans[i].End:]
+	}
+	return out
+}
+
+// compareEmbed compares two $embed fields by normalizing their $template spans.
+func compareEmbed(r testReporter, name string, expected, actual any) bool {
+	expMap, ok1 := expected.(map[string]any)
+	actMap, ok2 := actual.(map[string]any)
+	if !ok1 || !ok2 {
+		r.Errorf("Embed field %s: expected and actual must both be $embed objects", name)
+		return false
+	}
+	expTmpl, _ := expMap["$template"].(string)
+	actTmpl, _ := actMap["$template"].(string)
+	if normalizeEmbedTemplate(expTmpl) != normalizeEmbedTemplate(actTmpl) {
+		r.Errorf("Embed field %s.$template should match expected (normalized): expected %q, got %q",
+			name, expTmpl, actTmpl)
+		return false
+	}
+	return true
+}
+
+// normalizeEscaping removes common backslash escape sequences from a string
+// to allow comparison of values that may have been escaped differently during
+// JSON/PKL round-trips (e.g. `"` vs `\"`).
+func normalizeEscaping(s string) string {
+	r := strings.NewReplacer(`\"`, `"`, `\\`, `\`)
+	return r.Replace(s)
+}
+
+// compareResolvable validates that an actual resolvable has a resolved $value
+// and that its metadata fields match the expected resolvable.
+// If the actual value is not a resolvable (e.g. after extraction, where
+// resolvables are resolved to plain values), the comparison is skipped.
+func compareResolvable(r testReporter, name string, expected, actual any, context string) bool {
+	if !isResolvable(actual) {
+		r.Logf("Skipping resolvable comparison for %s: actual is a resolved value (%s)", name, context)
+		return true
+	}
+
+	expectedMap := expected.(map[string]any)
+	actualMap := actual.(map[string]any)
+
+	resolvedValue, hasValue := actualMap["$value"]
+	if !hasValue || resolvedValue == "" {
+		// $value may be absent after extraction — the resolvable reference is
+		// preserved but the resolved value is not included. This is expected.
+		r.Logf("Resolvable %s has no resolved $value yet (%s)", name, context)
+	} else {
+		r.Logf("Resolvable %s resolved to: %v", name, resolvedValue)
+	}
+
+	ok := true
+	for _, field := range []string{"$label", "$type", "$stack", "$property"} {
+		expectedFieldValue, expectedHasField := expectedMap[field]
+		actualFieldValue, actualHasField := actualMap[field]
+		if expectedHasField && actualHasField && expectedFieldValue != actualFieldValue {
+			r.Errorf("Resolvable %s field %s mismatch: expected %v, got %v (%s)",
+				name, field, expectedFieldValue, actualFieldValue, context)
+			ok = false
+		}
+	}
+	return ok
+}
+
+// resolvableMetadataKey returns a string key from a resolvable's metadata fields
+// for use in matching expected resolvables to actual ones in arrays.
+func resolvableMetadataKey(v any) string {
+	m := v.(map[string]any)
+	label, _ := m["$label"].(string)
+	typ, _ := m["$type"].(string)
+	stack, _ := m["$stack"].(string)
+	prop, _ := m["$property"].(string)
+	return label + "|" + typ + "|" + stack + "|" + prop
+}
+
+// normalizeResolvables strips $visibility and $value from resolvable refs
+// so that expected (with $visibility) and actual (with $value) produce
+// identical JSON for comparison. The stable metadata fields ($res, $label,
+// $type, $stack, $property) are preserved.
+func normalizeResolvables(v any) any {
+	switch val := v.(type) {
+	case map[string]any:
+		if isResolvable(val) {
+			norm := make(map[string]any)
+			for k, v := range val {
+				if k == "$visibility" || k == "$value" {
+					continue
+				}
+				norm[k] = v
+			}
+			return norm
+		}
+		norm := make(map[string]any)
+		for k, v := range val {
+			norm[k] = normalizeResolvables(v)
+		}
+		return norm
+	case []any:
+		norm := make([]any, len(val))
+		for i, v := range val {
+			norm[i] = normalizeResolvables(v)
+		}
+		return norm
+	default:
+		return v
+	}
+}
+
+// extractProviderDefaultPaths extracts field paths with HasProviderDefault=true
+// from the Schema Hints on a resource.
+//
+// providerDefault holds metadata about a provider-default field path,
+// including whether it's a collection (Mapping) that should use prefix matching.
+type providerDefault struct {
+	// IsCollection indicates this is a Mapping field where the provider may
+	// add extra keys. When true, prefix matching is used — any child path
+	// under this field is tolerated.
+	IsCollection bool
+}
+
+func extractProviderDefaultPaths(resource map[string]any) map[string]providerDefault {
+	result := make(map[string]providerDefault)
+	schema, ok := resource["Schema"].(map[string]any)
+	if !ok {
+		return result
+	}
+	hints, ok := schema["Hints"].(map[string]any)
+	if !ok {
+		return result
+	}
+	for path, hint := range hints {
+		hintMap, ok := hint.(map[string]any)
+		if !ok {
+			continue
+		}
+		if hpd, ok := hintMap["HasProviderDefault"].(bool); ok && hpd {
+			result[path] = providerDefault{}
+		}
+	}
+
+	// Detect collection (Mapping) fields from the schema structure.
+	// A field with hasProviderDefault that has no child fields in the schema
+	// is a leaf field — likely a Mapping where the provider may add extra keys.
+	fields, _ := schema["Fields"].([]any)
+	fieldSet := make(map[string]bool, len(fields))
+	for _, f := range fields {
+		if s, ok := f.(string); ok {
+			fieldSet[s] = true
+		}
+	}
+	for path, pd := range result {
+		if pd.IsCollection {
+			continue
+		}
+		hasChildren := false
+		prefix := path + "."
+		for field := range fieldSet {
+			if strings.HasPrefix(field, prefix) {
+				hasChildren = true
+				break
+			}
+		}
+		if !hasChildren {
+			pd.IsCollection = true
+			result[path] = pd
+		}
+	}
+
+	return result
+}
+
+// isProviderDefault checks if a given field path (dot-separated) matches
+// a provider default path. Handles:
+//   - Exact match for scalar fields
+//   - Prefix match for collection (Mapping) fields — any child path is tolerated
+//   - Array index stripping — e.g. "spec.ports[0].protocol" → "spec.ports.protocol"
+func isProviderDefault(fieldPath string, providerDefaults map[string]providerDefault) bool {
+	// Exact match (scalar provider default)
+	if _, ok := providerDefaults[fieldPath]; ok {
+		return true
+	}
+
+	// Prefix match for collection (Mapping) provider defaults
+	for path, pd := range providerDefaults {
+		if pd.IsCollection && strings.HasPrefix(fieldPath, path+".") {
+			return true
+		}
+	}
+
+	// Strip array index segments: spec.ports[0].protocol → spec.ports.protocol
+	cleaned := fieldPath
+	for {
+		start := strings.Index(cleaned, "[")
+		if start == -1 {
+			break
+		}
+		end := strings.Index(cleaned[start:], "]")
+		if end == -1 {
+			break
+		}
+		cleaned = cleaned[:start] + cleaned[start+end+1:]
+	}
+	if cleaned != fieldPath {
+		return isProviderDefault(cleaned, providerDefaults)
+	}
+
+	return false
+}
+
+// compareArrayUnordered compares two arrays ignoring element order.
+// If the array contains resolvable elements, it uses element-wise matching
+// that validates resolvable metadata and $value. Otherwise, elements are
+// serialized to JSON for canonical comparison. Nested resolvables inside
+// map elements are normalized before comparison so that $visibility vs
+// $value differences don't cause false mismatches.
+func compareArrayUnordered(r testReporter, key string, expected, actual any, context string, providerDefaults map[string]providerDefault) bool {
+	expectedArr, ok := expected.([]any)
+	if !ok {
+		r.Errorf("Expected %s is not an array (%s)", key, context)
+		return false
+	}
+	actualArr, ok := actual.([]any)
+	if !ok {
+		r.Errorf("Actual %s is not an array (%s)", key, context)
+		return false
+	}
+
+	if len(expectedArr) != len(actualArr) {
+		// If expected is empty and the field has a provider default, the PKL
+		// rendered a null Listing as [] but the provider filled in a default
+		// value. Accept the provider's value.
+		if len(expectedArr) == 0 && isProviderDefault(key, providerDefaults) {
+			return true
+		}
+		r.Errorf("Array %s length mismatch: expected %d, got %d (%s)", key, len(expectedArr), len(actualArr), context)
+		return false
+	}
+
+	// Check if any expected element is a resolvable
+	hasResolvables := false
+	for _, v := range expectedArr {
+		if isResolvable(v) {
+			hasResolvables = true
+			break
+		}
+	}
+
+	// If array contains resolvables, use element-wise matching
+	if hasResolvables {
+		return compareArrayWithResolvables(r, key, expectedArr, actualArr, context, providerDefaults)
+	}
+
+	// If elements are maps, use schema-aware matching that allows extra
+	// fields only when they are marked hasProviderDefault in the schema.
+	if len(expectedArr) > 0 {
+		if _, isMap := expectedArr[0].(map[string]any); isMap {
+			return compareArrayOfMaps(r, key, expectedArr, actualArr, context, providerDefaults)
+		}
+	}
+
+	// Serialize to JSON, sort, and compare. Normalize resolvables so that
+	// $visibility (expected) and $value (actual) are stripped before comparison.
+	serialize := func(v any) string {
+		b, _ := json.Marshal(normalizeResolvables(v))
+		return string(b)
+	}
+
+	expectedSorted := make([]string, len(expectedArr))
+	for i, v := range expectedArr {
+		expectedSorted[i] = serialize(v)
+	}
+	sort.Strings(expectedSorted)
+
+	actualSorted := make([]string, len(actualArr))
+	for i, v := range actualArr {
+		actualSorted[i] = serialize(v)
+	}
+	sort.Strings(actualSorted)
+
+	for i := range expectedSorted {
+		if expectedSorted[i] != actualSorted[i] {
+			r.Errorf("Array %s mismatch at sorted index %d (%s): expected %s, got %s",
+				key, i, context, expectedSorted[i], actualSorted[i])
+			return false
+		}
+	}
+
+	return true
+}
+
+// compareArrayOfMaps compares arrays of map elements using schema-aware matching.
+// For each expected map element, it finds a matching actual map element where
+// all expected keys match (subset matching for finding pairs). Then it runs
+// bidirectional compareMap which flags extra actual keys unless they are
+// hasProviderDefault in the schema.
+func compareArrayOfMaps(r testReporter, key string, expectedArr, actualArr []any, context string, providerDefaults map[string]providerDefault) bool {
+	ok := true
+	matched := make([]bool, len(actualArr))
+
+	for i, expectedVal := range expectedArr {
+		expectedMap, isMap := expectedVal.(map[string]any)
+		if !isMap {
+			// Non-map element — serialize and compare exactly
+			expectedJSON, _ := json.Marshal(normalizeResolvables(expectedVal))
+			found := false
+			for j, actualVal := range actualArr {
+				if matched[j] {
+					continue
+				}
+				actualJSON, _ := json.Marshal(normalizeResolvables(actualVal))
+				if string(expectedJSON) == string(actualJSON) {
+					matched[j] = true
+					found = true
+					break
+				}
+			}
+			if !found {
+				r.Errorf("Array %s[%d] has no match in actual (%s): %s", key, i, context, string(expectedJSON))
+				ok = false
+			}
+			continue
+		}
+
+		// Find matching actual element using subset comparison
+		matchIdx := -1
+		for j, actualVal := range actualArr {
+			if matched[j] {
+				continue
+			}
+			actualMap, isActualMap := actualVal.(map[string]any)
+			if !isActualMap {
+				continue
+			}
+			if mapSubsetMatch(expectedMap, actualMap) {
+				matchIdx = j
+				break
+			}
+		}
+
+		if matchIdx >= 0 {
+			matched[matchIdx] = true
+			// Run compareMap for detailed error reporting (now bidirectional)
+			actualMap := actualArr[matchIdx].(map[string]any)
+			if !compareMap(r, fmt.Sprintf("%s[%d]", key, i), expectedMap, actualMap, context, providerDefaults) {
+				ok = false
+			}
+		} else {
+			expectedJSON, _ := json.Marshal(expectedMap)
+			r.Errorf("Array %s[%d] has no matching element in actual (%s): %s", key, i, context, string(expectedJSON))
+			ok = false
+		}
+	}
+
+	return ok
+}
+
+// mapSubsetMatch checks if all keys in expected exist in actual with matching
+// values. This is a non-reporting version of compareMap for use in matching.
+// Resolvables are normalized before comparison.
+func mapSubsetMatch(expected, actual map[string]any) bool {
+	for key, expectedValue := range expected {
+		actualValue, exists := actual[key]
+		if !exists {
+			// Skip expected keys with null or empty collection values —
+			// these are PKL rendering artifacts, not real field requirements
+			if expectedValue == nil {
+				continue
+			}
+			if arr, ok := expectedValue.([]any); ok && len(arr) == 0 {
+				continue
+			}
+			if m, ok := expectedValue.(map[string]any); ok && len(m) == 0 {
+				continue
+			}
+			return false
+		}
+		expectedValue = normalizeResolvables(expectedValue)
+		actualValue = normalizeResolvables(actualValue)
+
+		switch ev := expectedValue.(type) {
+		case map[string]any:
+			av, ok := actualValue.(map[string]any)
+			if !ok {
+				return false
+			}
+			if !mapSubsetMatch(ev, av) {
+				return false
+			}
+		case []any:
+			av, ok := actualValue.([]any)
+			if !ok {
+				return false
+			}
+			if !arraySubsetMatch(ev, av) {
+				return false
+			}
+		default:
+			eStr := fmt.Sprintf("%v", expectedValue)
+			aStr := fmt.Sprintf("%v", actualValue)
+			if eStr != aStr && normalizeEscaping(eStr) != normalizeEscaping(aStr) {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+// arraySubsetMatch checks if two arrays match, using subset matching for map
+// elements and exact comparison for scalars.
+func arraySubsetMatch(expected, actual []any) bool {
+	if len(expected) != len(actual) {
+		return false
+	}
+	// If elements are maps, use subset matching
+	if len(expected) > 0 {
+		if _, isMap := expected[0].(map[string]any); isMap {
+			matched := make([]bool, len(actual))
+			for _, ev := range expected {
+				eMap, ok := ev.(map[string]any)
+				if !ok {
+					return false
+				}
+				found := false
+				for j, av := range actual {
+					if matched[j] {
+						continue
+					}
+					aMap, ok := av.(map[string]any)
+					if !ok {
+						continue
+					}
+					if mapSubsetMatch(eMap, aMap) {
+						matched[j] = true
+						found = true
+						break
+					}
+				}
+				if !found {
+					return false
+				}
+			}
+			return true
+		}
+	}
+	// For non-map elements, serialize and compare sorted
+	serialize := func(v any) string {
+		b, _ := json.Marshal(normalizeResolvables(v))
+		return string(b)
+	}
+	eSorted := make([]string, len(expected))
+	for i, v := range expected {
+		eSorted[i] = serialize(v)
+	}
+	sort.Strings(eSorted)
+	aSorted := make([]string, len(actual))
+	for i, v := range actual {
+		aSorted[i] = serialize(v)
+	}
+	sort.Strings(aSorted)
+	for i := range eSorted {
+		if eSorted[i] != aSorted[i] {
+			return false
+		}
+	}
+	return true
+}
+
+// compareArrayWithResolvables compares arrays element-wise, handling resolvable
+// elements by matching on metadata and validating $value, and non-resolvable
+// elements by JSON equality.
+func compareArrayWithResolvables(r testReporter, key string, expectedArr, actualArr []any, context string, providerDefaults map[string]providerDefault) bool {
+	ok := true
+	matched := make([]bool, len(actualArr))
+
+	serialize := func(v any) string {
+		b, _ := json.Marshal(normalizeResolvables(v))
+		return string(b)
+	}
+
+	// Check if actual array has any resolvables (it won't after extraction)
+	actualHasResolvables := false
+	for _, v := range actualArr {
+		if isResolvable(v) {
+			actualHasResolvables = true
+			break
+		}
+	}
+
+	for i, exp := range expectedArr {
+		elemName := fmt.Sprintf("%s[%d]", key, i)
+		found := false
+
+		if isResolvable(exp) {
+			if !actualHasResolvables {
+				// After extraction, resolvables become plain values — skip comparison
+				r.Logf("Skipping resolvable comparison for %s: actual array has resolved values (%s)", elemName, context)
+				found = true
+			} else {
+				expKey := resolvableMetadataKey(exp)
+				for j, act := range actualArr {
+					if matched[j] || !isResolvable(act) {
+						continue
+					}
+					if resolvableMetadataKey(act) == expKey {
+						if !compareResolvable(r, elemName, exp, act, context) {
+							ok = false
+						}
+						matched[j] = true
+						found = true
+						break
+					}
+				}
+			}
+		} else if expMap, isMap := exp.(map[string]any); isMap {
+			// Non-resolvable map element — use subset matching
+			for j, act := range actualArr {
+				if matched[j] {
+					continue
+				}
+				if actMap, isActMap := act.(map[string]any); isActMap {
+					if mapSubsetMatch(expMap, actMap) {
+						matched[j] = true
+						found = true
+						break
+					}
+				}
+			}
+		} else {
+			expJSON := serialize(exp)
+			for j, act := range actualArr {
+				if matched[j] {
+					continue
+				}
+				if serialize(act) == expJSON {
+					matched[j] = true
+					found = true
+					break
+				}
+			}
+		}
+
+		if !found {
+			r.Errorf("Array %s: no match found for expected element %d (%s): %s",
+				key, i, context, serialize(exp))
+			ok = false
+		}
+	}
+
+	return ok
+}
+
+// compareMap recursively compares two maps, handling nested Resolvables,
+// arrays, and sub-maps. Performs bidirectional comparison:
+// 1. expected→actual: all expected keys must exist and match in actual
+// 2. actual→expected: extra keys in actual must be hasProviderDefault in schema
+func compareMap(r testReporter, name string, expected, actual map[string]any, context string, providerDefaults map[string]providerDefault) bool {
+	ok := true
+	// Forward: expected → actual
+	for key, expectedValue := range expected {
+		actualValue, exists := actual[key]
+		if !exists {
+			// Nullable fields rendered as null or empty arrays by PKL may be
+			// legitimately absent from the provider response.
+			if expectedValue == nil {
+				continue
+			}
+			if arr, isArr := expectedValue.([]any); isArr && len(arr) == 0 {
+				continue
+			}
+			if m, isMap := expectedValue.(map[string]any); isMap && len(m) == 0 {
+				continue
+			}
+			r.Errorf("Property %s.%s should exist (%s)", name, key, context)
+			ok = false
+			continue
+		}
+		if isEmbed(expectedValue) {
+			if !compareEmbed(r, name+"."+key, expectedValue, actualValue) {
+				ok = false
+			}
+			continue
+		}
+		if isResolvable(expectedValue) {
+			if !compareResolvable(r, name+"."+key, expectedValue, actualValue, context) {
+				ok = false
+			}
+			continue
+		}
+		// Opaque secret fields are hashed at rest, so the actual value is an
+		// opaque envelope rather than the authored plaintext. Verify by digest
+		// instead of a plaintext scalar comparison.
+		if isOpaqueValue(actualValue) || isOpaqueValue(expectedValue) {
+			if !compareOpaqueValue(r, name+"."+key, expectedValue, actualValue, context) {
+				ok = false
+			}
+			continue
+		}
+		if expectedArr, isArray := expectedValue.([]any); isArray {
+			if !compareArrayUnordered(r, name+"."+key, expectedArr, actualValue, context, providerDefaults) {
+				ok = false
+			}
+			continue
+		}
+		if expectedMap, isMap := expectedValue.(map[string]any); isMap {
+			if actualMap, isActualMap := actualValue.(map[string]any); isActualMap {
+				if !compareMap(r, name+"."+key, expectedMap, actualMap, context, providerDefaults) {
+					ok = false
+				}
+				continue
+			}
+		}
+		// Scalar comparison
+		expectedStr := fmt.Sprintf("%v", expectedValue)
+		actualStr := fmt.Sprintf("%v", actualValue)
+		if expectedStr != actualStr {
+			if normalizeEscaping(expectedStr) != normalizeEscaping(actualStr) {
+				r.Errorf("Property %s.%s should match expected value (%s): expected %v, got %v",
+					name, key, context, expectedValue, actualValue)
+				ok = false
+			}
+		}
+	}
+	// Reverse: actual → expected — flag extra keys not in hasProviderDefault.
+	// Mirror the forward loop's "skip if structurally absent" forgiveness:
+	// nil / empty array / empty map values are semantically equivalent to
+	// the key being omitted (cloud providers commonly return [] / {} for
+	// fields the user didn't set, which shouldn't trigger drift detection).
+	// Real drift — non-empty unexpected values — is still flagged.
+	for key, actualValue := range actual {
+		if _, inExpected := expected[key]; inExpected {
+			continue
+		}
+		if actualValue == nil {
+			continue
+		}
+		if arr, isArr := actualValue.([]any); isArr && len(arr) == 0 {
+			continue
+		}
+		if m, isMap := actualValue.(map[string]any); isMap && len(m) == 0 {
+			continue
+		}
+		fieldPath := name + "." + key
+		if !isProviderDefault(fieldPath, providerDefaults) {
+			r.Errorf("Property %s.%s is not expected and not a provider default (%s)", name, key, context)
+			ok = false
+		}
+	}
+	return ok
+}
+
+// compareProperties compares expected properties against actual properties from inventory.
+// Uses schema hints to allow extra fields marked hasProviderDefault while flagging
+// any other unexpected fields in the actual response.
+func compareProperties(r testReporter, expectedProperties map[string]any, actualResource map[string]any, context string, providerDefaults map[string]providerDefault) bool {
+	hasErrors := false
+
+	actualProperties, ok := actualResource["Properties"].(map[string]any)
+	if !ok {
+		r.Errorf("Could not extract Properties from inventory resource (%s)", context)
+		return false
+	}
+
+	r.Logf("Comparing expected properties with actual properties (%s)...", context)
+	// Forward: expected → actual
+	for key, expectedValue := range expectedProperties {
+		actualValue, exists := actualProperties[key]
+		if !exists {
+			// Nullable fields that the user didn't set may render as null, empty
+			// arrays, or empty maps in PKL output. Cloud providers legitimately
+			// omit these from their response.
+			if expectedValue == nil {
+				continue
+			}
+			if arr, ok := expectedValue.([]any); ok && len(arr) == 0 {
+				continue
+			}
+			if m, ok := expectedValue.(map[string]any); ok && len(m) == 0 {
+				continue
+			}
+			r.Errorf("Property %s should exist in actual resource (%s)", key, context)
+			hasErrors = true
+			continue
+		}
+
+		// Validate embedded-resolvable fields ($embed) by normalizing their
+		// $template spans — the stored form carries the resolved $value and
+		// sorted keys, the authored form does not.
+		if isEmbed(expectedValue) {
+			r.Logf("Validating embedded-resolvable property %s (resolved at runtime)", key)
+			if !compareEmbed(r, key, expectedValue, actualValue) {
+				hasErrors = true
+			}
+			continue
+		}
+
+		// Validate resolvable properties - they should be resolved at apply time
+		if isResolvable(expectedValue) {
+			r.Logf("Validating resolvable property %s (resolved at runtime)", key)
+			if !compareResolvable(r, key, expectedValue, actualValue, context) {
+				hasErrors = true
+			}
+			continue
+		}
+
+		// Validate opaque secret properties by digest — they are hashed at rest,
+		// so the actual value is an opaque envelope, not the authored plaintext.
+		if isOpaqueValue(actualValue) || isOpaqueValue(expectedValue) {
+			r.Logf("Validating opaque secret property %s (hashed at rest)", key)
+			if !compareOpaqueValue(r, key, expectedValue, actualValue, context) {
+				hasErrors = true
+			}
+			continue
+		}
+
+		// Skip comparison for empty provider-default arrays
+		if arr, isArray := expectedValue.([]any); isArray && len(arr) == 0 && isProviderDefault(key, providerDefaults) {
+			continue
+		}
+
+		// Use order-independent comparison for all arrays
+		if _, isArray := expectedValue.([]any); isArray {
+			if !compareArrayUnordered(r, key, expectedValue, actualValue, context, providerDefaults) {
+				hasErrors = true
+			}
+		} else if expectedMap, isMap := expectedValue.(map[string]any); isMap {
+			if actualMap, isActualMap := actualValue.(map[string]any); isActualMap {
+				if !compareMap(r, key, expectedMap, actualMap, context, providerDefaults) {
+					hasErrors = true
+				}
+			} else {
+				r.Errorf("Property %s should be a map (%s): expected map, got %T", key, context, actualValue)
+				hasErrors = true
+			}
+		} else {
+			expectedStr := fmt.Sprintf("%v", expectedValue)
+			actualStr := fmt.Sprintf("%v", actualValue)
+			if expectedStr != actualStr {
+				// Normalize escaped strings before failing — extraction round-trips
+				// can introduce or remove backslash escaping (e.g. " vs \")
+				if normalizeEscaping(expectedStr) != normalizeEscaping(actualStr) {
+					r.Errorf("Property %s should match expected value (%s): expected %v, got %v",
+						key, context, expectedValue, actualValue)
+					hasErrors = true
+				}
+			}
+		}
+	}
+
+	// Reverse: actual → expected — flag extra keys not in hasProviderDefault.
+	// Skip when the actual value is structurally absent (nil / empty array
+	// / empty map) — cloud providers commonly return [] / {} for fields
+	// the user didn't set, and that's semantically equivalent to the key
+	// being omitted. Real drift (non-empty unexpected values) still flagged.
+	for key, actualValue := range actualProperties {
+		if _, inExpected := expectedProperties[key]; inExpected {
+			continue
+		}
+		if actualValue == nil {
+			continue
+		}
+		if arr, isArr := actualValue.([]any); isArr && len(arr) == 0 {
+			continue
+		}
+		if m, isMap := actualValue.(map[string]any); isMap && len(m) == 0 {
+			continue
+		}
+		if !isProviderDefault(key, providerDefaults) {
+			r.Errorf("Property %s is not expected and not a provider default (%s)", key, context)
+			hasErrors = true
+		}
+	}
+
+	if !hasErrors {
+		r.Logf("All expected properties matched (%s)!", context)
+	}
+	return !hasErrors
+}
+
+// reapplyHarness is the subset of TestHarness the extract re-apply sub-step drives.
+// Narrowing it keeps the sub-step unit-testable with a fake, mirroring the
+// testReporter seam used by the comparison helpers.
+type reapplyHarness interface {
+	SimulateApply(pklFile string, mode string) (*model.Simulation, error)
+}
+
+// verifyExtractReapply simulates a patch-mode apply of the forma that
+// `formae extract` just produced and asserts the agent plans no changes. A
+// faithful extract describes state that already exists, so the simulation must
+// come back empty; a lossy one diffs, and the planned operations name exactly
+// what the re-apply would touch. Simulating rather than applying asserts the
+// round-trip property directly, keeps the resource pristine for the phases
+// that follow, and avoids waiting on a command the agent never stores for
+// zero-change applies.
+//
+// Reporting is non-fatal so the lifecycle still reaches Destroy. Returns
+// whether the round trip passed.
+func (rc *ResultCollector) verifyExtractReapply(
+	t *testing.T,
+	idx int,
+	harness reapplyHarness,
+	extractFile string,
+	extractedResource map[string]any,
+	createdResource map[string]any,
+) bool {
+	// Secret fields are hashed at rest, so extract emits an opaque envelope rather
+	// than the authored plaintext. Re-applying that would either be refused as a
+	// hashed value or write a digest to the provider; neither is a plugin defect.
+	// Opacity is read off what formae produced, never off the authored fixture,
+	// which normally holds plaintext.
+	if containsOpaqueValue(extractedResource["Properties"]) || containsOpaqueValue(createdResource["Properties"]) {
+		t.Logf("Skipping extract re-apply: resource carries an opaque secret value, which extract cannot round-trip")
+		return true
+	}
+
+	t.Log("Simulating a patch-mode apply of the extracted forma...")
+	simulation, err := harness.SimulateApply(extractFile, "patch")
+	if err != nil {
+		rc.CRUDErrorf(t, idx, PhaseExtract, "Simulated re-apply of extracted forma failed: %v", err)
+		return false
+	}
+	if simulation == nil {
+		rc.CRUDErrorf(t, idx, PhaseExtract, "Simulated re-apply of extracted forma should return a simulation")
+		return false
+	}
+	if simulation.ChangesRequired {
+		rc.CRUDErrorf(t, idx, PhaseExtract,
+			"Re-applying the extracted forma should be a zero-operation apply, but the agent plans changes: %s",
+			describePlannedChanges(&simulation.Command))
+		return false
+	}
+
+	t.Log("Extract re-apply simulation confirmed a zero-operation apply!")
+	return true
+}
+
+// describePlannedChanges renders the operations a simulation would perform, so
+// a failed round trip names exactly what the re-apply would touch.
+//
+// Only fields present in the released pkg/api/model module may be used here:
+// plugin repos build this SDK as a dependency, where the local replace on
+// ../api/model does not apply. Command.StackUpdates, for instance, is not in
+// the released module; a stack-only plan still fails the round trip through
+// ChangesRequired and falls back to the no-operations text below.
+func describePlannedChanges(cmd *model.Command) string {
+	var ops []string
+	for _, ru := range cmd.ResourceUpdates {
+		op := fmt.Sprintf("%s %s (%s)", ru.Operation, ru.ResourceLabel, ru.ResourceType)
+		// The patch document names the exact properties that diff, which is
+		// the difference between "some property is lossy" and a fixable report.
+		if len(ru.PatchDocument) > 0 {
+			op += " patch: " + string(ru.PatchDocument)
+		}
+		ops = append(ops, op)
+	}
+	for _, tu := range cmd.TargetUpdates {
+		ops = append(ops, fmt.Sprintf("%s target %s", tu.Operation, tu.TargetLabel))
+	}
+	if len(ops) == 0 {
+		return "(the simulation reported changes but listed no operations)"
+	}
+	return strings.Join(ops, "; ")
+}
+
+// runCRUDTest runs the full CRUD lifecycle for a single test case.
+// This matches the structure of formae-internal's runLifecycleTest exactly.
+//
+// Error reporting uses two paths:
+//   - Non-comparison errors (eval, apply, poll, etc.) use rc.CRUDFatalf/CRUDErrorf directly.
+//   - Property comparison errors use rc.compareCRUDProperties, which wraps compareProperties
+//     with a collectingReporter to capture individual property mismatches for the result matrix.
+func runCRUDTest(t *testing.T, tc TestCase, rc *ResultCollector, sweep *providerDefaultSweep) {
+	if isParallelEnabled() {
+		t.Parallel()
+	}
+	t.Logf("Testing resource: %s (file: %s)", tc.Name, tc.PKLFile)
+
+	idx := rc.NewCRUDResult(tc.Name)
+	start := time.Now()
+	t.Cleanup(func() {
+		rc.SetCRUDDuration(idx, time.Since(start))
+		if t.Skipped() {
+			rc.MarkRemainingCRUDSkipped(idx)
+		}
+	})
+
+	// Track if all property comparisons pass (used for final success message)
+	allPropertiesMatched := true
+
+	// Create test harness
+	harness := NewTestHarness(t)
+	defer harness.Cleanup()
+
+	// Start the formae agent
+	if err := harness.StartAgent(); err != nil {
+		rc.CRUDFatalf(t, idx, PhaseCreate, "failed to start agent: %v", err)
+	}
+
+	// === Step 1: Eval the PKL file to get expected state ===
+	t.Log("Step 1: Evaluating PKL file to get expected state...")
+	expectedOutput, err := harness.Eval(tc.PKLFile)
+	if err != nil {
+		rc.CRUDFatalf(t, idx, PhaseCreate, "Eval command failed: %v", err)
+	}
+
+	// Parse eval output to get expected properties
+	var evalResult InventoryResponse
+	if err := json.Unmarshal([]byte(expectedOutput), &evalResult); err != nil {
+		rc.CRUDFatalf(t, idx, PhaseCreate, "Failed to parse eval output: %v\nRaw output:\n%s", err, expectedOutput)
+	}
+	if len(evalResult.Resources) == 0 {
+		rc.CRUDFatalf(t, idx, PhaseCreate, "Eval should return at least one resource")
+	}
+
+	// Find the target resource by matching the test case's ResourceType to the resource Type
+	expectedResource := findTargetResource(evalResult.Resources, tc.ResourceType)
+
+	actualResourceType, ok := expectedResource["Type"].(string)
+	if !ok {
+		rc.CRUDFatalf(t, idx, PhaseCreate, "Expected resource should have Type field")
+	}
+	expectedProperties, ok := expectedResource["Properties"].(map[string]any)
+	if !ok {
+		rc.CRUDFatalf(t, idx, PhaseCreate, "Expected resource should have Properties field")
+	}
+	providerDefaults := extractProviderDefaultPaths(expectedResource)
+	t.Logf("Expected resource type: %s (provider default paths: %d)", actualResourceType, len(providerDefaults))
+
+	// === Step 2: Wait for plugin to be registered before any commands ===
+	t.Log("Step 2: Waiting for plugin to be registered...")
+	namespace := strings.Split(actualResourceType, "::")[0]
+	if err := harness.WaitForPluginRegistered(namespace, 60*time.Second); err != nil {
+		rc.CRUDFatalf(t, idx, PhaseCreate, "Plugin should register within timeout: %v", err)
+	}
+
+	// === Step 3: Apply the forma to create the resource ===
+	t.Log("Step 3: Applying forma to create resource...")
+	applyCommandID, err := harness.Apply(tc.PKLFile)
+	if err != nil {
+		rc.CRUDFatalf(t, idx, PhaseCreate, "Apply command failed: %v", err)
+	}
+	if applyCommandID == "" {
+		rc.CRUDFatalf(t, idx, PhaseCreate, "Apply should return a command ID")
+	}
+
+	// === Step 4: Poll for apply command to complete successfully ===
+	t.Log("Step 4: Polling for apply command completion...")
+	applyStatus, err := harness.PollStatus(applyCommandID, getOperationTimeout())
+	if err != nil {
+		rc.CRUDFatalf(t, idx, PhaseCreate, "Apply command should complete successfully: %v", err)
+	}
+	if applyStatus != "Success" {
+		rc.CRUDFatalf(t, idx, PhaseCreate, "Apply command should reach Success state, got: %s", applyStatus)
+	}
+	rc.SetCRUDPhase(idx, PhaseCreate, StepPassed)
+
+	// === Step 5: Verify resource exists in inventory with correct properties ===
+	t.Log("Step 5: Verifying resource in inventory...")
+	inventory, err := harness.Inventory(fmt.Sprintf("type: %s", actualResourceType))
+	if err != nil {
+		rc.CRUDFatalf(t, idx, PhaseVerify, "Inventory command failed: %v", err)
+	}
+	if inventory == nil {
+		rc.CRUDFatalf(t, idx, PhaseVerify, "Inventory should return a response")
+	}
+	if len(inventory.Resources) != 1 {
+		rc.CRUDFatalf(t, idx, PhaseVerify, "Inventory should contain exactly 1 resource, got %d", len(inventory.Resources))
+	}
+
+	actualResource := inventory.Resources[0]
+	t.Logf("Found resource in inventory with type: %s", actualResource["Type"])
+
+	// Verify the resource type matches
+	verifyFailed := false
+	if actualResource["Type"] != actualResourceType {
+		rc.CRUDErrorf(t, idx, PhaseVerify, "Resource type should match: expected %s, got %s", actualResourceType, actualResource["Type"])
+		verifyFailed = true
+	}
+
+	// Compare properties — captures individual property errors for the result matrix
+	if !rc.compareCRUDProperties(t, idx, PhaseVerify, expectedProperties, actualResource, "after create", providerDefaults) {
+		allPropertiesMatched = false
+		verifyFailed = true
+	}
+	if !verifyFailed {
+		rc.SetCRUDPhase(idx, PhaseVerify, StepPassed)
+	}
+
+	// === Step 6: Extract resource and verify it matches original (if extractable) ===
+	// Check extractable from the eval output's Schema field
+	shouldSkipExtract := false
+	if schema, ok := expectedResource["Schema"].(map[string]any); ok {
+		if extractable, ok := schema["Extractable"].(bool); ok && !extractable {
+			t.Logf("Skipping extract validation: resource type %s has extractable=false", actualResourceType)
+			shouldSkipExtract = true
+		}
+	}
+
+	if !shouldSkipExtract {
+		t.Log("Step 6: Extracting resource to PKL and verifying...")
+
+		// Create temp directory for extracted files
+		extractDir, err := os.MkdirTemp("", "formae-extract-test-*")
+		if err != nil {
+			rc.CRUDFatalf(t, idx, PhaseExtract, "Failed to create temp directory for extraction: %v", err)
+		}
+		defer func() { _ = os.RemoveAll(extractDir) }()
+		t.Logf("Created extract directory: %s", extractDir)
+
+		// Extract the resource
+		extractFile := filepath.Join(extractDir, "extracted.pkl")
+		if err := harness.Extract(fmt.Sprintf("type:%s", actualResourceType), extractFile); err != nil {
+			rc.CRUDFatalf(t, idx, PhaseExtract, "Extract command failed: %v", err)
+		}
+
+		// Eval the extracted PKL file
+		extractedOutput, err := harness.Eval(extractFile)
+		if err != nil {
+			rc.CRUDFatalf(t, idx, PhaseExtract, "Eval of extracted file failed: %v", err)
+		}
+
+		// Parse extracted eval output
+		var extractedResult InventoryResponse
+		if err := json.Unmarshal([]byte(extractedOutput), &extractedResult); err != nil {
+			rc.CRUDFatalf(t, idx, PhaseExtract, "Failed to parse extracted eval output: %v", err)
+		}
+		if len(extractedResult.Resources) == 0 {
+			rc.CRUDFatalf(t, idx, PhaseExtract, "Extracted eval should return at least one resource")
+		}
+
+		// Get the extracted resource
+		extractedResource := extractedResult.Resources[0]
+
+		// Compare properties using the same logic as inventory comparison.
+		// Only re-apply once the extracted properties are known good — applying
+		// known-bad properties would mutate the resource for no extra signal.
+		if !rc.compareCRUDProperties(t, idx, PhaseExtract, expectedProperties, extractedResource, "after extract", providerDefaults) {
+			allPropertiesMatched = false
+		} else if rc.verifyExtractReapply(t, idx, harness, extractFile,
+			extractedResource, actualResource) {
+			rc.SetCRUDPhase(idx, PhaseExtract, StepPassed)
+		} else {
+			allPropertiesMatched = false
+		}
+		t.Log("Extract validation completed!")
+	} else {
+		t.Log("Step 6: Skipping extract validation")
+		rc.SetCRUDPhase(idx, PhaseExtract, StepSkipped)
+	}
+
+	// === Step 7: Force synchronization to read actual state from cloud ===
+	// A configured settle window gives a provider that populates fields
+	// asynchronously time to do so before the post-sync read is taken.
+	if window := getSettleWindow(); window > 0 {
+		t.Logf("Waiting %s for provider state to settle before sync...", window)
+		time.Sleep(window)
+	}
+	t.Log("Step 7: Forcing synchronization...")
+	if err := harness.Sync(); err != nil {
+		rc.CRUDFatalf(t, idx, PhaseSync, "Sync command failed: %v", err)
+	}
+
+	// === Step 8: Wait for synchronization to complete ===
+	t.Log("Step 8: Waiting for synchronization to complete...")
+	if err := harness.WaitForSyncCompletion(getSyncTimeout()); err != nil {
+		rc.CRUDFatalf(t, idx, PhaseSync, "Synchronization should complete successfully: %v", err)
+	}
+
+	// === Step 9: Verify inventory still matches expected state (idempotency check) ===
+	t.Log("Step 9: Verifying resource state unchanged after sync (idempotency)...")
+	inventoryAfterSync, err := harness.Inventory(fmt.Sprintf("type: %s", actualResourceType))
+	if err != nil {
+		rc.CRUDFatalf(t, idx, PhaseSync, "Inventory command failed after sync: %v", err)
+	}
+	if len(inventoryAfterSync.Resources) != 1 {
+		rc.CRUDFatalf(t, idx, PhaseSync, "Inventory should still contain exactly 1 resource after sync, got %d", len(inventoryAfterSync.Resources))
+	}
+
+	resourceAfterSync := inventoryAfterSync.Resources[0]
+
+	// Record the omit-and-observe result now that both reads exist: the create
+	// echo from step 5 and the post-sync read here. The fixture's own declared
+	// properties say which of the annotated fields were omitted.
+	sweep.record(tc.Name, actualResourceType, schemaHints(expectedResource),
+		expectedProperties, propertiesOf(actualResource), propertiesOf(resourceAfterSync))
+
+	// Compare properties using helper - verifies idempotency
+	syncFailed := !rc.compareCRUDProperties(t, idx, PhaseSync, expectedProperties, resourceAfterSync, "after sync", providerDefaults)
+	if syncFailed {
+		allPropertiesMatched = false
+	} else {
+		rc.SetCRUDPhase(idx, PhaseSync, StepPassed)
+		t.Log("Idempotency verified!")
+	}
+
+	// === Step 10: Update test (if update file exists) ===
+	if tc.UpdateFile != "" {
+		t.Log("Step 10: Running update test using update file...")
+
+		// Store current NativeID to verify it doesn't change during update
+		inventoryBeforeUpdate, err := harness.Inventory(fmt.Sprintf("type: %s", actualResourceType))
+		if err != nil {
+			rc.CRUDFatalf(t, idx, PhaseUpdate, "Inventory command failed before update: %v", err)
+		}
+		if len(inventoryBeforeUpdate.Resources) != 1 {
+			rc.CRUDFatalf(t, idx, PhaseUpdate, "Inventory should contain exactly 1 resource before update")
+		}
+		oldNativeID, ok := inventoryBeforeUpdate.Resources[0]["NativeID"].(string)
+		if !ok {
+			rc.CRUDFatalf(t, idx, PhaseUpdate, "Resource should have NativeID field")
+		}
+		t.Logf("Current NativeID before update: %s", oldNativeID)
+
+		// Eval update file for expected state
+		updateExpected, err := harness.Eval(tc.UpdateFile)
+		if err != nil {
+			rc.CRUDFatalf(t, idx, PhaseUpdate, "Update file eval failed: %v", err)
+		}
+
+		// Parse to get expected properties
+		var updateEvalResult InventoryResponse
+		if err := json.Unmarshal([]byte(updateExpected), &updateEvalResult); err != nil {
+			rc.CRUDFatalf(t, idx, PhaseUpdate, "Failed to parse update eval output: %v", err)
+		}
+		if len(updateEvalResult.Resources) == 0 {
+			rc.CRUDFatalf(t, idx, PhaseUpdate, "Update eval should return at least one resource")
+		}
+
+		// Find the target resource
+		updateExpectedResource := findTargetResource(updateEvalResult.Resources, tc.ResourceType)
+		updateExpectedProperties, ok := updateExpectedResource["Properties"].(map[string]any)
+		if !ok {
+			rc.CRUDFatalf(t, idx, PhaseUpdate, "Update expected resource should have Properties field")
+		}
+
+		// Apply with the configured update mode (patch by default).
+		updateCmdID, err := applyUpdate(harness, tc.UpdateFile)
+		if err != nil {
+			rc.CRUDFatalf(t, idx, PhaseUpdate, "Update apply failed: %v", err)
+		}
+		if updateCmdID == "" {
+			rc.CRUDFatalf(t, idx, PhaseUpdate, "Update apply should return a command ID")
+		}
+
+		// === Step 11: Poll for update command completion ===
+		t.Log("Step 11: Polling for update command completion...")
+		updateStatus, err := harness.PollStatus(updateCmdID, getOperationTimeout())
+		if err != nil {
+			rc.CRUDFatalf(t, idx, PhaseUpdate, "Update command should complete successfully: %v", err)
+		}
+		if updateStatus != "Success" {
+			rc.CRUDFatalf(t, idx, PhaseUpdate, "Update command should reach Success state, got: %s", updateStatus)
+		}
+
+		// === Step 12: Verify resource properties after update ===
+		t.Log("Step 12: Verifying resource properties after update...")
+		inventoryAfterUpdate, err := harness.Inventory(fmt.Sprintf("type: %s", actualResourceType))
+		if err != nil {
+			rc.CRUDFatalf(t, idx, PhaseUpdate, "Inventory command failed after update: %v", err)
+		}
+		if len(inventoryAfterUpdate.Resources) != 1 {
+			rc.CRUDFatalf(t, idx, PhaseUpdate, "Inventory should still contain exactly 1 resource after update")
+		}
+
+		resourceAfterUpdate := inventoryAfterUpdate.Resources[0]
+
+		// Verify NativeID did NOT change (proves resource was updated, not replaced)
+		newNativeID, ok := resourceAfterUpdate["NativeID"].(string)
+		if !ok {
+			rc.CRUDFatalf(t, idx, PhaseUpdate, "Resource should have NativeID field after update")
+		}
+		t.Logf("NativeID after update: %s", newNativeID)
+		updateFailed := false
+		if oldNativeID != newNativeID {
+			rc.CRUDErrorf(t, idx, PhaseUpdate, "NativeID should NOT change during update (old: %s, new: %s) - if it changed, a createOnly property was modified",
+				oldNativeID, newNativeID)
+			updateFailed = true
+		}
+
+		if !rc.compareCRUDProperties(t, idx, PhaseUpdate, updateExpectedProperties, resourceAfterUpdate, "after update", providerDefaults) {
+			allPropertiesMatched = false
+			updateFailed = true
+		}
+		if !updateFailed {
+			rc.SetCRUDPhase(idx, PhaseUpdate, StepPassed)
+		}
+		t.Log("Update test completed successfully!")
+	} else {
+		t.Log("No update file found, skipping update test")
+		rc.SetCRUDPhase(idx, PhaseUpdate, StepSkipped)
+	}
+
+	// === Step 13: Replace test (if replace file exists) ===
+	if tc.ReplaceFile != "" {
+		t.Log("Step 13: Running replace test using replace file...")
+
+		// Store current NativeID for comparison
+		inventoryBeforeReplace, err := harness.Inventory(fmt.Sprintf("type: %s", actualResourceType))
+		if err != nil {
+			rc.CRUDFatalf(t, idx, PhaseReplace, "Inventory command failed before replace: %v", err)
+		}
+		if len(inventoryBeforeReplace.Resources) != 1 {
+			rc.CRUDFatalf(t, idx, PhaseReplace, "Inventory should contain exactly 1 resource before replace")
+		}
+		oldNativeID, ok := inventoryBeforeReplace.Resources[0]["NativeID"].(string)
+		if !ok {
+			rc.CRUDFatalf(t, idx, PhaseReplace, "Resource should have NativeID field")
+		}
+		t.Logf("Current NativeID before replace: %s", oldNativeID)
+
+		// Eval replace file
+		replaceExpected, err := harness.Eval(tc.ReplaceFile)
+		if err != nil {
+			rc.CRUDFatalf(t, idx, PhaseReplace, "Replace file eval failed: %v", err)
+		}
+
+		// Parse to get expected properties
+		var replaceEvalResult InventoryResponse
+		if err := json.Unmarshal([]byte(replaceExpected), &replaceEvalResult); err != nil {
+			rc.CRUDFatalf(t, idx, PhaseReplace, "Failed to parse replace eval output: %v", err)
+		}
+		if len(replaceEvalResult.Resources) == 0 {
+			rc.CRUDFatalf(t, idx, PhaseReplace, "Replace eval should return at least one resource")
+		}
+
+		// Find the target resource
+		replaceExpectedResource := findTargetResource(replaceEvalResult.Resources, tc.ResourceType)
+		replaceExpectedProperties, ok := replaceExpectedResource["Properties"].(map[string]any)
+		if !ok {
+			rc.CRUDFatalf(t, idx, PhaseReplace, "Replace expected resource should have Properties field")
+		}
+
+		// Apply with patch mode (createOnly change triggers delete+create)
+		replaceCmdID, err := harness.ApplyWithMode(tc.ReplaceFile, "patch")
+		if err != nil {
+			rc.CRUDFatalf(t, idx, PhaseReplace, "Replace apply failed: %v", err)
+		}
+		if replaceCmdID == "" {
+			rc.CRUDFatalf(t, idx, PhaseReplace, "Replace apply should return a command ID")
+		}
+
+		// === Step 14: Poll for replace command completion ===
+		t.Log("Step 14: Polling for replace command completion...")
+		replaceStatus, err := harness.PollStatus(replaceCmdID, getOperationTimeout())
+		if err != nil {
+			rc.CRUDFatalf(t, idx, PhaseReplace, "Replace command should complete successfully: %v", err)
+		}
+		if replaceStatus != "Success" {
+			rc.CRUDFatalf(t, idx, PhaseReplace, "Replace command should reach Success state, got: %s", replaceStatus)
+		}
+
+		// === Step 15: Verify resource was replaced (NativeID changed) ===
+		t.Log("Step 15: Verifying resource was replaced (NativeID changed)...")
+		inventoryAfterReplace, err := harness.Inventory(fmt.Sprintf("type: %s", actualResourceType))
+		if err != nil {
+			rc.CRUDFatalf(t, idx, PhaseReplace, "Inventory command failed after replace: %v", err)
+		}
+		if len(inventoryAfterReplace.Resources) != 1 {
+			rc.CRUDFatalf(t, idx, PhaseReplace, "Inventory should still contain exactly 1 resource after replace")
+		}
+
+		newNativeID, ok := inventoryAfterReplace.Resources[0]["NativeID"].(string)
+		if !ok {
+			rc.CRUDFatalf(t, idx, PhaseReplace, "Resource should have NativeID field after replace")
+		}
+		t.Logf("New NativeID after replace: %s", newNativeID)
+
+		replaceFailed := false
+		if oldNativeID == newNativeID {
+			rc.CRUDErrorf(t, idx, PhaseReplace, "NativeID should change after replace (old: %s, new: %s)", oldNativeID, newNativeID)
+			replaceFailed = true
+		}
+
+		// Verify properties match expected state
+		resourceAfterReplace := inventoryAfterReplace.Resources[0]
+		if !rc.compareCRUDProperties(t, idx, PhaseReplace, replaceExpectedProperties, resourceAfterReplace, "after replace", providerDefaults) {
+			allPropertiesMatched = false
+			replaceFailed = true
+		}
+		if !replaceFailed {
+			rc.SetCRUDPhase(idx, PhaseReplace, StepPassed)
+		}
+
+		t.Log("Replace test completed successfully - resource was recreated with new NativeID!")
+	} else {
+		t.Log("No replace file found, skipping replace test")
+		rc.SetCRUDPhase(idx, PhaseReplace, StepSkipped)
+	}
+
+	// === Step 16: Destroy the resource ===
+	t.Log("Step 16: Destroying resource...")
+	destroyCommandID, err := harness.Destroy(tc.PKLFile)
+	if err != nil {
+		rc.CRUDFatalf(t, idx, PhaseDestroy, "Destroy command failed: %v", err)
+	}
+	if destroyCommandID == "" {
+		rc.CRUDFatalf(t, idx, PhaseDestroy, "Destroy should return a command ID")
+	}
+
+	// === Step 17: Poll for destroy command to complete successfully ===
+	t.Log("Step 17: Polling for destroy command completion...")
+	destroyStatus, err := harness.PollStatus(destroyCommandID, getOperationTimeout())
+	if err != nil {
+		rc.CRUDFatalf(t, idx, PhaseDestroy, "Destroy command should complete successfully: %v", err)
+	}
+	if destroyStatus != "Success" {
+		rc.CRUDFatalf(t, idx, PhaseDestroy, "Destroy command should reach Success state, got: %s", destroyStatus)
+	}
+
+	// === Step 18: Verify resource no longer exists in inventory ===
+	t.Log("Step 18: Verifying resource removed from inventory...")
+	inventoryAfterDestroy, err := harness.Inventory(fmt.Sprintf("type: %s", actualResourceType))
+	if err != nil {
+		rc.CRUDFatalf(t, idx, PhaseDestroy, "Inventory command failed after destroy: %v", err)
+	}
+	if len(inventoryAfterDestroy.Resources) != 0 {
+		rc.CRUDErrorf(t, idx, PhaseDestroy, "Inventory should be empty after destroy, got %d resources", len(inventoryAfterDestroy.Resources))
+	} else {
+		rc.SetCRUDPhase(idx, PhaseDestroy, StepPassed)
+	}
+
+	// === Step 19: Re-apply the resource for OOB delete test ===
+	// Rotate the test run ID so recreated resources get unique names.
+	// This avoids conflicts with resources still being async-deleted
+	// by the cloud provider (e.g., OCI compartments).
+	harness.RotateTestRunID()
+	t.Log("Step 19: Re-applying forma to recreate resource for OOB delete test...")
+	reapplyCommandID, err := harness.Apply(tc.PKLFile)
+	if err != nil {
+		rc.CRUDFatalf(t, idx, PhaseOOBDelete, "Re-apply command failed: %v", err)
+	}
+	if reapplyCommandID == "" {
+		rc.CRUDFatalf(t, idx, PhaseOOBDelete, "Re-apply should return a command ID")
+	}
+
+	// === Step 20: Poll for re-apply command to complete successfully ===
+	t.Log("Step 20: Polling for re-apply command completion...")
+	reapplyStatus, err := harness.PollStatus(reapplyCommandID, getOperationTimeout())
+	if err != nil {
+		rc.CRUDFatalf(t, idx, PhaseOOBDelete, "Re-apply command should complete successfully: %v", err)
+	}
+	if reapplyStatus != "Success" {
+		rc.CRUDFatalf(t, idx, PhaseOOBDelete, "Re-apply command should reach Success state, got: %s", reapplyStatus)
+	}
+
+	// === Step 21: Verify resource is back in inventory and capture NativeID ===
+	t.Log("Step 21: Verifying resource recreated in inventory...")
+	inventoryAfterReapply, err := harness.Inventory(fmt.Sprintf("type: %s", actualResourceType))
+	if err != nil {
+		rc.CRUDFatalf(t, idx, PhaseOOBDelete, "Inventory command failed after re-apply: %v", err)
+	}
+	if len(inventoryAfterReapply.Resources) != 1 {
+		rc.CRUDFatalf(t, idx, PhaseOOBDelete, "Inventory should contain exactly 1 resource after re-apply, got %d", len(inventoryAfterReapply.Resources))
+	}
+	oobResource := inventoryAfterReapply.Resources[0]
+	oobNativeID, ok := oobResource["NativeID"].(string)
+	if !ok || oobNativeID == "" {
+		rc.CRUDFatalf(t, idx, PhaseOOBDelete, "Recreated resource should have a NativeID")
+	}
+	t.Logf("Recreated resource NativeID: %s", oobNativeID)
+
+	// Parse target from eval output for the OOB delete
+	var forma pkgmodel.Forma
+	if err := json.Unmarshal([]byte(expectedOutput), &forma); err != nil {
+		rc.CRUDFatalf(t, idx, PhaseOOBDelete, "Failed to parse forma for OOB delete: %v", err)
+	}
+	if len(forma.Targets) == 0 {
+		rc.CRUDFatalf(t, idx, PhaseOOBDelete, "Forma should have at least one target for OOB delete")
+	}
+	oobTarget := forma.Targets[0]
+
+	// === Step 22: Delete the resource out-of-band (bypassing formae) ===
+	t.Log("Step 22: Deleting resource out-of-band via plugin...")
+	if err := harness.DeleteResourceOOB(actualResourceType, oobNativeID, &oobTarget); err != nil {
+		rc.CRUDFatalf(t, idx, PhaseOOBDelete, "OOB delete failed: %v", err)
+	}
+	t.Log("Resource deleted out-of-band successfully")
+
+	// === Step 23: Trigger sync to detect the OOB deletion ===
+	t.Log("Step 23: Triggering sync to detect OOB deletion...")
+	if err := harness.Sync(); err != nil {
+		rc.CRUDFatalf(t, idx, PhaseOOBDelete, "Sync command failed: %v", err)
+	}
+
+	// === Step 24: Verify resource is removed from inventory (tombstoned by sync) ===
+	t.Log("Step 24: Waiting for resource to be removed from inventory after OOB delete...")
+	if err := harness.WaitForResourceRemovedFromInventory(actualResourceType, oobNativeID, getOOBDeleteTimeout()); err != nil {
+		rc.CRUDFatalf(t, idx, PhaseOOBDelete, "Resource should be removed from inventory after OOB delete + sync: %v", err)
+	}
+	t.Log("OOB delete detection verified - sync correctly tombstoned the resource!")
+	rc.SetCRUDPhase(idx, PhaseOOBDelete, StepPassed)
+
+	// Only log success if all property comparisons passed
+	if allPropertiesMatched {
+		t.Logf("Resource lifecycle test completed successfully for %s!", tc.Name)
+	}
+}
+
+// RunDiscoveryTests tests that the plugin can discover resources created out-of-band.
+//
+// This test:
+//   - Creates a resource directly via the plugin (bypassing formae)
+//   - Runs formae discovery
+//   - Verifies the resource appears as unmanaged
+//   - Cleans up the resource
+//
+// Environment variables:
+//   - FORMAE_BINARY: Path to the formae binary (optional). If not set, the binary is
+//     downloaded automatically via orbital.
+//   - FORMAE_TEST_FILTER: Filter test cases by name, resource type, or file path (optional).
+//     Supports comma-separated patterns for multiple filters.
+//     Examples: "s3-bucket", "ec2-instance,vpc", "testdata/network"
+//   - FORMAE_TEST_TYPE: Select which tests to run (optional).
+//     Values: "all" (default), "crud", "discovery".
+//     When set to "crud", discovery tests are skipped.
+//
+// This function should be called from a plugin's conformance_test.go:
+//
+//	func TestPluginDiscovery(t *testing.T) {
+//	    conformance.RunDiscoveryTests(t)
+//	}
+func RunDiscoveryTests(t *testing.T) {
+	// Skip if test type is CRUD-only
+	if getTestType() == TestTypeCRUD {
+		t.Skip("Skipping discovery tests: FORMAE_TEST_TYPE=crud")
+	}
+
+	// Find plugin directory
+	pluginDir, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("failed to get working directory: %v", err)
+	}
+
+	// Discover test cases
+	testCases, err := DiscoverTestData(pluginDir)
+	if err != nil {
+		t.Fatalf("failed to discover test cases: %v", err)
+	}
+
+	if len(testCases) == 0 {
+		t.Skip("No test cases found")
+	}
+
+	// Apply filter if FORMAE_TEST_FILTER is set
+	testCases = filterTestCases(t, testCases)
+
+	rc := NewResultCollector()
+	t.Cleanup(func() { rc.PrintSummary() })
+
+	t.Logf("Discovered %d test case(s) for discovery testing", len(testCases))
+
+	// Run discovery test for each test case
+	for _, tc := range testCases {
+		t.Run("Discovery/"+tc.Name, func(t *testing.T) {
+			runDiscoveryTest(t, tc, rc)
+		})
+	}
+}
+
+// runDiscoveryTest runs the discovery test for a single test case.
+func runDiscoveryTest(t *testing.T, tc TestCase, rc *ResultCollector) {
+	if isParallelEnabled() {
+		t.Parallel()
+	}
+
+	idx := rc.NewDiscoveryResult(tc.Name)
+	start := time.Now()
+	t.Cleanup(func() {
+		rc.SetDiscoveryDuration(idx, time.Since(start))
+		if t.Skipped() {
+			rc.MarkRemainingDiscoverySkipped(idx)
+		}
+	})
+
+	// Create test harness
+	harness := NewTestHarness(t)
+	defer harness.Cleanup()
+
+	// Get resource descriptor to find the resource type for discovery config
+	// tc.PKLFile is already the absolute path from DiscoverTestData
+	pklFile := tc.PKLFile
+
+	// Evaluate to get resource type
+	evalOutput, err := harness.Eval(pklFile)
+	if err != nil {
+		rc.DiscoveryFatalf(t, idx, PhaseCreateOOB, "failed to eval PKL file: %v", err)
+	}
+
+	// Extract the plugin namespace and resource type from the evaluated forma resources
+	namespace, resourceType, err := extractNamespaceFromEvalOutput(evalOutput)
+	if err != nil {
+		rc.DiscoveryFatalf(t, idx, PhaseCreateOOB, "failed to extract namespace from eval output: %v", err)
+	}
+	t.Logf("Extracted plugin namespace: %s, resource type: %s", namespace, resourceType)
+
+	// Launch the plugin before anything is created so the descriptor below can be
+	// read first: a type that is not discoverable must skip without provisioning
+	// the fixture's infrastructure out of band.
+	if err := harness.EnsurePluginLaunched(evalOutput); err != nil {
+		rc.DiscoveryFatalf(t, idx, PhaseCreateOOB, "failed to launch plugin: %v", err)
+	}
+
+	t.Log("Step 1: Checking if resource type is discoverable...")
+	descriptor, err := harness.GetResourceDescriptorFromCoordinator(resourceType)
+	if err != nil {
+		t.Skipf("Skipping discovery test: failed to get resource descriptor for %s: %v", resourceType, err)
+	}
+	if !descriptor.Discoverable {
+		t.Skipf("Skipping discovery test: resource type %s has discoverable=false", resourceType)
+	}
+
+	t.Log("Step 2: Creating resource out-of-band via plugin...")
+
+	// Create all resources directly via the plugin (bypassing formae)
+	// Use CreateAllUnmanagedResources to get all created resources for cleanup
+	createdResources, err := harness.CreateAllUnmanagedResources(evalOutput)
+	if err != nil {
+		rc.DiscoveryFatalf(t, idx, PhaseCreateOOB, "failed to create unmanaged resource: %v", err)
+	}
+	if len(createdResources) == 0 {
+		rc.DiscoveryFatalf(t, idx, PhaseCreateOOB, "no resources were created")
+	}
+
+	nativeID, err := findMainResourceNativeID(createdResources, resourceType)
+	if err != nil {
+		t.Fatalf("failed to find main resource: %v", err)
+	}
+	t.Logf("Created %d resource(s), main resource NativeID: %s (type: %s)", len(createdResources), nativeID, resourceType)
+
+	// Deletion of each created resource is registered by
+	// CreateAllUnmanagedResources as soon as that resource exists, so a create
+	// that fails partway still cleans up what it made.
+
+	// Extract all unique resource types from created resources for discovery configuration.
+	// This includes both the main resource type and any parent/dependency types.
+	resourceTypes := make([]string, 0)
+	seenTypes := make(map[string]bool)
+	for _, res := range createdResources {
+		if !seenTypes[res.ResourceType] {
+			resourceTypes = append(resourceTypes, res.ResourceType)
+			seenTypes[res.ResourceType] = true
+		}
+	}
+
+	// Include additional pre-existing resource types that should be discovered
+	// but aren't created OOB (e.g., static parent resources like OCI compartments).
+	if extra := os.Getenv("FORMAE_TEST_EXTRA_DISCOVERY_TYPES"); extra != "" {
+		for _, rt := range strings.Split(extra, ",") {
+			rt = strings.TrimSpace(rt)
+			if rt != "" && !seenTypes[rt] {
+				resourceTypes = append(resourceTypes, rt)
+				seenTypes[rt] = true
+			}
+		}
+	}
+
+	// Configure discovery to only scan the resource types being tested (including dependencies).
+	// This prevents discovery from scanning all resource types, which causes
+	// excessive rate limiting and timeouts.
+	if err := harness.ConfigureDiscovery(resourceTypes); err != nil {
+		rc.DiscoveryFatalf(t, idx, PhaseCreateOOB, "failed to configure discovery: %v", err)
+	}
+
+	// Start the agent with discovery enabled
+	if err := harness.StartAgent(); err != nil {
+		rc.DiscoveryFatalf(t, idx, PhaseCreateOOB, "failed to start agent: %v", err)
+	}
+	rc.SetDiscoveryPhase(idx, PhaseCreateOOB, StepPassed)
+
+	// Step 3: Register target for discovery
+	t.Log("Step 3: Registering target for discovery...")
+	if err := harness.RegisterTargetForDiscovery([]byte(evalOutput)); err != nil {
+		rc.DiscoveryFatalf(t, idx, PhaseRegister, "failed to register target: %v", err)
+	}
+
+	// Step 4: Wait for plugin to register (using extracted namespace, not directory name)
+	t.Log("Step 4: Waiting for plugin to register...")
+	if err := harness.WaitForPluginRegistered(namespace, 60*time.Second); err != nil {
+		rc.DiscoveryFatalf(t, idx, PhaseRegister, "plugin did not register: %v", err)
+	}
+	rc.SetDiscoveryPhase(idx, PhaseRegister, StepPassed)
+
+	// Step 5: Re-trigger discovery across the timeout while polling inventory.
+	// The wait loop triggers the first scan itself, so there is no separate
+	// standalone trigger here — re-scanning tolerates CloudControl propagation lag.
+	t.Log("Step 5: Discovering resource (re-trigger + poll)...")
+	if err := harness.WaitForResourceDiscovered(resourceType, nativeID, getDiscoveryTimeout()); err != nil {
+		rc.DiscoveryFatalf(t, idx, PhaseDiscover, "resource not discovered: %v", err)
+	}
+	rc.SetDiscoveryPhase(idx, PhaseDiscover, StepPassed)
+
+	// Step 6: Verify the discovered resource
+	t.Log("Step 6: Verifying discovered resource...")
+	inventory, err := harness.Inventory(fmt.Sprintf("type: %s managed: false", resourceType))
+	if err != nil {
+		rc.DiscoveryFatalf(t, idx, PhaseDiscoveryVerify, "failed to query inventory: %v", err)
+	}
+
+	// Find our specific resource by NativeID
+	var discoveredResource map[string]any
+	for _, res := range inventory.Resources {
+		if resNativeID, ok := res["NativeID"].(string); ok {
+			if resNativeID == nativeID {
+				discoveredResource = res
+				break
+			}
+		}
+	}
+
+	if discoveredResource == nil {
+		rc.DiscoveryFatalf(t, idx, PhaseDiscoveryVerify, "did not find resource with NativeID %s in discovered resources", nativeID)
+	}
+
+	// Verify resource is on the unmanaged stack
+	stack, ok := discoveredResource["Stack"].(string)
+	if !ok || stack != "$unmanaged" {
+		rc.DiscoveryFatalf(t, idx, PhaseDiscoveryVerify, "discovered resource should be on $unmanaged stack, got: %s", stack)
+	}
+
+	// Verify resource type matches
+	discoveredType, ok := discoveredResource["Type"].(string)
+	if !ok || discoveredType != resourceType {
+		rc.DiscoveryFatalf(t, idx, PhaseDiscoveryVerify, "discovered resource type should be %s, got: %s", resourceType, discoveredType)
+	}
+
+	t.Log("Discovery test passed!")
+	rc.SetDiscoveryPhase(idx, PhaseDiscoveryVerify, StepPassed)
+}
+
+// findMainResourceNativeID returns the NativeID of the last created resource matching
+// the given resource type. Creation order (dependency-first) may differ from PKL output
+// order, so we search backwards for a type match rather than taking the last resource.
+// Returns an error if no created resource matches the expected type.
+func findMainResourceNativeID(createdResources []CreatedResourceInfo, resourceType string) (string, error) {
+	for i := len(createdResources) - 1; i >= 0; i-- {
+		if createdResources[i].ResourceType == resourceType {
+			return createdResources[i].NativeID, nil
+		}
+	}
+	return "", fmt.Errorf("no created resource matches type %s", resourceType)
+}
+
+// extractNamespaceFromEvalOutput parses the evaluated JSON to extract the plugin namespace
+// and resource type from the last cloud resource (e.g., "OVH::Network::FloatingIP" -> namespace="OVH", resourceType="OVH::Network::FloatingIP").
+// The last resource is used because it's typically the main resource being tested,
+// while earlier resources are dependencies.
+func extractNamespaceFromEvalOutput(evalOutput string) (namespace string, resourceType string, err error) {
+	var forma pkgmodel.Forma
+	if err := json.Unmarshal([]byte(evalOutput), &forma); err != nil {
+		return "", "", err
+	}
+
+	// Find the last cloud resource (those with "::" in the type)
+	for i := len(forma.Resources) - 1; i >= 0; i-- {
+		res := forma.Resources[i]
+		if strings.Contains(res.Type, "::") {
+			parts := strings.Split(res.Type, "::")
+			if len(parts) > 0 {
+				return parts[0], res.Type, nil
+			}
+		}
+	}
+
+	return "", "", fmt.Errorf("no cloud resource found in eval output")
+}
+
+// getUpdateMode keeps existing partial-update fixtures in patch mode. Reconcile
+// is opt-in for complete declarations that intentionally remove collection members.
+func getUpdateMode() (string, error) {
+	mode := os.Getenv("FORMAE_TEST_UPDATE_MODE")
+	switch mode {
+	case "", "patch":
+		return "patch", nil
+	case "reconcile":
+		return mode, nil
+	default:
+		return "", fmt.Errorf("invalid FORMAE_TEST_UPDATE_MODE %q: expected patch or reconcile", mode)
+	}
+}
+
+func applyUpdate(harness *TestHarness, file string) (string, error) {
+	mode, err := getUpdateMode()
+	if err != nil {
+		return "", err
+	}
+	return harness.ApplyWithMode(file, mode)
+}

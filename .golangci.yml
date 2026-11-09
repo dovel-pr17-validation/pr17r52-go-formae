@@ -1,0 +1,36 @@
+version: "2"
+
+run:
+  # tests/e2e/go's files all sit behind `//go:build e2e`; without this tag
+  # golangci-lint finds no packages there and exits non-zero.
+  build-tags:
+    - e2e
+
+linters:
+  enable:
+    - errcheck
+    - govet
+    - staticcheck
+    - ineffassign
+    # - gocyclo
+    - unused
+    - misspell
+    # - godox # catch TODO/FIXME comments
+  settings:
+    staticcheck:
+      checks:
+        - "all"
+        - "-ST1005"     # don't enforce error string capitalization
+        - "-ST1000"     # don't enforce package comments
+        - "-SA1029"     # don't enforce string literal rules
+        - "-QF1003"     # don't enforce if/else to switch statements
+        - "-ST1003"     # don't enforce capitalized acronyms
+        - "-ST1021"
+        - "-ST1020"
+    gocyclo:
+      min-complexity: 35
+
+formatters:
+  enable:
+    - gofmt
+    - goimports

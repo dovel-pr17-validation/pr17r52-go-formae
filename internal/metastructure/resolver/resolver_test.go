@@ -1,0 +1,1805 @@
+// © 2025 Platform Engineering Labs Inc.
+//
+// SPDX-License-Identifier: FSL-1.1-ALv2
+
+//go:build unit
+
+package resolver
+
+import (
+	"encoding/json"
+	"fmt"
+	"testing"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	"github.com/tidwall/gjson"
+
+	"github.com/platform-engineering-labs/formae/internal/metastructure/util"
+	pkgmodel "github.com/platform-engineering-labs/formae/pkg/model"
+)
+
+func TestExtractResolvableRefs_ReturnsTargetPathsForEachRef(t *testing.T) {
+	props := json.RawMessage(`{
+		"Cluster": {"$ref": "formae://CL#/Arn", "$value": "arn-cluster"},
+		"LoadBalancers": [
+			{"TargetGroupArn": {"$ref": "formae://LN#/DefaultActions.0.TargetGroupArn", "$value": "arn-tg"}}
+		],
+		"Name": "static"
+	}`)
+	res := pkgmodel.Resource{Properties: props}
+
+	refs := ExtractResolvableRefs(res)
+
+	// Build an easy-to-assert map of TargetPath → ResourceURI.
+	got := map[string]pkgmodel.FormaeURI{}
+	for _, r := range refs {
+		got[r.TargetPath] = r.URI
+	}
+	if got["Cluster"] != "formae://CL" {
+		t.Errorf("Cluster: got %q", got["Cluster"])
+	}
+	if got["LoadBalancers.0.TargetGroupArn"] != "formae://LN" {
+		t.Errorf("LoadBalancers.0.TargetGroupArn: got %q", got["LoadBalancers.0.TargetGroupArn"])
+	}
+	if len(refs) != 2 {
+		t.Errorf("expected 2 refs, got %d: %+v", len(refs), refs)
+	}
+}
+
+func TestResolvePropertyReferences(t *testing.T) {
+	t.Run("resolves basic reference", func(t *testing.T) {
+		vpcRef := newTestRef("VpcId")
+		properties := fmt.Appendf(nil, `{
+			"VpcId": {
+				"$ref": "%s"
+			}
+		}`, vpcRef)
+
+		resolved, err := ResolvePropertyReferences(
+			pkgmodel.FormaeURI(vpcRef),
+			properties,
+			`{"VpcId": "vpc-123456"}`,
+		)
+
+		require.NoError(t, err)
+
+		result := gjson.Parse(string(resolved))
+		assert.Equal(t, "vpc-123456", result.Get("VpcId.$value").String())
+		assert.Equal(t, vpcRef, result.Get("VpcId.$ref").String())
+	})
+
+	t.Run("preserves strategy and visibility", func(t *testing.T) {
+		secretRef := newTestRef("Arn")
+		properties := fmt.Appendf(nil, `{
+			"SecretArn": {
+				"$ref": "%s",
+				"$strategy": "SetOnce",
+				"$visibility": "opaque"
+			}
+		}`, secretRef)
+
+		resolved, err := ResolvePropertyReferences(
+			pkgmodel.FormaeURI(secretRef),
+			properties,
+			`{"Arn": "arn:aws:secretsmanager:us-east-1:123456789012:secret:MySecret"}`,
+		)
+
+		require.NoError(t, err)
+
+		result := gjson.Parse(string(resolved))
+		assert.Equal(t, "arn:aws:secretsmanager:us-east-1:123456789012:secret:MySecret", result.Get("SecretArn.$value").String())
+		assert.Equal(t, "SetOnce", result.Get("SecretArn.$strategy").String())
+		assert.Equal(t, "opaque", result.Get("SecretArn.$visibility").String())
+	})
+
+	t.Run("extracts property from complex resolved value", func(t *testing.T) {
+		bucketRef := newTestRef("Arn")
+		properties := fmt.Appendf(nil, `{
+			"BucketArn": {
+				"$ref": "%s"
+			}
+		}`, bucketRef)
+
+		resolved, err := ResolvePropertyReferences(
+			pkgmodel.FormaeURI(bucketRef),
+			properties,
+			`{"Arn": "arn:aws:s3:::my-bucket", "Name": "my-bucket", "Region": "us-east-1"}`,
+		)
+
+		require.NoError(t, err)
+
+		result := gjson.Parse(string(resolved))
+		assert.Equal(t, "arn:aws:s3:::my-bucket", result.Get("BucketArn.$value").String())
+	})
+
+	t.Run("returns error for missing reference", func(t *testing.T) {
+		vpcRef := newTestRef("VpcId")
+		nonExistentRef := newTestRef("VpcId") // Different KSUID for same property
+
+		properties := fmt.Appendf(nil, `{
+			"VpcId": {
+				"$ref": "%s"
+			}
+		}`, vpcRef)
+
+		// Try to resolve with a different KSUID that doesn't exist in properties
+		_, err := ResolvePropertyReferences(
+			pkgmodel.FormaeURI(nonExistentRef),
+			properties,
+			`{"VpcId": "vpc-123456"}`,
+		)
+
+		assert.Error(t, err)
+		assert.Contains(t, err.Error(), fmt.Sprintf("failed to set property value for %s", nonExistentRef))
+	})
+
+	t.Run("resolves only targeted reference among multiple", func(t *testing.T) {
+		vpcRef := newTestRef("VpcId")
+		subnetRef := newTestRef("SubnetId")
+		properties := fmt.Appendf(nil, `{
+			"VpcId": {
+				"$ref": "%s"
+			},
+			"SubnetId": {
+				"$ref": "%s"
+			}
+		}`, vpcRef, subnetRef)
+
+		resolved, err := ResolvePropertyReferences(
+			pkgmodel.FormaeURI(vpcRef),
+			properties,
+			`{"VpcId": "vpc-123456"}`,
+		)
+
+		require.NoError(t, err)
+
+		result := gjson.Parse(string(resolved))
+		assert.Equal(t, "vpc-123456", result.Get("VpcId.$value").String())
+		assert.False(t, result.Get("SubnetId.$value").Exists())
+		assert.Equal(t, subnetRef, result.Get("SubnetId.$ref").String())
+	})
+
+	t.Run("handles malformed JSON input", func(t *testing.T) {
+		properties := fmt.Appendf(nil, `{"VpcId": {invalid json}`)
+
+		_, err := ResolvePropertyReferences(
+			"formae://vpc.ec2.aws/stack/vpc-1#/VpcId",
+			properties,
+			`{"VpcId": "vpc-123456"}`,
+		)
+
+		assert.Error(t, err)
+	})
+
+	t.Run("handles null value", func(t *testing.T) {
+		properties := json.RawMessage(`{
+			"VpcId": {
+				"$ref": "formae://vpc.ec2.aws/stack/vpc-1#/VpcId"
+			}
+		}`)
+
+		resolved, err := ResolvePropertyReferences(
+			"formae://vpc.ec2.aws/stack/vpc-1#/VpcId",
+			properties,
+			`{"VpcId": null}`,
+		)
+
+		require.NoError(t, err)
+
+		// null values should be set, but the value should be null
+		result := gjson.Parse(string(resolved))
+		if result.Get("VpcId.$value").Exists() {
+			assert.Nil(t, result.Get("VpcId.$value").Value())
+		}
+
+		// the reference should still be preserved
+		assert.Equal(t, "formae://vpc.ec2.aws/stack/vpc-1#/VpcId", result.Get("VpcId.$ref").String())
+	})
+
+	t.Run("handles boolean values", func(t *testing.T) {
+		enabledRef := newTestRef("Enabled")
+		properties := fmt.Appendf(nil, `{
+			"Enabled": {
+				"$ref": "%s"
+			}
+		}`, enabledRef)
+
+		resolved, err := ResolvePropertyReferences(
+			pkgmodel.FormaeURI(enabledRef),
+			properties,
+			`{"Enabled": true}`,
+		)
+
+		require.NoError(t, err)
+
+		result := gjson.Parse(string(resolved))
+		assert.True(t, result.Get("Enabled.$value").Bool())
+	})
+
+	t.Run("handles numeric values", func(t *testing.T) {
+		portRef := newTestRef("Port")
+		properties := fmt.Appendf(nil, `{
+			"Port": {
+				"$ref": "%s"
+			}
+		}`, portRef)
+
+		resolved, err := ResolvePropertyReferences(
+			pkgmodel.FormaeURI(portRef),
+			properties,
+			`{"Port": 8080}`,
+		)
+
+		require.NoError(t, err)
+
+		result := gjson.Parse(string(resolved))
+		assert.Equal(t, int64(8080), result.Get("Port.$value").Int())
+	})
+
+	t.Run("resolves JSON object value without double-encoding", func(t *testing.T) {
+		// When a resource property is a JSON object (like an endpoints mapping),
+		// the resolved $value should be a proper JSON object, not a double-encoded string.
+		endpointsRef := newTestRef("Endpoints")
+		properties := fmt.Appendf(nil, `{
+			"Endpoints": {
+				"$ref": "%s"
+			}
+		}`, endpointsRef)
+
+		// The ResolveCache extracts the property value first (gjson.Get + .String()),
+		// so the resolved value IS the object itself, not wrapped in {"Endpoints": ...}.
+		resolved, err := ResolvePropertyReferences(
+			pkgmodel.FormaeURI(endpointsRef),
+			properties,
+			`{"grafana": "http://localhost:3000", "prometheus": "http://localhost:9090"}`,
+		)
+
+		require.NoError(t, err)
+
+		result := gjson.Parse(string(resolved))
+		// $value should be a proper JSON object, not a string
+		endpointsValue := result.Get("Endpoints.$value")
+		assert.True(t, endpointsValue.IsObject(), "resolved $value should be a JSON object, got: %s", endpointsValue.Raw)
+		assert.Equal(t, "http://localhost:3000", endpointsValue.Get("grafana").String())
+		assert.Equal(t, "http://localhost:9090", endpointsValue.Get("prometheus").String())
+
+		// After conversion to plugin format, the object should be preserved
+		pluginFormat, err := ConvertToPluginFormat(resolved)
+		require.NoError(t, err)
+
+		pluginResult := gjson.Parse(string(pluginFormat))
+		assert.True(t, pluginResult.Get("Endpoints").IsObject(), "plugin format should preserve object structure")
+		assert.Equal(t, "http://localhost:3000", pluginResult.Get("Endpoints.grafana").String())
+		assert.Equal(t, "http://localhost:9090", pluginResult.Get("Endpoints.prometheus").String())
+	})
+
+	t.Run("handles deeply nested objects", func(t *testing.T) {
+		dbEndpointRef := newTestRef("Endpoint")
+		properties := fmt.Appendf(nil, `{
+			"Config": {
+				"Database": {
+					"Host": {
+						"$ref": "%s"
+					}
+				}
+			}
+		}`, dbEndpointRef)
+
+		resolved, err := ResolvePropertyReferences(
+			pkgmodel.FormaeURI(dbEndpointRef),
+			properties,
+			`{"Endpoint": "db.example.com"}`,
+		)
+
+		require.NoError(t, err)
+
+		result := gjson.Parse(string(resolved))
+		assert.Equal(t, "db.example.com", result.Get("Config.Database.Host.$value").String())
+	})
+
+	t.Run("handles partial resolution scenarios", func(t *testing.T) {
+		// Test that some references can be resolved while others remain unresolved
+		vpcRef := newTestRef("VpcId")
+		sgRef := newTestRef("GroupId")
+		subnetRef := newTestRef("SubnetId")
+		properties := fmt.Appendf(nil, `{
+			"VpcId": {
+				"$ref": "%s",
+				"$strategy": "SetOnce"
+			},
+			"SubnetId": {
+				"$ref": "%s"
+			},
+			"SecurityGroupId": {
+				"$ref": "%s"
+			}
+		}`, vpcRef, subnetRef, sgRef)
+
+		// First, resolve only VpcId
+		resolvedOnce, err := ResolvePropertyReferences(
+			pkgmodel.FormaeURI(vpcRef),
+			properties,
+			`{"VpcId": "vpc-123456"}`)
+		require.NoError(t, err)
+
+		// Then resolve SecurityGroupId on the partially resolved properties
+		resolvedTwice, err := ResolvePropertyReferences(
+			pkgmodel.FormaeURI(sgRef),
+			resolvedOnce,
+			`{"GroupId": "sg-789012"}`)
+		require.NoError(t, err)
+
+		result := gjson.Parse(string(resolvedTwice))
+
+		// VpcId should be resolved
+		assert.Equal(t, "vpc-123456", result.Get("VpcId.$value").String())
+		assert.Equal(t, "SetOnce", result.Get("VpcId.$strategy").String())
+
+		// SecurityGroupId should be resolved
+		assert.Equal(t, "sg-789012", result.Get("SecurityGroupId.$value").String())
+
+		// SubnetId should remain unresolved
+		assert.Equal(t, subnetRef, result.Get("SubnetId.$ref").String())
+		assert.False(t, result.Get("SubnetId.$value").Exists())
+	})
+
+	t.Run("handles complex array references with proper paths", func(t *testing.T) {
+		sgHttpRef := newTestRef("GroupId")
+		sgHttpsRef := newTestRef("GroupId")
+		properties := fmt.Appendf(nil, `{
+			"SecurityGroupIngress": [
+				{
+					"FromPort": 80,
+					"IpProtocol": "tcp",
+					"SourceSecurityGroupId": {
+						"$ref": "%s",
+						"$visibility": "Clear"
+					},
+					"ToPort": 80
+				},
+				{
+					"FromPort": 443,
+					"IpProtocol": "tcp",
+					"SourceSecurityGroupId": {
+						"$ref": "%s",
+						"$visibility": "Clear"
+					},
+					"ToPort": 443
+				}
+			],
+			"VpcId": {
+				"$ref": "formae://vpc.ec2.aws/stack/vpc-1#/VpcId"
+			}
+		}`, sgHttpRef, sgHttpsRef)
+
+		// Resolve one of the array references
+		resolved, err := ResolvePropertyReferences(
+			pkgmodel.FormaeURI(sgHttpRef),
+			properties,
+			`{"GroupId": "sg-http-123"}`)
+		require.NoError(t, err)
+
+		result := gjson.Parse(string(resolved))
+
+		// First array element should be resolved
+		assert.Equal(t, "sg-http-123", result.Get("SecurityGroupIngress.0.SourceSecurityGroupId.$value").String())
+		assert.Equal(t, "Clear", result.Get("SecurityGroupIngress.0.SourceSecurityGroupId.$visibility").String())
+
+		// Second array element should remain unresolved
+		assert.Equal(t, sgHttpsRef, result.Get("SecurityGroupIngress.1.SourceSecurityGroupId.$ref").String())
+		assert.False(t, result.Get("SecurityGroupIngress.1.SourceSecurityGroupId.$value").Exists())
+
+		// VpcId should remain unresolved
+		assert.Equal(t, "formae://vpc.ec2.aws/stack/vpc-1#/VpcId", result.Get("VpcId.$ref").String())
+		assert.False(t, result.Get("VpcId.$value").Exists())
+
+		// Static properties should be unchanged
+		assert.Equal(t, int64(80), result.Get("SecurityGroupIngress.0.FromPort").Int())
+		assert.Equal(t, int64(443), result.Get("SecurityGroupIngress.1.FromPort").Int())
+	})
+}
+
+func TestConvertToPluginFormat(t *testing.T) {
+	t.Run("converts properly resolved references (object usage)", func(t *testing.T) {
+		vpcRef := newTestRef("VpcObject")
+		properties := fmt.Appendf(nil, `{
+			"VpcObject": {
+				"$ref": "%s",
+				"$value": {"VpcId": "vpc-123456", "State": "available"}
+			}
+		}`, vpcRef)
+
+		result, err := ConvertToPluginFormat(properties)
+
+		require.NoError(t, err)
+
+		parsed := gjson.Parse(string(result))
+		assert.JSONEq(t, `{"VpcId": "vpc-123456", "State": "available"}`, parsed.Get("VpcObject").String())
+	})
+
+	t.Run("handles mixed properly resolved references", func(t *testing.T) {
+		vpcRef := newTestRef("VpcObject")
+		subnetRef := newTestRef("SubnetObject")
+		properties := fmt.Appendf(nil, `{
+			"VpcObject": {
+				"$ref": "%s",
+				"$value": {"VpcId": "vpc-123456", "State": "available"}
+			},
+			"SubnetObject": {
+				"$ref": "%s", 
+				"$value": {"SubnetId": "subnet-789012", "AvailabilityZone": "us-east-1a"}
+			},
+			"BucketName": {
+				"$value": "my-bucket"
+			},
+			"Region": "us-east-1"
+		}`, vpcRef, subnetRef)
+
+		result, err := ConvertToPluginFormat(properties)
+
+		require.NoError(t, err)
+
+		parsed := gjson.Parse(string(result))
+
+		vpcGot := parsed.Get("VpcObject").Raw
+		subnetGot := parsed.Get("SubnetObject").Raw
+
+		assert.JSONEq(t, `{"VpcId": "vpc-123456", "State": "available"}`, vpcGot)
+		assert.JSONEq(t, `{"SubnetId": "subnet-789012", "AvailabilityZone": "us-east-1a"}`, subnetGot)
+		assert.Equal(t, "my-bucket", parsed.Get("BucketName").String())
+		assert.Equal(t, "us-east-1", parsed.Get("Region").String())
+	})
+
+	t.Run("converts resolved references to plain values", func(t *testing.T) {
+		vpcRef := newTestRef("VpcId")
+		properties := fmt.Appendf(nil, `{
+			"VpcId": {
+				"$ref": "%s",
+				"$value": "vpc-123456"
+			}
+		}`, vpcRef)
+
+		result, err := ConvertToPluginFormat(properties)
+
+		require.NoError(t, err)
+
+		parsed := gjson.Parse(string(result))
+		assert.Equal(t, "vpc-123456", parsed.Get("VpcId").String())
+	})
+
+	t.Run("converts value objects to plain values", func(t *testing.T) {
+		properties := json.RawMessage(`{
+			"BucketName": {
+				"$value": "my-bucket"
+			}
+		}`)
+
+		result, err := ConvertToPluginFormat(properties)
+
+		require.NoError(t, err)
+
+		parsed := gjson.Parse(string(result))
+		assert.Equal(t, "my-bucket", parsed.Get("BucketName").String())
+	})
+
+	t.Run("handles mixed references, values, and static data", func(t *testing.T) {
+		vpcRef := newTestRef("VpcId")
+		properties := fmt.Appendf(nil, `{
+			"VpcId": {
+				"$ref": "%s",
+				"$value": "vpc-123456"
+			},
+			"BucketName": {
+				"$value": "my-bucket"
+			},
+			"Region": "us-east-1",
+			"Port": 8080
+		}`, vpcRef)
+
+		result, err := ConvertToPluginFormat(properties)
+
+		require.NoError(t, err)
+
+		parsed := gjson.Parse(string(result))
+		assert.Equal(t, "vpc-123456", parsed.Get("VpcId").String())
+		assert.Equal(t, "my-bucket", parsed.Get("BucketName").String())
+		assert.Equal(t, "us-east-1", parsed.Get("Region").String())
+		assert.Equal(t, int64(8080), parsed.Get("Port").Int())
+	})
+
+	t.Run("handles arrays with mixed types", func(t *testing.T) {
+		sg1Ref := newTestRef("GroupId")
+		properties := fmt.Appendf(nil, `{
+			"SecurityGroups": [
+				{
+					"$ref": "%s",
+					"$value": "sg-123456"
+				},
+				{
+					"$value": "sg-789012"
+				},
+				"sg-static"
+			]
+		}`, sg1Ref)
+
+		result, err := ConvertToPluginFormat(properties)
+
+		require.NoError(t, err)
+
+		parsed := gjson.Parse(string(result))
+		sgs := parsed.Get("SecurityGroups").Array()
+		assert.Len(t, sgs, 3)
+		assert.Equal(t, "sg-123456", sgs[0].String())
+		assert.Equal(t, "sg-789012", sgs[1].String())
+		assert.Equal(t, "sg-static", sgs[2].String())
+	})
+
+	t.Run("preserves unresolved references", func(t *testing.T) {
+		vpcRef := newTestRef("VpcId")
+		properties := fmt.Appendf(nil, `{
+			"VpcId": {
+				"$ref": "%s"
+			}
+		}`, vpcRef)
+
+		result, err := ConvertToPluginFormat(properties)
+
+		require.NoError(t, err)
+
+		parsed := gjson.Parse(string(result))
+		assert.Equal(t, vpcRef, parsed.Get("VpcId.$ref").String())
+		assert.False(t, parsed.Get("VpcId.$value").Exists())
+	})
+
+	t.Run("handles various data types", func(t *testing.T) {
+		properties := json.RawMessage(`{
+			"StringVal": { "$value": "hello" },
+			"IntVal": { "$value": 42 },
+			"FloatVal": { "$value": 3.14 },
+			"BoolVal": { "$value": true },
+			"NullVal": { "$value": null },
+			"ArrayVal": { "$value": [1, 2, 3] },
+			"ObjectVal": { "$value": {"nested": "object"} }
+		}`)
+
+		result, err := ConvertToPluginFormat(properties)
+
+		require.NoError(t, err)
+
+		parsed := gjson.Parse(string(result))
+		assert.Equal(t, "hello", parsed.Get("StringVal").String())
+		assert.Equal(t, int64(42), parsed.Get("IntVal").Int())
+		assert.Equal(t, 3.14, parsed.Get("FloatVal").Float())
+		assert.True(t, parsed.Get("BoolVal").Bool())
+		assert.True(t, parsed.Get("NullVal").Exists())
+		assert.Len(t, parsed.Get("ArrayVal").Array(), 3)
+		assert.Equal(t, "object", parsed.Get("ObjectVal.nested").String())
+	})
+
+	t.Run("handles partially resolved properties", func(t *testing.T) {
+		resolvedRef := newTestRef("ResolvedRef")
+		unresolvedRef := newTestRef("UnresolvedRef")
+		properties := fmt.Appendf(nil, `{
+			"ResolvedRef": {
+				"$ref": "%s",
+				"$value": "vpc-123456"
+			},
+			"UnresolvedRef": {
+				"$ref": "%s"
+			},
+			"PlainValue": "static-value"
+		}`, resolvedRef, unresolvedRef)
+
+		result, err := ConvertToPluginFormat(properties)
+
+		require.NoError(t, err)
+
+		parsed := gjson.Parse(string(result))
+		assert.Equal(t, "vpc-123456", parsed.Get("ResolvedRef").String())
+		assert.Equal(t, unresolvedRef, parsed.Get("UnresolvedRef.$ref").String())
+		assert.Equal(t, "static-value", parsed.Get("PlainValue").String())
+	})
+
+	t.Run("handles complex nested array structures", func(t *testing.T) {
+		vpcRef := newTestRef("VpcId")
+		properties := fmt.Appendf(nil, `{
+			"ComplexArray": [
+				{
+					"Name": "item1",
+					"VpcId": {
+						"$ref": "%s",
+						"$value": "vpc-123456"
+					}
+				},
+				{
+					"Name": "item2",
+					"SubnetIds": [
+						{
+							"$value": "subnet-123"
+						},
+						"subnet-static"
+					]
+				}
+			]
+		}`, vpcRef)
+
+		result, err := ConvertToPluginFormat(properties)
+
+		require.NoError(t, err)
+
+		parsed := gjson.Parse(string(result))
+		array := parsed.Get("ComplexArray").Array()
+		assert.Len(t, array, 2)
+		assert.Equal(t, "item1", array[0].Get("Name").String())
+		assert.Equal(t, "vpc-123456", array[0].Get("VpcId").String())
+		assert.Equal(t, "item2", array[1].Get("Name").String())
+		assert.Equal(t, "subnet-123", array[1].Get("SubnetIds.0").String())
+		assert.Equal(t, "subnet-static", array[1].Get("SubnetIds.1").String())
+	})
+
+	t.Run("converts opaque references to raw values for cloud provider compatibility", func(t *testing.T) {
+		secretValueRef := newTestRef("SecretString")
+		clearValueRef := newTestRef("VpcId")
+		properties := fmt.Appendf(nil, `{
+			"SecretValue": {
+				"$ref": "%s",
+				"$value": "my-secret-password",
+				"$visibility": "Opaque"
+			},
+			"ClearValue": {
+				"$ref": "%s",
+				"$value": "vpc-123456"
+			}
+		}`, secretValueRef, clearValueRef)
+
+		result, err := ConvertToPluginFormat(properties)
+
+		require.NoError(t, err)
+
+		parsed := gjson.Parse(string(result))
+
+		assert.Equal(t, "my-secret-password", parsed.Get("SecretValue").String())
+		assert.Equal(t, "vpc-123456", parsed.Get("ClearValue").String())
+
+		// Stripped metadata
+		assert.False(t, parsed.Get("SecretValue.$visibility").Exists())
+	})
+
+	t.Run("handles empty properties gracefully", func(t *testing.T) {
+		properties := json.RawMessage(`{}`)
+
+		result, err := ConvertToPluginFormat(properties)
+
+		require.NoError(t, err)
+		assert.JSONEq(t, `{}`, string(result))
+	})
+
+	t.Run("converts inherited opaque references correctly in plugin format", func(t *testing.T) {
+		masterUserPasswordRef := newTestRef("SecretString")
+		properties := fmt.Appendf(nil, `{
+			"MasterUserPassword": {
+				"$ref": "%s",
+				"$value": "super-secret-password",
+				"$visibility": "Opaque"
+			},
+			"DatabaseName": {
+				"$value": "my-database"
+			}
+		}`, masterUserPasswordRef)
+
+		result, err := ConvertToPluginFormat(properties)
+
+		require.NoError(t, err)
+
+		parsed := gjson.Parse(string(result))
+
+		assert.Equal(t, "super-secret-password", parsed.Get("MasterUserPassword").String())
+		assert.Equal(t, "my-database", parsed.Get("DatabaseName").String())
+
+		assert.False(t, parsed.Get("MasterUserPassword.$visibility").Exists())
+		assert.False(t, parsed.Get("MasterUserPassword.$ref").Exists())
+	})
+}
+
+func TestExtractResolvableURIs(t *testing.T) {
+	t.Run("extracts basic references", func(t *testing.T) {
+		vpcRef := newTestRef("VpcId")
+		subnetRef := newTestRef("SubnetId")
+		resource := pkgmodel.Resource{
+			Properties: fmt.Appendf(nil, `{
+				"VpcId": {
+					"$ref": "%s"
+				},
+				"SubnetId": {
+					"$ref": "%s"
+				}
+			}`, vpcRef, subnetRef),
+		}
+
+		uris := ExtractResolvableURIs(resource)
+
+		assert.Len(t, uris, 2)
+		assert.Contains(t, uris, pkgmodel.FormaeURI(vpcRef))
+		assert.Contains(t, uris, pkgmodel.FormaeURI(subnetRef))
+	})
+
+	t.Run("extracts references from nested objects", func(t *testing.T) {
+		dbEndpointRef := newTestRef("Endpoint")
+		resource := pkgmodel.Resource{
+			Properties: fmt.Appendf(nil, `{
+				"Config": {
+					"Database": {
+						"Host": {
+							"$ref": "%s"
+						}
+					}
+				}
+			}`, dbEndpointRef),
+		}
+
+		uris := ExtractResolvableURIs(resource)
+
+		assert.Len(t, uris, 1)
+		assert.Contains(t, uris, pkgmodel.FormaeURI(dbEndpointRef))
+	})
+
+	t.Run("extracts references from arrays", func(t *testing.T) {
+		sg1Ref := newTestRef("GroupId")
+		sg2Ref := newTestRef("GroupId")
+		resource := pkgmodel.Resource{
+			Properties: fmt.Appendf(nil, `{
+				"SecurityGroups": [
+					{
+						"$ref": "%s"
+					},
+					{
+						"$ref": "%s"
+					}
+				]
+			}`, sg1Ref, sg2Ref),
+		}
+
+		uris := ExtractResolvableURIs(resource)
+
+		assert.Len(t, uris, 2)
+		assert.Contains(t, uris, pkgmodel.FormaeURI(sg1Ref))
+		assert.Contains(t, uris, pkgmodel.FormaeURI(sg2Ref))
+	})
+
+	t.Run("extracts ALL references including resolved ones", func(t *testing.T) {
+		vpcRef := newTestRef("VpcId")
+		resource := pkgmodel.Resource{
+			Properties: fmt.Appendf(nil, `{
+				"VpcId": {
+					"$ref": "%s",
+					"$value": "vpc-123456"
+				}
+			}`, vpcRef),
+		}
+
+		uris := ExtractResolvableURIs(resource)
+
+		assert.Len(t, uris, 1)
+		assert.Contains(t, uris, pkgmodel.FormaeURI(vpcRef))
+	})
+
+	t.Run("ignores non-reference properties", func(t *testing.T) {
+		resource := pkgmodel.Resource{
+			Properties: json.RawMessage(`{
+				"StaticValue": "hello",
+				"ValueObject": {
+					"$value": "world"
+				},
+				"RegularObject": {
+					"nested": "data"
+				}
+			}`),
+		}
+
+		uris := ExtractResolvableURIs(resource)
+
+		assert.Empty(t, uris)
+	})
+
+	t.Run("returns empty slice for no resolvable URIs", func(t *testing.T) {
+		resource := pkgmodel.Resource{
+			Properties: json.RawMessage(`{
+				"StaticValue": "hello",
+				"Number": 42
+			}`),
+		}
+
+		uris := ExtractResolvableURIs(resource)
+
+		assert.Empty(t, uris)
+		assert.NotNil(t, uris) // Should be empty slice, not nil
+	})
+
+	t.Run("handles malformed resource properties", func(t *testing.T) {
+		resource := pkgmodel.Resource{
+			Properties: json.RawMessage(`{invalid json}`),
+		}
+
+		uris := ExtractResolvableURIs(resource)
+
+		assert.Empty(t, uris)
+	})
+
+	t.Run("extracts all reference types in same resource", func(t *testing.T) {
+		unresolvedRef := newTestRef("UnresolvedRef")
+		resolvedRef := newTestRef("ResolvedRef")
+		resource := pkgmodel.Resource{
+			Properties: fmt.Appendf(nil, `{
+				"UnresolvedRef": {
+					"$ref": "%s"
+				},
+				"ResolvedRef": {
+					"$ref": "%s",
+					"$value": "subnet-123456"
+				},
+				"ValueOnly": {
+					"$value": "some-value"
+				},
+				"Static": "static-value"
+			}`, unresolvedRef, resolvedRef),
+		}
+
+		uris := ExtractResolvableURIs(resource)
+
+		assert.Len(t, uris, 2) // both refs, not just unresolved
+		assert.Contains(t, uris, pkgmodel.FormaeURI(unresolvedRef))
+		assert.Contains(t, uris, pkgmodel.FormaeURI(resolvedRef))
+	})
+
+	t.Run("handles deeply nested complex structures", func(t *testing.T) {
+		deepRef := newTestRef("DeepProperty")
+		resource := pkgmodel.Resource{
+			Properties: fmt.Appendf(nil, `{
+				"Level1": {
+					"Level2": {
+						"Level3": [
+							{
+								"RefInArray": {
+									"$ref": "%s"
+								}
+							}
+						]
+					}
+				}
+			}`, deepRef),
+		}
+
+		uris := ExtractResolvableURIs(resource)
+
+		assert.Len(t, uris, 1)
+		assert.Contains(t, uris, pkgmodel.FormaeURI(deepRef))
+	})
+
+	t.Run("handles empty properties", func(t *testing.T) {
+		resource := pkgmodel.Resource{
+			Properties: json.RawMessage(`{}`),
+		}
+
+		uris := ExtractResolvableURIs(resource)
+
+		assert.Empty(t, uris)
+	})
+
+	t.Run("extracts references from complex array structures", func(t *testing.T) {
+		// Test that ExtractResolvableURIs finds all references in complex nested arrays
+		sgHttpRef := newTestRef("GroupId")
+		sgHttpsRef := newTestRef("GroupId")
+		subnet1Ref := newTestRef("SubnetId")
+		subnet2Ref := newTestRef("SubnetId")
+		vpcRef := newTestRef("VpcId")
+		resource := pkgmodel.Resource{
+			Properties: fmt.Appendf(nil, `{
+				"SecurityGroupIngress": [
+					{
+						"FromPort": 80,
+						"SourceSecurityGroupId": {
+							"$ref": "%s",
+							"$visibility": "Clear"
+						}
+					},
+					{
+						"FromPort": 443,
+						"SourceSecurityGroupId": {
+							"$ref": "%s",
+							"$value": "sg-existing"
+						}
+					}
+				],
+				"Subnets": [
+					{
+						"$ref": "%s"
+					},
+					{
+						"$ref": "%s"
+					}
+				],
+				"VpcId": {
+					"$ref": "%s"
+				}
+			}`, sgHttpRef, sgHttpsRef, subnet1Ref, subnet2Ref, vpcRef),
+		}
+
+		uris := ExtractResolvableURIs(resource)
+
+		// Should find all 5 references (2 in SecurityGroupIngress, 2 in Subnets, 1 VpcId)
+		assert.Len(t, uris, 5)
+		assert.Contains(t, uris, pkgmodel.FormaeURI(sgHttpRef))
+		assert.Contains(t, uris, pkgmodel.FormaeURI(sgHttpsRef))
+		assert.Contains(t, uris, pkgmodel.FormaeURI(subnet1Ref))
+		assert.Contains(t, uris, pkgmodel.FormaeURI(subnet2Ref))
+		assert.Contains(t, uris, pkgmodel.FormaeURI(vpcRef))
+	})
+}
+
+func TestExtractResolvableURIsFromJSON(t *testing.T) {
+	t.Run("extracts refs from raw JSON", func(t *testing.T) {
+		config := json.RawMessage(fmt.Sprintf(`{
+			"endpoint": {"$ref": "%s", "$strategy": "SetOnce", "$visibility": "Clear"},
+			"region": "us-east-1",
+			"nested": {
+				"cert": {"$ref": "%s"}
+			}
+		}`, newTestRef("Endpoint"), newTestRef("CertificateArn")))
+
+		uris := ExtractResolvableURIsFromJSON(config)
+
+		assert.Len(t, uris, 2)
+	})
+
+	t.Run("returns empty for no refs", func(t *testing.T) {
+		config := json.RawMessage(`{"region": "us-east-1"}`)
+		uris := ExtractResolvableURIsFromJSON(config)
+		assert.Empty(t, uris)
+	})
+
+	t.Run("returns nil for nil input", func(t *testing.T) {
+		uris := ExtractResolvableURIsFromJSON(nil)
+		assert.Nil(t, uris)
+	})
+}
+
+func TestMetadataInheritance(t *testing.T) {
+	t.Run("inherits metadata from referenced property", func(t *testing.T) {
+		secretRef := newTestRef("SecretString")
+		properties := json.RawMessage(fmt.Sprintf(`{
+			"MasterUserPassword": {
+				"$ref": "%s"
+			}
+		}`, secretRef))
+
+		propValue := `{"$value": "super-secret-password", "$visibility": "Opaque", "$strategy": "SetOnce"}`
+
+		resolved, err := ResolvePropertyReferences(
+			pkgmodel.FormaeURI(secretRef),
+			properties,
+			propValue,
+		)
+
+		require.NoError(t, err)
+
+		result := gjson.Parse(string(resolved))
+
+		assert.Equal(t, "super-secret-password", result.Get("MasterUserPassword.$value").String())
+		assert.Equal(t, "Opaque", result.Get("MasterUserPassword.$visibility").String())
+		assert.Equal(t, "SetOnce", result.Get("MasterUserPassword.$strategy").String())
+		assert.Equal(t, secretRef, result.Get("MasterUserPassword.$ref").String())
+	})
+
+	t.Run("handles simple string values without metadata", func(t *testing.T) {
+		vpcRef := newTestRef("VpcId")
+		properties := fmt.Appendf(nil, `{
+			"VpcId": {
+				"$ref": "%s"
+			}
+		}`, vpcRef)
+
+		// no metadata
+		simpleValue := "vpc-123456"
+
+		resolved, err := ResolvePropertyReferences(
+			pkgmodel.FormaeURI(vpcRef),
+			properties,
+			simpleValue,
+		)
+
+		require.NoError(t, err)
+
+		result := gjson.Parse(string(resolved))
+
+		assert.Equal(t, "vpc-123456", result.Get("VpcId.$value").String())
+		assert.False(t, result.Get("VpcId.$visibility").Exists())
+		assert.False(t, result.Get("VpcId.$strategy").Exists())
+	})
+
+	t.Run("inherits only available metadata fields", func(t *testing.T) {
+		secretRef := newTestRef("SecretString")
+		properties := fmt.Appendf(nil, `{
+			"DatabasePassword": {
+				"$ref": "%s"
+			}
+		}`, secretRef)
+
+		partialMetadata := `{"$value": "my-password", "$visibility": "Opaque"}`
+
+		resolved, err := ResolvePropertyReferences(
+			pkgmodel.FormaeURI(secretRef),
+			properties,
+			partialMetadata,
+		)
+
+		require.NoError(t, err)
+
+		result := gjson.Parse(string(resolved))
+
+		assert.Equal(t, "my-password", result.Get("DatabasePassword.$value").String())
+		assert.Equal(t, "Opaque", result.Get("DatabasePassword.$visibility").String())
+
+		// Should not set strategy when not provided
+		assert.False(t, result.Get("DatabasePassword.$strategy").Exists())
+	})
+}
+
+func TestResolveMultiplePropertiesSameResolverInstance(t *testing.T) {
+	restApiIdRef := newTestRef("RestApiId")
+	parentIdRef := newTestRef("RootResourceId")
+	properties := fmt.Appendf(nil, `{
+		"RestApiId": {
+			"$ref": "%s",
+			"$visibility": "Clear"
+		},
+		"ParentId": {
+			"$ref": "%s",
+			"$visibility": "Clear"
+		}
+	}`, restApiIdRef, parentIdRef)
+	resolver := newPropertyResolver(properties)
+
+	err := resolver.setRefValue(
+		pkgmodel.FormaeURI(restApiIdRef),
+		`{"RestApiId": "fhu1gfgwhc", "RootResourceId": "7c5bfje8c3"}`,
+	)
+	require.NoError(t, err)
+
+	err = resolver.setRefValue(
+		pkgmodel.FormaeURI(parentIdRef),
+		`{"RestApiId": "fhu1gfgwhc", "RootResourceId": "7c5bfje8c3"}`,
+	)
+	require.NoError(t, err)
+
+	resolved, err := resolver.resolveReferences(properties)
+	require.NoError(t, err)
+
+	result := gjson.Parse(string(resolved))
+
+	restApiValue := result.Get("RestApiId.$value").String()
+	parentIdValue := result.Get("ParentId.$value").String()
+
+	assert.Equal(t, "fhu1gfgwhc", restApiValue)
+	assert.Equal(t, "7c5bfje8c3", parentIdValue)
+}
+
+// formaToResourcesMap converts a Forma to the map[string][]*Resource format
+func formaToResourcesMap(forma *pkgmodel.Forma) map[string][]*pkgmodel.Resource {
+	result := make(map[string][]*pkgmodel.Resource)
+	for _, r := range forma.Resources {
+		res := r // copy to get stable pointer
+		result[r.Stack] = append(result[r.Stack], &res)
+	}
+	return result
+}
+
+func TestLoadResolvablePropertiesFromStacks(t *testing.T) {
+	t.Run("extracts plain property value", func(t *testing.T) {
+		vpcKsuid := util.NewID()
+		subnetKsuid := util.NewID()
+
+		vpc := pkgmodel.Resource{
+			Ksuid:              vpcKsuid,
+			Label:              "vpc",
+			ReadOnlyProperties: json.RawMessage(`{"VpcId": "vpc-123456"}`),
+		}
+
+		subnet := pkgmodel.Resource{
+			Ksuid: subnetKsuid,
+			Label: "subnet",
+			Properties: json.RawMessage(fmt.Sprintf(`{
+				"VpcId": {
+					"$ref": "formae://%s#/VpcId"
+				}
+			}`, vpcKsuid)),
+		}
+
+		forma := &pkgmodel.Forma{
+			Resources: []pkgmodel.Resource{vpc, subnet},
+		}
+
+		resolvables, err := LoadResolvablePropertiesFromStacks(subnet, formaToResourcesMap(forma), nil, nil)
+
+		require.NoError(t, err)
+		value, found := resolvables.Get(vpcKsuid, "VpcId")
+		assert.True(t, found)
+		assert.Equal(t, "vpc-123456", value)
+	})
+
+	t.Run("extracts $value from nested $ref object", func(t *testing.T) {
+		compartmentKsuid := util.NewID()
+		vcnKsuid := util.NewID()
+		subnetKsuid := util.NewID()
+
+		compartment := pkgmodel.Resource{
+			Ksuid:              compartmentKsuid,
+			Label:              "compartment",
+			ReadOnlyProperties: json.RawMessage(`{"Id": "ocid1.compartment.oc1..abc123"}`),
+		}
+
+		vcn := pkgmodel.Resource{
+			Ksuid: vcnKsuid,
+			Label: "vcn",
+			Properties: json.RawMessage(fmt.Sprintf(`{
+				"CompartmentId": {
+					"$ref": "formae://%s#/Id",
+					"$value": "ocid1.compartment.oc1..abc123"
+				}
+			}`, compartmentKsuid)),
+			ReadOnlyProperties: json.RawMessage(`{"Id": "ocid1.vcn.oc1..xyz789"}`),
+		}
+
+		subnet := pkgmodel.Resource{
+			Ksuid: subnetKsuid,
+			Label: "subnet",
+			Properties: json.RawMessage(fmt.Sprintf(`{
+				"CompartmentId": {
+					"$ref": "formae://%s#/CompartmentId"
+				}
+			}`, vcnKsuid)),
+		}
+
+		forma := &pkgmodel.Forma{
+			Resources: []pkgmodel.Resource{compartment, vcn, subnet},
+		}
+
+		resolvables, err := LoadResolvablePropertiesFromStacks(subnet, formaToResourcesMap(forma), nil, nil)
+
+		require.NoError(t, err)
+		value, found := resolvables.Get(vcnKsuid, "CompartmentId")
+		assert.True(t, found)
+		assert.Equal(t, "ocid1.compartment.oc1..abc123", value)
+	})
+
+	t.Run("extracts value from Properties when not in ReadOnlyProperties", func(t *testing.T) {
+		vpcKsuid := util.NewID()
+		subnetKsuid := util.NewID()
+
+		vpc := pkgmodel.Resource{
+			Ksuid:      vpcKsuid,
+			Label:      "vpc",
+			Properties: json.RawMessage(`{"CidrBlock": "10.0.0.0/16"}`),
+		}
+
+		subnet := pkgmodel.Resource{
+			Ksuid: subnetKsuid,
+			Label: "subnet",
+			Properties: json.RawMessage(fmt.Sprintf(`{
+				"VpcCidr": {
+					"$ref": "formae://%s#/CidrBlock"
+				}
+			}`, vpcKsuid)),
+		}
+
+		forma := &pkgmodel.Forma{
+			Resources: []pkgmodel.Resource{vpc, subnet},
+		}
+
+		resolvables, err := LoadResolvablePropertiesFromStacks(subnet, formaToResourcesMap(forma), nil, nil)
+
+		require.NoError(t, err)
+		value, found := resolvables.Get(vpcKsuid, "CidrBlock")
+		assert.True(t, found)
+		assert.Equal(t, "10.0.0.0/16", value)
+	})
+
+	t.Run("returns error for missing resource", func(t *testing.T) {
+		missingKsuid := util.NewID()
+		subnetKsuid := util.NewID()
+
+		subnet := pkgmodel.Resource{
+			Ksuid: subnetKsuid,
+			Label: "subnet",
+			Properties: json.RawMessage(fmt.Sprintf(`{
+				"VpcId": {
+					"$ref": "formae://%s#/VpcId"
+				}
+			}`, missingKsuid)),
+		}
+
+		forma := &pkgmodel.Forma{
+			Resources: []pkgmodel.Resource{subnet},
+		}
+
+		_, err := LoadResolvablePropertiesFromStacks(subnet, formaToResourcesMap(forma), nil, nil)
+
+		assert.Error(t, err)
+		assert.Contains(t, err.Error(), "not found")
+	})
+
+	t.Run("skips missing property for late-binding resolution", func(t *testing.T) {
+		vpcKsuid := util.NewID()
+		subnetKsuid := util.NewID()
+
+		vpc := pkgmodel.Resource{
+			Ksuid:      vpcKsuid,
+			Label:      "vpc",
+			Properties: json.RawMessage(`{"CidrBlock": "10.0.0.0/16"}`),
+		}
+
+		subnet := pkgmodel.Resource{
+			Ksuid: subnetKsuid,
+			Label: "subnet",
+			Properties: json.RawMessage(fmt.Sprintf(`{
+				"VpcId": {
+					"$ref": "formae://%s#/NonExistentProperty"
+				}
+			}`, vpcKsuid)),
+		}
+
+		forma := &pkgmodel.Forma{
+			Resources: []pkgmodel.Resource{vpc, subnet},
+		}
+
+		props, err := LoadResolvablePropertiesFromStacks(subnet, formaToResourcesMap(forma), nil, nil)
+
+		assert.NoError(t, err)
+		// Property not resolved — will be resolved at execution time
+		_, found := props.Get(vpcKsuid, "NonExistentProperty")
+		assert.False(t, found)
+	})
+}
+
+func TestSameURIMultiplePaths(t *testing.T) {
+	t.Run("resolves at multiple array paths", func(t *testing.T) {
+		gwRef := newTestRef("GatewayId")
+		props := fmt.Appendf(nil, `{
+			"RouteRules": [
+				{
+					"Destination": "10.0.0.0/8",
+					"NetworkEntityId": { "$ref": "%s" }
+				},
+				{
+					"Destination": "172.16.0.0/12",
+					"NetworkEntityId": { "$ref": "%s" }
+				}
+			]
+		}`, gwRef, gwRef)
+
+		resolved, err := ResolvePropertyReferences(
+			pkgmodel.FormaeURI(gwRef),
+			props,
+			`{"GatewayId": "gw-123456"}`,
+		)
+
+		require.NoError(t, err)
+
+		result := gjson.Parse(string(resolved))
+		assert.Equal(t, "gw-123456", result.Get("RouteRules.0.NetworkEntityId.$value").String())
+		assert.Equal(t, "gw-123456", result.Get("RouteRules.1.NetworkEntityId.$value").String())
+	})
+
+	t.Run("resolves at multiple top-level paths", func(t *testing.T) {
+		vpcRef := newTestRef("VpcId")
+		props := fmt.Appendf(nil, `{
+			"SourceVpcId": { "$ref": "%s" },
+			"DestinationVpcId": { "$ref": "%s" }
+		}`, vpcRef, vpcRef)
+
+		resolved, err := ResolvePropertyReferences(
+			pkgmodel.FormaeURI(vpcRef),
+			props,
+			`{"VpcId": "vpc-123456"}`,
+		)
+
+		require.NoError(t, err)
+
+		result := gjson.Parse(string(resolved))
+		assert.Equal(t, "vpc-123456", result.Get("SourceVpcId.$value").String())
+		assert.Equal(t, "vpc-123456", result.Get("DestinationVpcId.$value").String())
+	})
+
+	t.Run("returns unique URIs for duplicate refs", func(t *testing.T) {
+		sharedRef := newTestRef("SharedId")
+		res := pkgmodel.Resource{
+			Properties: fmt.Appendf(nil, `{
+				"Field1": { "$ref": "%s" },
+				"Field2": { "$ref": "%s" },
+				"Field3": { "$ref": "%s" }
+			}`, sharedRef, sharedRef, sharedRef),
+		}
+
+		uris := ExtractResolvableURIs(res)
+
+		assert.Len(t, uris, 1)
+		assert.Contains(t, uris, pkgmodel.FormaeURI(sharedRef))
+	})
+
+	t.Run("converts all paths to plugin format", func(t *testing.T) {
+		sgRef := newTestRef("SecurityGroupId")
+		props := fmt.Appendf(nil, `{
+			"SecurityGroupIds": [
+				{ "$ref": "%s", "$value": "sg-123" },
+				{ "$ref": "%s", "$value": "sg-123" }
+			]
+		}`, sgRef, sgRef)
+
+		result, err := ConvertToPluginFormat(props)
+
+		require.NoError(t, err)
+
+		parsed := gjson.Parse(string(result))
+		sgs := parsed.Get("SecurityGroupIds").Array()
+		assert.Len(t, sgs, 2)
+		assert.Equal(t, "sg-123", sgs[0].String())
+		assert.Equal(t, "sg-123", sgs[1].String())
+	})
+
+	t.Run("resolves in deeply nested structures", func(t *testing.T) {
+		subnetRef := newTestRef("SubnetId")
+		props := fmt.Appendf(nil, `{
+			"Config": {
+				"Primary": { "$ref": "%s" },
+				"Failover": { "$ref": "%s" }
+			}
+		}`, subnetRef, subnetRef)
+
+		resolved, err := ResolvePropertyReferences(
+			pkgmodel.FormaeURI(subnetRef),
+			props,
+			`{"SubnetId": "subnet-abc"}`,
+		)
+
+		require.NoError(t, err)
+
+		result := gjson.Parse(string(resolved))
+		assert.Equal(t, "subnet-abc", result.Get("Config.Primary.$value").String())
+		assert.Equal(t, "subnet-abc", result.Get("Config.Failover.$value").String())
+	})
+}
+
+func TestConvertToPluginFormat_TargetConfig(t *testing.T) {
+	t.Run("strips resolvable wrappers from target config with endpoint and CA", func(t *testing.T) {
+		endpointRef := newTestRef("Endpoint")
+		caRef := newTestRef("CertificateAuthorityData")
+		nameRef := newTestRef("Name")
+
+		targetConfig := json.RawMessage(fmt.Sprintf(`{
+			"Type": "K8S",
+			"Endpoint": {
+				"$ref": "%s",
+				"$value": "https://ABC123.gr7.us-west-2.eks.amazonaws.com"
+			},
+			"CertificateAuthority": {
+				"$ref": "%s",
+				"$value": "LS0tLS1CRUdJTi..."
+			},
+			"ClusterName": {
+				"$ref": "%s",
+				"$value": "my-cluster"
+			},
+			"WaitForLoadBalancer": false
+		}`, endpointRef, caRef, nameRef))
+
+		result, err := ConvertToPluginFormat(targetConfig)
+		require.NoError(t, err)
+
+		parsed := gjson.Parse(string(result))
+		assert.Equal(t, "K8S", parsed.Get("Type").String())
+		assert.Equal(t, "https://ABC123.gr7.us-west-2.eks.amazonaws.com", parsed.Get("Endpoint").String())
+		assert.Equal(t, "LS0tLS1CRUdJTi...", parsed.Get("CertificateAuthority").String())
+		assert.Equal(t, "my-cluster", parsed.Get("ClusterName").String())
+		assert.Equal(t, false, parsed.Get("WaitForLoadBalancer").Bool())
+
+		// Verify no $ref or $value wrappers remain
+		assert.False(t, parsed.Get("Endpoint.$ref").Exists())
+		assert.False(t, parsed.Get("Endpoint.$value").Exists())
+		assert.False(t, parsed.Get("ClusterName.$ref").Exists())
+	})
+}
+
+func TestExtractResolvableRefs_EmbedField(t *testing.T) {
+	// Build a $embed field whose $template contains one framed span.
+	// The span envelope is a post-translation $ref (KSUID-based) so
+	// ExtractResolvableRefs can construct the URI exactly as for whole-value refs.
+	kvsKsuid := util.NewID()
+	envJSON := fmt.Sprintf(`{"$ref":"formae://%s#/id"}`, kvsKsuid)
+	tmpl := "cf.kvs('" + pkgmodel.FrameEnvelope(envJSON) + "')"
+	props, _ := json.Marshal(map[string]any{
+		"functionCode": map[string]any{"$embed": true, "$template": tmpl},
+	})
+	res := pkgmodel.Resource{Properties: props}
+
+	refs := ExtractResolvableRefs(res)
+
+	if len(refs) != 1 {
+		t.Fatalf("want 1 embedded ref, got %d", len(refs))
+	}
+	if refs[0].TargetPath != "functionCode" {
+		t.Errorf("TargetPath: got %q want functionCode", refs[0].TargetPath)
+	}
+
+	// Assert the Embedded flag and EmbedFieldPath are set on the internal Ref —
+	// these carry the embedded-resolvable metadata and must survive refactoring.
+	pr := newPropertyResolverFromResource(res)
+	var embedRef pkgmodel.Ref
+	found := false
+	for _, bucket := range pr.refs {
+		for _, r := range bucket {
+			if r.Embedded {
+				embedRef = r
+				found = true
+			}
+		}
+	}
+	if !found {
+		t.Fatal("no Ref with Embedded==true found in propertyResolver.refs")
+	}
+	if !embedRef.Embedded {
+		t.Errorf("Ref.Embedded: got false, want true")
+	}
+	if embedRef.EmbedFieldPath != "functionCode" {
+		t.Errorf("Ref.EmbedFieldPath: got %q, want functionCode", embedRef.EmbedFieldPath)
+	}
+}
+
+// newTestRef creates a test reference with a real KSUID for the given property
+func newTestRef(property string) string {
+	ksuid := util.NewID()
+	return fmt.Sprintf("formae://%s#/%s", ksuid, property)
+}
+
+func TestExtractPropertyValue_MapKey(t *testing.T) {
+	properties := []byte(`{"endpoints":{"lgtm:3000":"http://localhost:3000","lgtm:4318":"http://localhost:4318"}}`)
+	result := gjson.GetBytes(properties, `endpoints.lgtm\:3000`)
+	require.True(t, result.Exists())
+	assert.Equal(t, "http://localhost:3000", result.String())
+}
+
+func TestExtractPropertyValue_ListIndexField(t *testing.T) {
+	properties := []byte(`{"endpoints":[{"uri":"https://db-1.ovh.net:5432","component":"postgresql"},{"uri":"https://db-2.ovh.net:5432","component":"replica"}]}`)
+	result := gjson.GetBytes(properties, "endpoints.0.uri")
+	require.True(t, result.Exists())
+	assert.Equal(t, "https://db-1.ovh.net:5432", result.String())
+
+	result2 := gjson.GetBytes(properties, "endpoints.1.component")
+	require.True(t, result2.Exists())
+	assert.Equal(t, "replica", result2.String())
+}
+
+func TestExtractPropertyValue_EscapedDotInKey(t *testing.T) {
+	properties := []byte(`{"config":{"host.name":"example.com"}}`)
+	result := gjson.GetBytes(properties, `config.host\.name`)
+	require.True(t, result.Exists())
+	assert.Equal(t, "example.com", result.String())
+}
+
+// embedProps is a helper that builds a JSON props object with a single $embed field.
+// It uses json.Marshal so the control characters in the template are properly
+// encoded as / (valid JSON escapes) rather than \x1e/\x1f (Go-only).
+func embedProps(fieldName, tmpl string) json.RawMessage {
+	tmplJSON, err := json.Marshal(tmpl)
+	if err != nil {
+		panic(fmt.Sprintf("embedProps: json.Marshal failed: %v", err))
+	}
+	fieldJSON, err := json.Marshal(fieldName)
+	if err != nil {
+		panic(fmt.Sprintf("embedProps: json.Marshal fieldName failed: %v", err))
+	}
+	return json.RawMessage(`{` + string(fieldJSON) + `:{"$embed":true,"$template":` + string(tmplJSON) + `}}`)
+}
+
+func TestEmbed_ResolveThenPluginFormat(t *testing.T) {
+	ksuid := "abc123"
+	refEnv := `{"$ref":"formae://` + ksuid + `#/id"}`
+	tmpl := "cf.kvs('" + pkgmodel.FrameEnvelope(refEnv) + "')"
+	props := embedProps("functionCode", tmpl)
+
+	resolver := newPropertyResolver(props)
+	require.NoError(t, resolver.setRefValue(pkgmodel.FormaeURI("formae://"+ksuid+"#/id"), "KV-7H9X"))
+
+	// Persisted form: still a $embed envelope, span now carries the value.
+	resolved, err := resolver.resolveReferences(props)
+	require.NoError(t, err)
+	assert.True(t, gjson.GetBytes(resolved, "functionCode.$embed").Bool())
+
+	// Plugin form: assembled plain string.
+	plugin, err := resolver.toPluginFormat(resolved)
+	require.NoError(t, err)
+	assert.Equal(t, "cf.kvs('KV-7H9X')", gjson.GetBytes(plugin, "functionCode").String())
+}
+
+func TestEmbed_MultiResolvable(t *testing.T) {
+	ksuid1 := util.NewID()
+	ksuid2 := util.NewID()
+	refEnv1 := fmt.Sprintf(`{"$ref":"formae://%s#/id"}`, ksuid1)
+	refEnv2 := fmt.Sprintf(`{"$ref":"formae://%s#/name"}`, ksuid2)
+	// Two distinct spans in one template.
+	tmpl := "cf.kvs('" + pkgmodel.FrameEnvelope(refEnv1) + "', '" + pkgmodel.FrameEnvelope(refEnv2) + "')"
+	props := embedProps("functionCode", tmpl)
+
+	resolver := newPropertyResolver(props)
+	require.NoError(t, resolver.setRefValue(pkgmodel.FormaeURI("formae://"+ksuid1+"#/id"), "KV-7H9X"))
+	require.NoError(t, resolver.setRefValue(pkgmodel.FormaeURI("formae://"+ksuid2+"#/name"), "my-store"))
+
+	resolved, err := resolver.resolveReferences(props)
+	require.NoError(t, err)
+	// Still structured after resolution.
+	assert.True(t, gjson.GetBytes(resolved, "functionCode.$embed").Bool())
+
+	// Assembled plain string in plugin format.
+	plugin, err := resolver.toPluginFormat(resolved)
+	require.NoError(t, err)
+	assert.Equal(t, "cf.kvs('KV-7H9X', 'my-store')", gjson.GetBytes(plugin, "functionCode").String())
+}
+
+func TestEmbed_DuplicateIdenticalSpans(t *testing.T) {
+	// Same envelope (same URI) appearing twice: both spans get the same resolved value.
+	ksuid := util.NewID()
+	refEnv := fmt.Sprintf(`{"$ref":"formae://%s#/id"}`, ksuid)
+	span := pkgmodel.FrameEnvelope(refEnv)
+	tmpl := "cf.fn('" + span + "', '" + span + "')"
+	props := embedProps("code", tmpl)
+
+	resolver := newPropertyResolver(props)
+	require.NoError(t, resolver.setRefValue(pkgmodel.FormaeURI("formae://"+ksuid+"#/id"), "VAL-42"))
+
+	resolved, err := resolver.resolveReferences(props)
+	require.NoError(t, err)
+	assert.True(t, gjson.GetBytes(resolved, "code.$embed").Bool())
+
+	// After resolve, BOTH span envelopes in the $template must carry $value="VAL-42".
+	// A regression that only updated one span would leave the other without $value.
+	resolvedTmpl := gjson.GetBytes(resolved, "code.$template").String()
+	resolvedSpans, scanErr := pkgmodel.ScanEmbedSpans(resolvedTmpl)
+	require.NoError(t, scanErr)
+	require.Len(t, resolvedSpans, 2, "expected two span sites in resolved $template")
+	resolvedCount := 0
+	for _, sp := range resolvedSpans {
+		if gjson.Get(sp.EnvelopeJSON, "$value").String() == "VAL-42" {
+			resolvedCount++
+		}
+	}
+	assert.Equal(t, 2, resolvedCount,
+		"expected $value='VAL-42' to appear in both span envelopes of the resolved $template")
+
+	plugin, err := resolver.toPluginFormat(resolved)
+	require.NoError(t, err)
+	assert.Equal(t, "cf.fn('VAL-42', 'VAL-42')", gjson.GetBytes(plugin, "code").String())
+}
+
+func TestToPluginFormat_ErrorsOnHashedValue(t *testing.T) {
+	props := json.RawMessage(`{"SecretString":{"$value":"deadbeef","$visibility":"Opaque","$hashed":true}}`)
+	_, err := ConvertToPluginFormat(props) // exported entry at resolver.go:33
+	require.Error(t, err)
+	// The message must be actionable, not just internally descriptive: name the
+	// offending field, explain why the value can't be written (stored hashed, no
+	// plaintext to recover), and tell the user what to do (re-supply or accept).
+	msg := err.Error()
+	assert.Contains(t, msg, "SecretString", "names the offending secret field")
+	assert.Contains(t, msg, "hashed", "explains the value is stored hashed")
+	assert.Contains(t, msg, "re-supply", "tells the user how to proceed")
+}
+
+// TestExtractSourceOpaqueResolvableURIsFromJSON covers deriving credential-ness
+// from the SOURCE property rather than the consumer envelope, including the
+// ReadOnlyProperties fallback (a plugin may expose a generated credential there).
+func TestExtractSourceOpaqueResolvableURIsFromJSON(t *testing.T) {
+	secretKsuid := util.NewID()
+	roKsuid := util.NewID()
+	plainKsuid := util.NewID()
+
+	secretURI := pkgmodel.NewFormaeURI(secretKsuid, "SecretString")
+	roURI := pkgmodel.NewFormaeURI(roKsuid, "Token")
+	plainURI := pkgmodel.NewFormaeURI(plainKsuid, "Arn")
+
+	sources := map[string]*pkgmodel.Resource{
+		secretKsuid: {Ksuid: secretKsuid, Properties: json.RawMessage(`{"SecretString":{"$value":"h","$visibility":"Opaque","$hashed":true}}`)},
+		roKsuid:     {Ksuid: roKsuid, ReadOnlyProperties: json.RawMessage(`{"Token":{"$value":"h","$visibility":"Opaque","$hashed":true}}`)},
+		plainKsuid:  {Ksuid: plainKsuid, ReadOnlyProperties: json.RawMessage(`{"Arn":"arn:aws:iam::123:role/r"}`)},
+	}
+	load := func(ksuid string) (*pkgmodel.Resource, error) { return sources[ksuid], nil }
+
+	// A Clear .json() cred whose opaque source lives in Properties is a credential.
+	got, err := ExtractSourceOpaqueResolvableURIsFromJSON(
+		json.RawMessage(`{"password":{"$ref":"`+string(secretURI)+`","$json":"password","$visibility":"Clear"}}`), load)
+	require.NoError(t, err)
+	assert.Equal(t, []pkgmodel.FormaeURI{secretURI}, got)
+
+	// A Clear cred whose opaque source lives in ReadOnlyProperties is a credential.
+	got, err = ExtractSourceOpaqueResolvableURIsFromJSON(
+		json.RawMessage(`{"token":{"$ref":"`+string(roURI)+`","$visibility":"Clear"}}`), load)
+	require.NoError(t, err)
+	assert.Equal(t, []pkgmodel.FormaeURI{roURI}, got)
+
+	// A Clear cross-resource ref to a plain (non-opaque) source is excluded.
+	got, err = ExtractSourceOpaqueResolvableURIsFromJSON(
+		json.RawMessage(`{"roleArn":{"$ref":"`+string(plainURI)+`","$visibility":"Clear"}}`), load)
+	require.NoError(t, err)
+	assert.Empty(t, got)
+
+	// A map-shaped secret (Kubernetes-style): the opaque value is a single field
+	// `decodedData` stored as one hashed envelope, and a ref selects a key with
+	// .at("password"), so its source property path is "decodedData.password".
+	// The ref is a credential by virtue of its opaque PARENT field, even though
+	// the leaf path has no envelope of its own.
+	mapKsuid := util.NewID()
+	mapURI := pkgmodel.NewFormaeURI(mapKsuid, "decodedData.password")
+	sources[mapKsuid] = &pkgmodel.Resource{
+		Ksuid:      mapKsuid,
+		Properties: json.RawMessage(`{"decodedData":{"$value":"h","$visibility":"Opaque","$hashed":true}}`),
+	}
+	got, err = ExtractSourceOpaqueResolvableURIsFromJSON(
+		json.RawMessage(`{"password":{"$ref":"`+string(mapURI)+`","$visibility":"Clear"}}`), load)
+	require.NoError(t, err)
+	assert.Equal(t, []pkgmodel.FormaeURI{mapURI}, got)
+
+	// An envelope-Opaque ref is a credential without ever loading the source.
+	loadFail := func(string) (*pkgmodel.Resource, error) {
+		return nil, fmt.Errorf("source must not be loaded for an envelope-opaque ref")
+	}
+	got, err = ExtractSourceOpaqueResolvableURIsFromJSON(
+		json.RawMessage(`{"auth":{"$ref":"`+string(secretURI)+`","$visibility":"Opaque"}}`), loadFail)
+	require.NoError(t, err)
+	assert.Equal(t, []pkgmodel.FormaeURI{secretURI}, got)
+
+	// An unloadable (missing) source is not classified as a credential.
+	missingURI := pkgmodel.NewFormaeURI(util.NewID(), "SecretString")
+	got, err = ExtractSourceOpaqueResolvableURIsFromJSON(
+		json.RawMessage(`{"password":{"$ref":"`+string(missingURI)+`","$visibility":"Clear"}}`), load)
+	require.NoError(t, err)
+	assert.Empty(t, got)
+
+	// A schema-opaque source (FieldHint.Opaque) whose persisted value is still
+	// plain — no $hashed, no $visibility, never yet transformed at rest — is a
+	// credential by virtue of the schema/known-opaque table fallback.
+	schemaOpaqueKsuid := util.NewID()
+	schemaOpaqueURI := pkgmodel.NewFormaeURI(schemaOpaqueKsuid, "ApiKey")
+	sources[schemaOpaqueKsuid] = &pkgmodel.Resource{
+		Ksuid: schemaOpaqueKsuid,
+		Type:  "Test::SchemaOpaqueSource",
+		Schema: pkgmodel.Schema{
+			Fields: []string{"ApiKey"},
+			Hints:  map[string]pkgmodel.FieldHint{"ApiKey": {Opaque: true}},
+		},
+		Properties: json.RawMessage(`{"ApiKey":"plain-not-yet-hashed"}`),
+	}
+	got, err = ExtractSourceOpaqueResolvableURIsFromJSON(
+		json.RawMessage(`{"key":{"$ref":"`+string(schemaOpaqueURI)+`","$visibility":"Clear"}}`), load)
+	require.NoError(t, err)
+	assert.Equal(t, []pkgmodel.FormaeURI{schemaOpaqueURI}, got,
+		"a schema-declared Opaque field classifies opaque even when persisted as a plain value")
+}
+
+// An envelope's resolution provenance survives the full parse -> resolve ->
+// rebuild round trip: the resolver rebuilds envelopes from typed fields, so a
+// field it does not carry would be silently dropped.
+func TestResolvePropertyReferences_PreservesResolvedFrom(t *testing.T) {
+	digest := "v1:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+	props := json.RawMessage(`{"Password":{"$ref":"formae://2abcdefghijklmnopqrstuvwxyz#/S","$resolvedFrom":"` + digest + `"}}`)
+
+	resolved, err := ResolvePropertyReferences("formae://2abcdefghijklmnopqrstuvwxyz#/S", props, "live-value")
+	require.NoError(t, err)
+
+	out := gjson.GetBytes(resolved, "Password")
+	assert.Equal(t, "live-value", out.Get("$value").String())
+	assert.Equal(t, digest, out.Get("$resolvedFrom").String(),
+		"resolving a reference must not drop its provenance")
+}
+
+// Resolution restates the hashed marker from the value it resolved, rather than
+// inheriting whatever the target envelope happened to carry. Both directions
+// matter and they pull opposite ways: a stale true makes the terminal hashing
+// pass skip an envelope and persist plaintext labelled as a digest, while
+// clearing a true that is still accurate lets a digest past the plugin-boundary
+// guard and reach a provider as though it were the secret.
+func TestResolvePropertyReferences_HashedMarkerFollowsTheResolvedValue(t *testing.T) {
+	const uri = pkgmodel.FormaeURI("formae://2abcDEFghiJKLmnoPQRstuVWxyz#/SecretString")
+
+	// An envelope that was hashed at rest, now being re-resolved.
+	target := json.RawMessage(`{
+		"DbPassword": {
+			"$ref": "` + string(uri) + `",
+			"$value": "0000000000000000000000000000000000000000000000000000000000000000",
+			"$hashed": true,
+			"$visibility": "Opaque"
+		}
+	}`)
+
+	t.Run("live plaintext clears a stale marker", func(t *testing.T) {
+		out, err := ResolvePropertyReferences(uri, target, "live-plaintext")
+		require.NoError(t, err)
+		assert.Equal(t, "live-plaintext", gjson.GetBytes(out, "DbPassword.$value").String())
+		assert.False(t, gjson.GetBytes(out, "DbPassword.$hashed").Bool(),
+			"a live plaintext resolution must not stay marked hashed, or terminal hashing skips it")
+		assert.NoError(t, guardNoHashedValues(out),
+			"plaintext must be writable to a provider")
+	})
+
+	t.Run("a resolved digest keeps its marker so the write guard still fires", func(t *testing.T) {
+		digest := `{"$value":"1111111111111111111111111111111111111111111111111111111111111111","$hashed":true,"$visibility":"Opaque"}`
+		out, err := ResolvePropertyReferences(uri, target, digest)
+		require.NoError(t, err)
+		assert.True(t, gjson.GetBytes(out, "DbPassword.$hashed").Bool(),
+			"resolving from a stored digest must stay marked hashed")
+		assert.ErrorIs(t, guardNoHashedValues(out), ErrHashedValueNotWritable,
+			"a digest must never reach a provider as if it were the secret")
+	})
+}
+
+// A generator reference names a value to be drawn; the envelope is never that
+// value, so it must not be written to a provider. The rejection is typed and
+// names the offending path. Conversion leaves the envelope structurally
+// intact, so the guard sees the same shape whichever side of the conversion
+// it is applied on.
+func TestGuardNoUnresolvedGenerators_RejectsAnUnresolvedGeneratorReference(t *testing.T) {
+	props := json.RawMessage(`{
+		"Name": "db",
+		"SecretString": {
+			"$gen": true,
+			"$generator": "2abcDEFghiJKLmnoPQRstuVWxyz",
+			"$output": "value",
+			"$visibility": "Opaque"
+		}
+	}`)
+
+	err := GuardNoUnresolvedGenerators(props)
+	require.Error(t, err)
+	assert.ErrorIs(t, err, ErrUnresolvedGeneratorReferenceNotWritable,
+		"a generator reference must never be written to a provider in place of its value")
+	assert.Contains(t, err.Error(), "/SecretString",
+		"the rejection must name the property that is still unresolved")
+
+	converted, err := ConvertToPluginFormat(props)
+	require.NoError(t, err,
+		"planning converts the same document to diff it, and must not be refused")
+	assert.ErrorIs(t, GuardNoUnresolvedGenerators(converted), ErrUnresolvedGeneratorReferenceNotWritable,
+		"conversion leaves the envelope intact, so the guard still catches it after")
+}
+
+// The guard is scoped to generator references and must not fire on the
+// surrounding document: a plain property whose name or value merely resembles
+// the envelope's keys is still writable.
+func TestGuardNoUnresolvedGenerators_AcceptsPropertiesWithoutAGeneratorReference(t *testing.T) {
+	props := json.RawMessage(`{
+		"Name": "db",
+		"Description": "$gen",
+		"Tags": [{"Key": "gen", "Value": "true"}],
+		"SecretString": {"$value": "plaintext", "$visibility": "Opaque"}
+	}`)
+
+	out, err := ConvertToPluginFormat(props)
+	require.NoError(t, err)
+	assert.NoError(t, GuardNoUnresolvedGenerators(out))
+	assert.Equal(t, "plaintext", gjson.GetBytes(out, "SecretString").String())
+}
+
+func TestExtractResolvableURIsStableOrder(t *testing.T) {
+	props := json.RawMessage(`{"first":{"$ref":"formae://z#/name"},"second":{"$ref":"formae://a#/name"},"duplicate":{"$ref":"formae://a#/name"}}`)
+	want := []pkgmodel.FormaeURI{"formae://a#/name", "formae://z#/name"}
+	for range 64 {
+		require.Equal(t, want, ExtractResolvableURIs(pkgmodel.Resource{Properties: props}))
+		require.Equal(t, want, ExtractResolvableURIsFromJSON(props))
+	}
+}
+
+func TestExtractResolvableRefsStableOrder(t *testing.T) {
+	r := pkgmodel.Resource{Properties: json.RawMessage(`{"z":{"$ref":"formae://z#/name"},"b":{"$ref":"formae://a#/name"},"a":{"$ref":"formae://a#/name"}}`)}
+	for range 64 {
+		refs := ExtractResolvableRefs(r)
+		require.Len(t, refs, 3)
+		require.Equal(t, []string{"a", "b", "z"}, []string{refs[0].TargetPath, refs[1].TargetPath, refs[2].TargetPath})
+		require.Equal(t, []pkgmodel.FormaeURI{"formae://a", "formae://a", "formae://z"}, []pkgmodel.FormaeURI{refs[0].URI, refs[1].URI, refs[2].URI})
+	}
+}

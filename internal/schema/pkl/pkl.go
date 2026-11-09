@@ -1,0 +1,1073 @@
+// © 2025 Platform Engineering Labs Inc.
+//
+// SPDX-License-Identifier: FSL-1.1-ALv2
+
+package pkl
+
+import (
+	"context"
+	"embed"
+	"encoding/json"
+	"fmt"
+	"io/fs"
+	"log/slog"
+	"net/url"
+	"os"
+	"path/filepath"
+	"reflect"
+	"strings"
+	"time"
+
+	pklgo "github.com/apple/pkl-go/pkl"
+	formae "github.com/platform-engineering-labs/formae"
+	"github.com/platform-engineering-labs/formae/internal/schema"
+	pklmodel "github.com/platform-engineering-labs/formae/internal/schema/pkl/model"
+	pkgmodel "github.com/platform-engineering-labs/formae/pkg/model"
+	"github.com/platform-engineering-labs/formae/pkg/plugin/pklrun"
+)
+
+const ProjectFile = "PklProject"
+
+// hashedSecretSentinel is the inline comment appended by the PKL generator to
+// every hashed opaque field. It MUST stay byte-identical to the trailing comment
+// that gen.pkl emits — the consistency test in pkl_generate_test.go guards drift.
+const hashedSecretSentinel = "// hashed secret value — cannot be applied as-is; re-supply the plaintext to set it"
+
+type PKL struct{}
+
+//go:embed assets
+var assets embed.FS
+
+//go:embed generator/*
+var generator embed.FS
+
+// Compile time check to satisfy protocol
+var _ schema.SchemaPlugin = PKL{}
+
+func init() {
+	schema.DefaultRegistry.Register(PKL{})
+}
+
+// bundledPklCommand returns the sibling pkl binary next to the formae executable,
+// or nil to let pkl-go fall back to PATH. Using PATH risks picking up a pkl
+// version that doesn't support stdlib features our schemas rely on (e.g.
+// `pkl.reflect.Property.allAnnotations` needs 0.31+). The detection logic lives
+// in pklrun so every pkl invocation (eval and `project resolve`) shares it.
+func bundledPklCommand() []string {
+	exe, err := os.Executable()
+	if err != nil {
+		return nil
+	}
+	return pklrun.BundledPklCommand(exe)
+}
+
+func (p PKL) Name() string {
+	return "pkl"
+}
+
+func (p PKL) FileExtension() string {
+	return ".pkl"
+}
+
+func (p PKL) SupportsExtract() bool {
+	return true
+}
+
+func (p PKL) FormaeConfig(path string) (*pkgmodel.Config, error) {
+	config, err := p.rawConfig(path)
+	if err != nil {
+		return nil, err
+	}
+	return translateConfig(config)
+}
+
+// rawConfig evaluates the Pkl configuration at path into the decode model,
+// without translating it into the runtime model.
+func (p PKL) rawConfig(path string) (*pklmodel.Config, error) {
+	formaeFs, err := fs.Sub(assets, "assets/formae")
+	if err != nil {
+		return nil, err
+	}
+
+	var configSource *pklgo.ModuleSource
+	if path == "" {
+		configSource = pklgo.TextSource(`amends "formae:/Config.pkl"`)
+	} else {
+		if FileExists(path) {
+			configSource = pklgo.FileSource(path)
+		} else {
+			return nil, fmt.Errorf("config file: %s does not exist", path)
+		}
+	}
+
+	// Build evaluator options: always include formae:/ scheme
+	opts := []func(*pklgo.EvaluatorOptions){
+		pklgo.WithFs(formaeFs, "formae"),
+		pklgo.WithResourceReader(libExtension{}),
+		pklgo.PreconfiguredOptions,
+	}
+
+	// Set up the plugins:/ FS scheme so configs can import wrapper modules
+	// for installed plugins. The wrapper dir is the writable mount point and
+	// is created on demand — system-installed plugins must be importable on
+	// a clean machine where ~/.pel/formae/plugins doesn't exist yet. The scan
+	// covers the user's dev/override dir plus the system dir derived from the
+	// formae binary location, mirroring discovery.DiscoverPluginsMulti (first
+	// wins, so dev plugins override system plugins of the same name).
+	if pluginsOpt, err := pluginsSchemeOption(defaultPluginDir(), executablePath()); err != nil {
+		slog.Warn("failed to set up plugins:/ scheme", "error", err)
+	} else if pluginsOpt != nil {
+		opts = append(opts, pluginsOpt)
+	}
+
+	var evaluator pklgo.Evaluator
+
+	// Check if there's a PklProject in the directory tree
+	var projectDir string
+	if path != "" {
+		projectDir = WalkForProjectFile(filepath.Dir(path))
+	}
+
+	tfvarsBaseDir := ""
+	if path != "" {
+		tfvarsBaseDir = filepath.Dir(path)
+	}
+	opts = append(opts, pklgo.WithResourceReader(tfvarsReader{baseDir: tfvarsBaseDir}))
+
+	// Auto-register pkl-reader-helm as an external resource reader when
+	// it's discoverable on PATH or under an installed plugin's bin/. Lets
+	// formas use `import "@helm/helm.pkl"` without each project declaring
+	// the reader in evaluatorSettings.
+	if helmOpt := helmReaderOption(); helmOpt != nil {
+		opts = append(opts, helmOpt)
+	}
+
+	var cleanup func()
+	if projectDir != "" {
+		evaluator, cleanup, err = newSafeProjectEvaluator(
+			context.Background(),
+			&url.URL{Scheme: "file", Path: projectDir},
+			opts...,
+		)
+	} else {
+		if cmd := bundledPklCommand(); cmd != nil {
+			evaluator, err = pklgo.NewEvaluatorWithCommand(context.Background(), cmd, opts...)
+		} else {
+			evaluator, err = pklgo.NewEvaluator(context.Background(), opts...)
+		}
+		cleanup = func() { _ = evaluator.Close() }
+	}
+
+	if err != nil {
+		return nil, err
+	}
+
+	defer cleanup()
+
+	var config *pklmodel.Config
+	err = evaluator.EvaluateModule(context.Background(), configSource, &config)
+	if err != nil {
+		return nil, fmt.Errorf("failed to evaluate PKL configuration file '%s': %w", path, err)
+	}
+
+	return config, nil
+}
+
+func translateConfig(config *pklmodel.Config) (*pkgmodel.Config, error) {
+	translated := pkgmodel.Config{
+		Agent: pkgmodel.AgentConfig{
+			Server: pkgmodel.ServerConfig{
+				Nodename:      config.Agent.Server.Nodename,
+				Hostname:      config.Agent.Server.Hostname,
+				Port:          int(config.Agent.Server.Port),
+				ErgoPort:      int(config.Agent.Server.ErgoPort),
+				RegistrarPort: int(config.Agent.Server.RegistrarPort),
+				Secret:        config.Agent.Server.Secret,
+				ObserverPort:  int(config.Agent.Server.ObserverPort),
+				TLSCert:       config.Agent.Server.TLSCert,
+				TLSKey:        config.Agent.Server.TLSKey,
+			},
+			Datastore: pkgmodel.DatastoreConfig{
+				DatastoreType: config.Agent.Datastore.DatastoreType,
+				Sqlite: pkgmodel.SqliteConfig{
+					FilePath: config.Agent.Datastore.Sqlite.FilePath,
+				},
+				Postgres: pkgmodel.PostgresConfig{
+					Host:              config.Agent.Datastore.Postgres.Host,
+					Port:              int(config.Agent.Datastore.Postgres.Port),
+					User:              config.Agent.Datastore.Postgres.User,
+					Password:          config.Agent.Datastore.Postgres.Password,
+					PasswordSecretArn: config.Agent.Datastore.Postgres.PasswordSecretArn,
+					Database:          config.Agent.Datastore.Postgres.Database,
+					Schema:            config.Agent.Datastore.Postgres.Schema,
+					ConnectionParams:  config.Agent.Datastore.Postgres.ConnectionParams,
+				},
+				AuroraDataAPI: pkgmodel.AuroraDataAPIConfig{
+					ClusterARN: config.Agent.Datastore.AuroraDataAPI.ClusterArn,
+					SecretARN:  config.Agent.Datastore.AuroraDataAPI.SecretArn,
+					Database:   config.Agent.Datastore.AuroraDataAPI.Database,
+					Region:     config.Agent.Datastore.AuroraDataAPI.Region,
+					Endpoint:   config.Agent.Datastore.AuroraDataAPI.Endpoint,
+				},
+				MSSQL: pkgmodel.MSSQLConfig{
+					Host:                   config.Agent.Datastore.MSSQL.Host,
+					Port:                   int(config.Agent.Datastore.MSSQL.Port),
+					Database:               config.Agent.Datastore.MSSQL.Database,
+					AuthMode:               config.Agent.Datastore.MSSQL.AuthMode,
+					User:                   config.Agent.Datastore.MSSQL.User,
+					Password:               config.Agent.Datastore.MSSQL.Password,
+					Encrypt:                config.Agent.Datastore.MSSQL.Encrypt,
+					TrustServerCertificate: config.Agent.Datastore.MSSQL.TrustServerCertificate,
+					ConnectionParams:       config.Agent.Datastore.MSSQL.ConnectionParams,
+					MaxOpenConns:           int(config.Agent.Datastore.MSSQL.MaxOpenConns),
+					ConnMaxLifetime:        config.Agent.Datastore.MSSQL.ConnMaxLifetime.GoDuration(),
+				},
+			},
+			Retry: translateRetryConfig(config.Agent.Retry),
+			Synchronization: pkgmodel.SynchronizationConfig{
+				Enabled:  config.Agent.Synchronization.Enabled,
+				Interval: config.Agent.Synchronization.Interval.GoDuration(),
+			},
+			Discovery: pkgmodel.DiscoveryConfig{
+				Enabled:                 config.Agent.Discovery.Enabled,
+				Interval:                config.Agent.Discovery.Interval.GoDuration(),
+				ResourceTypesToDiscover: config.Agent.Discovery.ResourceTypesToDiscover,
+			},
+			Logging: pkgmodel.LoggingConfig{
+				FilePath:        config.Agent.Logging.FilePath,
+				FileLogLevel:    parseLogLevel(config.Agent.Logging.FileLogLevel),
+				ConsoleLogLevel: parseLogLevel(config.Agent.Logging.ConsoleLogLevel),
+			},
+			StackExpirer: pkgmodel.StackExpirerConfig{
+				Disabled: !config.Agent.StackExpirer.Enabled,
+				Interval: config.Agent.StackExpirer.Interval.GoDuration(),
+			},
+			OTel: pkgmodel.OTelConfig{
+				Enabled:     config.Agent.OTel.Enabled,
+				ServiceName: config.Agent.OTel.ServiceName,
+				OTLP: pkgmodel.OTLPConfig{
+					Enabled:     config.Agent.OTel.OTLP.Enabled,
+					Endpoint:    config.Agent.OTel.OTLP.Endpoint,
+					Protocol:    config.Agent.OTel.OTLP.Protocol,
+					Insecure:    config.Agent.OTel.OTLP.Insecure,
+					Temporality: config.Agent.OTel.OTLP.Temporality,
+				},
+				Prometheus: pkgmodel.PrometheusConfig{
+					Enabled: config.Agent.OTel.Prometheus.Enabled,
+				},
+			},
+			Auth:                  translateAuthConfig(&config.Agent.Auth),
+			ResourcePlugins:       translateResourcePluginConfigs(config.Agent.ResourcePlugins),
+			OidcCredentialPlugins: translateOidcCredentialPluginConfigs(config.Agent.OidcCredentialPlugins),
+		},
+		Artifacts: translateArtifactConfig(&config.Artifacts),
+		Cli: pkgmodel.CliConfig{
+			DisableUsageReporting: config.Cli.DisableUsageReporting,
+			Theme:                 config.Cli.Theme,
+			Appearance:            config.Cli.Appearance,
+		},
+	}
+
+	translated.PluginDir = config.PluginDir
+	translated.Network = translateNetworkConfig(config.Network)
+
+	// Backwards compatibility: fall back to deprecated plugins block
+	var legacyCliAuth json.RawMessage
+	applyDeprecatedPluginsConfig(config.Plugins, &translated, &legacyCliAuth)
+
+	conn, err := buildConnection(&config.Cli, legacyCliAuth, &translated.Warnings)
+	if err != nil {
+		return nil, err
+	}
+	translated.Cli.Connection = conn
+
+	// Warn when global settings conflict with per-plugin overrides
+	checkResourcePluginDeprecations(&translated)
+
+	// Synthesize Repositories from legacy flat fields and emit deprecation warnings
+	emitArtifactDeprecationWarnings(&translated)
+
+	return &translated, nil
+}
+
+// emitArtifactDeprecationWarnings synthesizes a canonical Repositories entry from
+// the legacy flat URL field and appends deprecation warnings to translated.Warnings.
+func emitArtifactDeprecationWarnings(translated *pkgmodel.Config) {
+	a := &translated.Artifacts
+	// When the user config uses the legacy flat fields and hasn't migrated
+	// to repositories, synthesize a single binary repository entry and warn.
+	if a.URL.String() != "" && len(a.Repositories) == 0 {
+		a.Repositories = []pkgmodel.Repository{
+			{URI: a.URL, Type: pkgmodel.RepositoryTypeBinary},
+		}
+		w := "artifacts.url is deprecated; migrate to artifacts.repositories. The URL has been loaded as a 'binary' repository for this release."
+		slog.Warn(w)
+		translated.Warnings = append(translated.Warnings, w)
+	}
+	if a.Username != "" {
+		w := "artifacts.username is deprecated; repository credentials will be per-repo in a future release"
+		slog.Warn(w)
+		translated.Warnings = append(translated.Warnings, w)
+	}
+	if a.Password != "" {
+		w := "artifacts.password is deprecated; repository credentials will be per-repo in a future release"
+		slog.Warn(w)
+		translated.Warnings = append(translated.Warnings, w)
+	}
+}
+
+// checkResourcePluginDeprecations warns when global settings conflict with per-plugin overrides.
+func checkResourcePluginDeprecations(translated *pkgmodel.Config) {
+	if len(translated.Agent.ResourcePlugins) == 0 {
+		return
+	}
+
+	hasPerPluginRetry := false
+	hasPerPluginRTD := false
+
+	for _, rpc := range translated.Agent.ResourcePlugins {
+		if rpc.Retry != nil {
+			hasPerPluginRetry = true
+		}
+		if len(rpc.ResourceTypesToDiscover) > 0 {
+			hasPerPluginRTD = true
+		}
+	}
+
+	// Default RetryConfig values as defined in Config.pkl
+	defaultRetry := pkgmodel.RetryConfig{
+		StatusCheckInterval: 20 * time.Second,
+		MaxRetries:          9,
+		RetryDelay:          10 * time.Second,
+	}
+
+	if hasPerPluginRetry && translated.Agent.Retry != defaultRetry {
+		w := "Your configuration file uses per-plugin 'retry' — the global 'agent.retry' is deprecated in favor of per-plugin retry config"
+		slog.Warn(w)
+		translated.Warnings = append(translated.Warnings, w)
+	}
+
+	if hasPerPluginRTD && len(translated.Agent.Discovery.ResourceTypesToDiscover) > 0 {
+		w := "Your configuration file uses per-plugin 'resourceTypesToDiscover' — the global 'agent.discovery.resourceTypesToDiscover' is deprecated in favor of per-plugin config"
+		slog.Warn(w)
+		translated.Warnings = append(translated.Warnings, w)
+	}
+}
+
+// applyDeprecatedPluginsConfig copies values from the deprecated plugins block
+// to their new locations, emitting deprecation warnings. New paths take precedence.
+// Warnings are collected in translated.Warnings so callers (CLI) can display them.
+func applyDeprecatedPluginsConfig(
+	plugins *pklmodel.PluginConfig,
+	translated *pkgmodel.Config,
+	legacyCliAuth *json.RawMessage,
+) {
+	if plugins == nil {
+		return
+	}
+
+	if plugins.PluginDir != "" && plugins.PluginDir != "~/.pel/formae/plugins" && translated.PluginDir == "~/.pel/formae/plugins" {
+		w := "Your configuration file uses deprecated 'plugins.pluginDir' — migrate to top-level 'pluginDir'"
+		slog.Warn(w)
+		translated.Warnings = append(translated.Warnings, w)
+		translated.PluginDir = plugins.PluginDir
+	}
+
+	if plugins.Authentication != nil {
+		w := "Your configuration file uses deprecated 'plugins.authentication' - migrate to 'agent.auth' and 'cli.auth'"
+		slog.Warn(w)
+		translated.Warnings = append(translated.Warnings, w)
+		authJSON := translateDynamic(plugins.Authentication)
+		// The agent keeps its explicit setting when it has one; the CLI's
+		// legacy credential is resolved separately, so an explicit agent.auth
+		// no longer silently leaves the CLI unauthenticated.
+		if translated.Agent.Auth == nil {
+			translated.Agent.Auth = authJSON
+		}
+		*legacyCliAuth = authJSON
+	}
+
+	if plugins.Network != nil && translated.Network == nil {
+		w := "Your configuration file uses deprecated 'plugins.network' — migrate to top-level 'network'"
+		slog.Warn(w)
+		translated.Warnings = append(translated.Warnings, w)
+		// The old format was a Dynamic blob. Convert to typed NetworkConfig
+		// by extracting the type field and passing the rest as-is via JSON.
+		networkJSON := translateDynamic(plugins.Network)
+		translated.Network = translateLegacyNetworkConfig(networkJSON)
+	}
+}
+
+// translateLegacyNetworkConfig converts the old plugins.network json.RawMessage
+// to a typed NetworkConfig. The old format was a flat JSON object with a Type field
+// and all config properties mixed in. The new format nests provider config.
+func translateLegacyNetworkConfig(networkJSON json.RawMessage) *pkgmodel.NetworkConfig {
+	if networkJSON == nil {
+		return nil
+	}
+	// For backwards compat, just store the raw JSON. The server's configureNetwork
+	// handles both typed NetworkConfig and legacy raw JSON via the network registry.
+	var raw map[string]any
+	if err := json.Unmarshal(networkJSON, &raw); err != nil {
+		return nil
+	}
+	netType, _ := raw["type"].(string)
+	return &pkgmodel.NetworkConfig{
+		Type:          netType,
+		LegacyRawJSON: networkJSON,
+	}
+}
+
+func translateNetworkConfig(nc *pklmodel.NetworkConfig) *pkgmodel.NetworkConfig {
+	if nc == nil {
+		return nil
+	}
+	result := &pkgmodel.NetworkConfig{Type: nc.Type}
+	if nc.Tailscale != nil {
+		result.Tailscale = &pkgmodel.TailscaleConfig{
+			TLS:             nc.Tailscale.TLS,
+			AuthKey:         nc.Tailscale.AuthKey,
+			Hostname:        nc.Tailscale.Hostname,
+			AdvertiseTags:   nc.Tailscale.AdvertiseTags,
+			EgressProxyPort: int(nc.Tailscale.EgressProxyPort),
+		}
+	}
+	return result
+}
+
+func (p PKL) Evaluate(path string, cmd pkgmodel.Command, mode pkgmodel.FormaApplyMode, props map[string]string) (*pkgmodel.Forma, error) {
+	var evaluator pklgo.Evaluator
+	var err error
+
+	addSchemaContextProperties(cmd, mode, props)
+
+	formaDir := filepath.Dir(path)
+	projectDir := WalkForProjectFile(formaDir)
+
+	evalOpts := []func(*pklgo.EvaluatorOptions){
+		pklgo.PreconfiguredOptions,
+		pklgo.WithResourceReader(libExtension{}),
+		pklgo.WithResourceReader(tfvarsReader{baseDir: formaDir}),
+		func(opts *pklgo.EvaluatorOptions) {
+			opts.Properties = props
+			opts.OutputFormat = "json"
+		},
+	}
+	// Auto-register pkl-reader-helm if discoverable; harmless when no
+	// helm imports are present in the forma.
+	if helmOpt := helmReaderOption(); helmOpt != nil {
+		evalOpts = append(evalOpts, helmOpt)
+	}
+
+	var cleanup func()
+	if projectDir != "" {
+		evaluator, cleanup, err = newSafeProjectEvaluator(
+			context.Background(),
+			&url.URL{Scheme: "file", Path: projectDir},
+			evalOpts...,
+		)
+		if err != nil {
+			return nil, err
+		}
+	} else {
+		if pklCmd := bundledPklCommand(); pklCmd != nil {
+			evaluator, err = pklgo.NewEvaluatorWithCommand(context.Background(), pklCmd, evalOpts...)
+		} else {
+			evaluator, err = pklgo.NewEvaluator(context.Background(), evalOpts...)
+		}
+		cleanup = func() { _ = evaluator.Close() }
+
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	defer cleanup()
+
+	// Render PKL
+	result, err := evaluator.EvaluateOutputText(context.Background(), pklgo.FileSource(path))
+	if err != nil {
+		return nil, err
+	}
+
+	// Marshal to struct
+	var forma *pkgmodel.Forma
+	err = json.Unmarshal([]byte(result), &forma)
+	if err != nil {
+		return nil, err
+	}
+
+	pkgmodel.RecordInputPropertySources(forma.Properties, props)
+	return forma, nil
+}
+
+func (p PKL) GenerateSourceCode(forma *pkgmodel.Forma, path string, includes []string, options *schema.SerializeOptions) (schema.GenerateSourcesResult, error) {
+	res := schema.GenerateSourcesResult{}
+
+	if options == nil {
+		options = &schema.SerializeOptions{Schema: "pkl"}
+	}
+	if options.Schema == "" {
+		options.Schema = "pkl"
+	}
+	schemaLocation := options.SchemaLocation
+	if schemaLocation == "" {
+		schemaLocation = schema.SchemaLocationRemote
+	}
+
+	if !strings.HasSuffix(path, ".pkl") {
+		path = path + ".pkl"
+	}
+	res.TargetPath = path
+
+	parentDir := filepath.Dir(path)
+	if err := os.MkdirAll(parentDir, 0755); err != nil {
+		return schema.GenerateSourcesResult{}, fmt.Errorf("failed to create parent directory: %v", err)
+	}
+
+	projectFile := filepath.Join(parentDir, "PklProject")
+	if _, err := os.Stat(projectFile); err == nil {
+		// Case 1: target dir has an existing PklProject — reuse its deps so the
+		// generated .pkl resolves cleanly when the user later evaluates it under
+		// their own project.
+		//
+		// `computed` is what the caller resolved from the agent's installed
+		// plugins (formae core + a dep for every resource namespace). It is the
+		// source of truth for any namespace the existing PklProject is missing.
+		computed := options.Dependencies
+
+		deps, parseErr := parsePklProjectDeps(projectFile)
+		if parseErr != nil {
+			return schema.GenerateSourcesResult{}, fmt.Errorf("failed to parse existing PklProject %q: %w", projectFile, parseErr)
+		}
+
+		// Correct the formae core dep to the running binary's version for THIS
+		// extract's serialization only (in-memory). An older pinned version
+		// resolves the wrong core schema and fails to evaluate against the
+		// schema this binary emits. Schemas publish only at a base X.Y.Z, so a
+		// prerelease binary (e.g. 0.88.0-dev.7) pins the base version. Skip on
+		// dev builds (0.0.0).
+		//
+		// The on-disk PklProject is deliberately NOT rewritten — that would drop
+		// a surprise diff into the user's tree. Instead we enforce the RULE:
+		// the PklProject must pin formae core >= requiredFormaeSchemaVersion
+		// (0.88.0). When it pins something older, report the mismatch so the CLI
+		// nags the user to update to exactly that version. The rule is a fixed
+		// literal, NOT the running binary version — see requiredFormaeSchemaVersion.
+		schemaVersion := coreSchemaVersion(formae.Version)
+		if schemaVersion != "0.0.0" {
+			bumped, current := bumpFormaeCoreDep(deps, schemaVersion)
+			deps = bumped
+			if isOlderVersion(current, requiredFormaeSchemaVersion) {
+				res.SchemaVersionUpgrade = &schema.SchemaVersionUpgrade{
+					ProjectDir: parentDir,
+					Current:    current,
+					Target:     requiredFormaeSchemaVersion,
+				}
+			}
+		}
+
+		// Add any plugin namespace the extracted resources need that the on-disk
+		// PklProject doesn't declare. Without this the generator can't resolve
+		// the resource's module and dies with an opaque "Cannot find key" error.
+		// Unlike the formae version (nag-only), these are added automatically —
+		// the file cannot be generated at all without them.
+		if missing := missingPluginDeps(deps, computed); len(missing) > 0 {
+			if addErr := addDepsToPklProject(projectFile, missing); addErr != nil {
+				return schema.GenerateSourcesResult{}, fmt.Errorf("failed to add missing dependencies to %q: %w", projectFile, addErr)
+			}
+			deps = append(deps, missing...)
+
+			// Drop the stale deps.json and re-resolve so the user's project
+			// resolves the added deps. Best-effort: a resolve failure (e.g.
+			// offline) still leaves a correct PklProject and a written .pkl.
+			depsJSON := filepath.Join(parentDir, "PklProject.deps.json")
+			if rmErr := os.Remove(depsJSON); rmErr != nil && !os.IsNotExist(rmErr) {
+				return schema.GenerateSourcesResult{}, fmt.Errorf("failed to clear stale deps.json: %w", rmErr)
+			}
+			if resErr := pklrun.ProjectResolve(parentDir, pklrun.WithPklCommand(bundledPklCommand())); resErr != nil {
+				res.Warnings = append(res.Warnings, fmt.Sprintf("Added dependencies to %q but re-resolving failed (%v). Run 'pkl project resolve' there.", projectFile, resErr))
+			}
+		}
+
+		options.Dependencies = deps
+	} else if os.IsNotExist(err) {
+		// Case 2: no existing PklProject — discover deps from options.LocalPluginDir
+		// and pin them so the generator and target ProjectInit use identical specs.
+		deps := resolveIncludes(forma, options)
+		// Apply schema-version dispatch so the written PklProject points
+		// versioned namespaces at their local install (where v*/ subtrees
+		// live). Without this, the on-disk PklProject misses any namespace
+		// that schema-version dispatch would resolve, and a later eval of
+		// the generated .pkl can't resolve `@<ns>/v*/...` imports.
+		// resolveSchemaVersions is a no-op outside SchemaLocationLocal,
+		// so versions is non-empty only when schemaLocation is already
+		// Local — no flip needed here.
+		versions, err := resolveSchemaVersions(forma, options)
+		if err != nil {
+			return schema.GenerateSourcesResult{}, err
+		}
+		deps = swapVersionedDepsToLocal(deps, versions, options)
+		options.Dependencies = deps
+
+		if err := p.ProjectInit(parentDir, deps, schemaLocation); err != nil {
+			return schema.GenerateSourcesResult{}, fmt.Errorf("failed to initialize Pkl project: %v", err)
+		}
+		res.InitializedNewProject = true
+		res.ProjectPath = parentDir
+		fmt.Println("Initialized new Pkl project at", parentDir)
+	} else {
+		return schema.GenerateSourcesResult{}, fmt.Errorf("failed to stat %q: %w", projectFile, err)
+	}
+
+	code, err := p.SerializeForma(forma, options)
+	if err != nil {
+		slog.Error(err.Error())
+		return schema.GenerateSourcesResult{}, fmt.Errorf("%w: %v", schema.ErrFailedToGenerateSources, err)
+	}
+	res.ResourceCount = len(forma.Resources)
+	res.HashedSecretCount = strings.Count(code, hashedSecretSentinel)
+
+	if err := os.WriteFile(path, []byte(code), 0644); err != nil {
+		return schema.GenerateSourcesResult{}, fmt.Errorf("failed to write Pkl file: %v", err)
+	}
+
+	depsFile := filepath.Join(parentDir, "PklProject.deps.json")
+	if _, err := os.Stat(depsFile); os.IsNotExist(err) && schemaLocation == schema.SchemaLocationRemote {
+		res.Warnings = append(res.Warnings, fmt.Sprintf("Pkl dependencies not resolved. Run 'pkl project resolve' in '%s' to resolve Pkl dependencies.", parentDir))
+	}
+
+	return res, nil
+}
+
+func (p PKL) ProjectInit(path string, include []string, schemaLocation schema.SchemaLocation) error {
+	var err error
+
+	if path == "" {
+		path, err = os.Getwd()
+		if err != nil {
+			return err
+		}
+	} else {
+		path, err = filepath.Abs(path)
+		if err != nil {
+			return err
+		}
+	}
+
+	if stat, err := os.Stat(path); os.IsNotExist(err) {
+		err = os.Mkdir(path, 0750)
+		if err != nil {
+			return err
+		}
+	} else {
+		if !stat.IsDir() {
+			return fmt.Errorf("%s is not a directory", path)
+		}
+	}
+
+	projOpts := []func(*pklgo.EvaluatorOptions){
+		pklgo.PreconfiguredOptions,
+		pklgo.WithFs(assets, "assets"),
+		func(opts *pklgo.EvaluatorOptions) {
+			opts.Properties = map[string]string{
+				"packages": strings.Join(include, ","),
+			}
+		},
+	}
+	var evaluator pklgo.Evaluator
+	if pklCmd := bundledPklCommand(); pklCmd != nil {
+		evaluator, err = pklgo.NewEvaluatorWithCommand(context.Background(), pklCmd, projOpts...)
+	} else {
+		evaluator, err = pklgo.NewEvaluator(context.Background(), projOpts...)
+	}
+	if err != nil {
+		return err
+	}
+
+	projectFile, err := evaluator.EvaluateOutputText(context.Background(), pklgo.UriSource("assets:/assets/PklProjectTemplate.pkl"))
+	if err != nil {
+		return err
+	}
+
+	err = os.WriteFile(filepath.Join(path, "PklProject"), []byte(projectFile), 0640)
+	if err != nil {
+		return err
+	}
+
+	entryFile, err := fs.ReadFile(assets, "assets/EntryPoint.pkl")
+	if err != nil {
+		return err
+	}
+
+	err = os.WriteFile(filepath.Join(path, "main.pkl"), entryFile, 0640)
+	if err != nil {
+		return err
+	}
+
+	// Run pkl project resolve if there are any remote packages
+	// Local packages use import() syntax and don't need resolution
+	hasRemotePackages := false
+	for _, pkg := range include {
+		if !strings.HasPrefix(pkg, "local:") {
+			hasRemotePackages = true
+			break
+		}
+	}
+
+	if hasRemotePackages {
+		if err := pklrun.ProjectResolve(path, pklrun.WithPklCommand(bundledPklCommand())); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+func (p PKL) ProjectProperties(path string) (map[string]pkgmodel.Prop, error) {
+	forma, err := p.Evaluate(path, pkgmodel.CommandEval, pkgmodel.FormaApplyModeProperties, make(map[string]string))
+	if err != nil {
+		return nil, err
+	}
+
+	return forma.Properties, nil
+}
+
+func (p PKL) SerializeForma(forma *pkgmodel.Forma, options *schema.SerializeOptions) (string, error) {
+	return p.serializeWithPKL(forma, options)
+}
+
+func sanitizeConfig(v any) any {
+	return sanitizeValue(reflect.ValueOf(v))
+}
+
+func sanitizeValue(rv reflect.Value) any {
+	if !rv.IsValid() {
+		return nil
+	}
+	switch rv.Kind() {
+	case reflect.Interface, reflect.Pointer:
+		if rv.IsNil() {
+			return nil
+		}
+		return sanitizeValue(rv.Elem())
+
+	case reflect.Map:
+		out := make(map[string]any, rv.Len())
+		iter := rv.MapRange()
+		for iter.Next() {
+			out[fmt.Sprintf("%v", iter.Key().Interface())] = sanitizeValue(iter.Value())
+		}
+		return out
+
+	case reflect.Array, reflect.Slice:
+		n := rv.Len()
+		out := make([]any, n)
+		for i := range n {
+			out[i] = sanitizeValue(rv.Index(i))
+		}
+		return out
+
+	case reflect.Struct:
+		// pkl.Object instances (from Dynamic or typed objects decoded as
+		// pkl.Object) are flattened to their properties/elements so the
+		// resulting JSON matches what plugins expect. Without this the
+		// raw pkl.Object struct fields (ModuleUri, Name, Properties, etc.)
+		// would leak into the JSON.
+		if obj, ok := rv.Interface().(pklgo.Object); ok {
+			if len(obj.Elements) > 0 {
+				return sanitizeValue(reflect.ValueOf(obj.Elements))
+			}
+			return sanitizeConfig(obj.Properties)
+		}
+
+		out := make(map[string]any, rv.NumField())
+		rt := rv.Type()
+		for i := 0; i < rv.NumField(); i++ {
+			f := rt.Field(i)
+			if f.PkgPath != "" {
+				continue
+			}
+			out[f.Name] = sanitizeValue(rv.Field(i))
+		}
+		return out
+
+	default:
+		return rv.Interface()
+	}
+}
+
+// translateAuthConfig converts a PKL auth config object to json.RawMessage.
+// Returns nil when the auth field is unset (zero-value pkl.Object with no properties).
+func translateAuthConfig(obj *pklgo.Object) json.RawMessage {
+	if obj == nil || len(obj.Properties) == 0 {
+		return nil
+	}
+	return translateDynamic(obj)
+}
+
+func translateDynamic(dyn *pklgo.Object) json.RawMessage {
+	if dyn == nil {
+		return nil
+	}
+	safe := sanitizeConfig(dyn.Properties)
+	configJson, err := json.Marshal(safe)
+	if err != nil {
+		slog.Error("Failed to marshal target config", "error", err)
+	}
+
+	return configJson
+}
+
+func translateRetryConfig(rc *pklmodel.RetryConfig) pkgmodel.RetryConfig {
+	if rc == nil {
+		return pkgmodel.RetryConfig{}
+	}
+	return pkgmodel.RetryConfig{
+		StatusCheckInterval: rc.StatusCheckInterval.GoDuration(),
+		MaxRetries:          int(rc.MaxRetries),
+		RetryDelay:          rc.RetryDelay.GoDuration(),
+	}
+}
+
+func translateArtifactConfig(ac *pklmodel.ArtifactConfig) pkgmodel.ArtifactConfig {
+	result := pkgmodel.ArtifactConfig{
+		URL:      ac.URL,
+		Username: ac.Username,
+		Password: ac.Password,
+	}
+	for _, r := range ac.Repositories {
+		result.Repositories = append(result.Repositories, pkgmodel.Repository{
+			URI:  r.URI,
+			Type: pkgmodel.RepositoryType(r.Type),
+		})
+	}
+	return result
+}
+
+func translateResourcePluginConfigs(objects []pklgo.Object) []pkgmodel.ResourcePluginUserConfig {
+	if len(objects) == 0 {
+		return nil
+	}
+	var configs []pkgmodel.ResourcePluginUserConfig
+	for i := range objects {
+		configs = append(configs, translateResourcePluginConfig(&objects[i]))
+	}
+	return configs
+}
+
+func translateResourcePluginConfig(obj *pklgo.Object) pkgmodel.ResourcePluginUserConfig {
+	props := obj.Properties
+
+	cfg := pkgmodel.ResourcePluginUserConfig{
+		Type:    pklString(props, "type"),
+		Enabled: pklBool(props, "enabled", true),
+	}
+
+	// rateLimit
+	if rl, ok := props["rateLimit"]; ok && rl != nil {
+		if rlObj, ok := rl.(*pklmodel.RateLimitConfig); ok {
+			cfg.RateLimit = &pkgmodel.RateLimitConfig{
+				Scope:                            pkgmodel.RateLimitScope(rlObj.Scope),
+				MaxRequestsPerSecondForNamespace: int(rlObj.MaxRequestsPerSecondForNamespace),
+			}
+		}
+	}
+
+	// labelConfig
+	if lc, ok := props["labelConfig"]; ok && lc != nil {
+		if lcObj, ok := lc.(*pklmodel.LabelConfig); ok {
+			cfg.LabelConfig = &pkgmodel.LabelConfig{
+				DefaultQuery:      lcObj.DefaultQuery,
+				ResourceOverrides: pklMappingToStringMap(lcObj.ResourceOverrides),
+			}
+		}
+	}
+
+	// discoveryFilters
+	if df, ok := props["discoveryFilters"]; ok && df != nil {
+		cfg.DiscoveryFilters = translateDiscoveryFilters(df)
+	}
+
+	// resourceTypesToDiscover
+	if rtd, ok := props["resourceTypesToDiscover"]; ok && rtd != nil {
+		cfg.ResourceTypesToDiscover = pklListingToStringSlice(rtd)
+	}
+
+	// retry
+	if r, ok := props["retry"]; ok && r != nil {
+		if rObj, ok := r.(*pklmodel.RetryConfig); ok {
+			cfg.Retry = &pkgmodel.RetryConfig{
+				StatusCheckInterval: rObj.StatusCheckInterval.GoDuration(),
+				MaxRetries:          int(rObj.MaxRetries),
+				RetryDelay:          rObj.RetryDelay.GoDuration(),
+			}
+		}
+	}
+
+	// Marshal remaining unknown properties into PluginConfig for plugin-specific fields
+	baseKeys := map[string]bool{
+		"type": true, "enabled": true, "rateLimit": true, "labelConfig": true,
+		"discoveryFilters": true, "resourceTypesToDiscover": true, "retry": true,
+	}
+	extra := make(map[string]any)
+	for k, v := range props {
+		if !baseKeys[k] {
+			extra[k] = v
+		}
+	}
+	if len(extra) > 0 {
+		cfg.PluginConfig, _ = json.Marshal(sanitizeConfig(extra))
+	}
+
+	return cfg
+}
+
+func translateOidcCredentialPluginConfigs(objects []pklgo.Object) []pkgmodel.OidcCredentialPluginUserConfig {
+	if len(objects) == 0 {
+		return nil
+	}
+	var configs []pkgmodel.OidcCredentialPluginUserConfig
+	for i := range objects {
+		configs = append(configs, translateOidcCredentialPluginConfig(&objects[i]))
+	}
+	return configs
+}
+
+// translateOidcCredentialPluginConfig maps a BaseOidcCredentialPluginConfig
+// subclass onto the user config. The two base fields are read directly; every
+// other property the subclass declared is the broker's own and is marshaled
+// into PluginConfig for the broker process to interpret.
+func translateOidcCredentialPluginConfig(obj *pklgo.Object) pkgmodel.OidcCredentialPluginUserConfig {
+	props := obj.Properties
+
+	cfg := pkgmodel.OidcCredentialPluginUserConfig{
+		Type:    pklString(props, "type"),
+		Enabled: pklBool(props, "enabled", true),
+	}
+
+	baseKeys := map[string]bool{"type": true, "enabled": true}
+	extra := make(map[string]any)
+	for k, v := range props {
+		if !baseKeys[k] {
+			extra[k] = v
+		}
+	}
+	if len(extra) > 0 {
+		cfg.PluginConfig, _ = json.Marshal(sanitizeConfig(extra))
+	}
+
+	return cfg
+}
+
+func translateDiscoveryFilters(v any) []pkgmodel.MatchFilter {
+	switch filters := v.(type) {
+	case []any:
+		var result []pkgmodel.MatchFilter
+		for _, f := range filters {
+			if mf, ok := f.(*pklmodel.MatchFilter); ok {
+				result = append(result, translateMatchFilter(mf))
+			}
+		}
+		return result
+	default:
+		return nil
+	}
+}
+
+func translateMatchFilter(mf *pklmodel.MatchFilter) pkgmodel.MatchFilter {
+	result := pkgmodel.MatchFilter{
+		ResourceTypes: mf.ResourceTypes,
+	}
+	for _, c := range mf.Conditions {
+		result.Conditions = append(result.Conditions, pkgmodel.FilterCondition{
+			PropertyPath:  c.PropertyPath,
+			PropertyValue: c.PropertyValue,
+		})
+	}
+	return result
+}
+
+// pklString extracts a string from a pkl.Object properties map.
+func pklString(props map[string]any, key string) string {
+	if v, ok := props[key]; ok {
+		if s, ok := v.(string); ok {
+			return s
+		}
+	}
+	return ""
+}
+
+// pklBool extracts a bool from a pkl.Object properties map with a default.
+func pklBool(props map[string]any, key string, defaultVal bool) bool {
+	if v, ok := props[key]; ok {
+		if b, ok := v.(bool); ok {
+			return b
+		}
+	}
+	return defaultVal
+}
+
+// pklListingToStringSlice converts a PKL Listing value (typically []any) to []string.
+func pklListingToStringSlice(v any) []string {
+	switch val := v.(type) {
+	case []any:
+		var result []string
+		for _, item := range val {
+			if s, ok := item.(string); ok {
+				result = append(result, s)
+			}
+		}
+		return result
+	case []string:
+		return val
+	default:
+		return nil
+	}
+}
+
+// pklMappingToStringMap converts a PKL Mapping (pkl.Object with Entries) to map[string]string.
+func pklMappingToStringMap(obj *pklgo.Object) map[string]string {
+	if obj == nil || len(obj.Entries) == 0 {
+		return nil
+	}
+	result := make(map[string]string, len(obj.Entries))
+	for k, v := range obj.Entries {
+		if ks, ok := k.(string); ok {
+			if vs, ok := v.(string); ok {
+				result[ks] = vs
+			}
+		}
+	}
+	return result
+}
+
+func parseLogLevel(level string) slog.Level {
+	switch level {
+	case "debug":
+		return slog.LevelDebug
+	case "info":
+		return slog.LevelInfo
+	case "warn":
+		return slog.LevelWarn
+	case "error":
+		return slog.LevelError
+	default:
+		return slog.LevelInfo
+	}
+}
+
+// newSafeProjectEvaluator builds a project-aware PKL evaluator for the project
+// at projectBaseURL, delegating to pklrun. pklrun auto-runs `pkl project resolve`
+// when PklProject.deps.json is missing (so `formae apply` works on an unresolved
+// project) and owns the race-condition workaround around pkl-go's evaluator
+// manager. The bundled, sibling-of-formae pkl binary is preferred over PATH so
+// schemas relying on newer stdlib features resolve correctly.
+func newSafeProjectEvaluator(ctx context.Context, projectBaseURL *url.URL, opts ...func(*pklgo.EvaluatorOptions)) (pklgo.Evaluator, func(), error) {
+	return pklrun.NewProjectEvaluator(
+		ctx,
+		projectBaseURL.Path,
+		pklrun.WithPklCommand(bundledPklCommand()),
+		pklrun.WithEvaluatorOptions(opts...),
+	)
+}

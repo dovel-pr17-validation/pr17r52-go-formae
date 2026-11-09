@@ -1,0 +1,85 @@
+name: formae-go
+
+on:
+  push:
+    branches: [ "**" ]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest-m
+    services:
+      postgres:
+        image: postgres:latest
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: admin
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+      mssql:
+        image: mcr.microsoft.com/mssql/server:2019-latest
+        env:
+          ACCEPT_EULA: "Y"
+          MSSQL_SA_PASSWORD: "Formae_Test_1234!"
+          MSSQL_PID: "Developer"
+        ports:
+          - 1433:1433
+        options: >-
+          --health-cmd "/opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -P Formae_Test_1234! -No -Q 'SELECT 1'"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 12
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+        fetch-tags: true
+
+    - name: Set up Go
+      uses: actions/setup-go@v4
+      with:
+        go-version: '1.26.2'
+
+    - name: Install Pkl
+      run: |
+        bash -c "$(curl -fsSL https://hub.platform.engineering/get/setup.sh)" -- install --yes pkl@0.31.0
+
+    - name: Add PEL to PATH
+      run: echo "/opt/pel/bin" >> $GITHUB_PATH
+
+    - name: Install swag
+      run: go install github.com/swaggo/swag/cmd/swag@latest
+
+    - name: Build
+      run: make all
+
+    - name: Test
+      uses: nick-fields/retry@v2
+      with:
+        # Includes test-build, Pkl, scripts, and all Go modules. Allow room
+        # for Go's per-package timeout to report before the wrapper aborts.
+        timeout_minutes: 20
+        max_attempts: 3
+        command: make test-all
+
+    - name: Postgres unit tests
+      run: |
+        set -eo pipefail
+        make test-unit-postgres
+
+    - name: MSSQL unit tests
+      run: |
+        set -eo pipefail
+        make test-unit-mssql
+
+    - name: Setup local-data-api
+      run: make local-data-api-ci
+
+    - name: Aurora Data API unit tests
+      run: |
+        set -eo pipefail
+        make test-unit-auroradataapi

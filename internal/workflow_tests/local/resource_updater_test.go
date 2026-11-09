@@ -1,0 +1,1870 @@
+// © 2025 Platform Engineering Labs Inc.
+//
+// SPDX-License-Identifier: FSL-1.1-ALv2
+
+//go:build unit
+
+package workflow_tests_local
+
+import (
+	"encoding/json"
+	"errors"
+	"fmt"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"ergo.services/ergo/gen"
+	"github.com/stretchr/testify/assert"
+
+	"github.com/platform-engineering-labs/formae/internal/metastructure/actornames"
+	"github.com/platform-engineering-labs/formae/internal/metastructure/forma_command"
+	"github.com/platform-engineering-labs/formae/internal/metastructure/forma_persister"
+	"github.com/platform-engineering-labs/formae/internal/metastructure/messages"
+	"github.com/platform-engineering-labs/formae/internal/metastructure/resource_update"
+	"github.com/platform-engineering-labs/formae/internal/metastructure/target_update"
+	"github.com/platform-engineering-labs/formae/internal/metastructure/testutil"
+	"github.com/platform-engineering-labs/formae/internal/metastructure/util"
+	"github.com/platform-engineering-labs/formae/internal/workflow_tests/test_helpers"
+	pkgmodel "github.com/platform-engineering-labs/formae/pkg/model"
+	"github.com/platform-engineering-labs/formae/pkg/plugin"
+	"github.com/platform-engineering-labs/formae/pkg/plugin/resource"
+)
+
+func TestResourceUpdater_HandlesThrottlingDuringSynchronization(t *testing.T) {
+	testutil.RunTestFromProjectRoot(t, func(t *testing.T) {
+		var readCallCount int
+		overrides := &plugin.ResourcePluginOverrides{
+			Read: func(request *resource.ReadRequest) (*resource.ReadResult, error) {
+				readCallCount++
+				if readCallCount == 1 {
+					return &resource.ReadResult{
+						ResourceType: "FakeAWS::S3::Bucket",
+						ErrorCode:    resource.OperationErrorCodeThrottling,
+					}, nil
+				}
+				return &resource.ReadResult{
+					ResourceType: "FakeAWS::S3::Bucket",
+					Properties:   `{"foo":"bar","baz":"qux","a":[3,4,2]}`,
+				}, nil
+			},
+			Update: func(request *resource.UpdateRequest) (*resource.UpdateResult, error) {
+				return &resource.UpdateResult{
+					ProgressResult: &resource.ProgressResult{
+						Operation:          resource.OperationUpdate,
+						OperationStatus:    resource.OperationStatusSuccess,
+						NativeID:           "test-native-id",
+						ResourceProperties: json.RawMessage(`{"foo":"snarf","baz":"sandwich","a":[4,3,2]}`),
+					},
+				}, nil
+			},
+		}
+
+		cfg := test_helpers.NewTestMetastructureConfig()
+		cfg.Agent.Retry.RetryDelay = 100 * time.Millisecond
+
+		m, def, err := test_helpers.NewTestMetastructureWithConfig(t, overrides, cfg)
+		defer def()
+		if err != nil {
+			t.Fatalf("Failed to create metastructure: %v", err)
+			return
+		}
+
+		messages := make(chan any, 1)
+		var helperPID gen.PID
+		helperPID, err = testutil.StartTestHelperActor(m.Node, messages)
+		assert.NoError(t, err)
+
+		initialResource := successfullyFinishedResourceUpdateCreatingS3Bucket()
+		hash, err := testutil.Call(m.Node, "ResourcePersister", resource_update.PersistResourceUpdate{
+			PluginOperation: resource.OperationCreate,
+			ResourceUpdate:  *initialResource,
+		})
+		assert.NoError(t, err)
+		assert.NotEmpty(t, hash)
+
+		testutil.Call(m.Node, "FormaCommandPersister", forma_persister.StoreNewFormaCommand{
+			Command: forma_command.FormaCommand{
+				ID:      "test-throttle-sync",
+				State:   forma_command.CommandStateNotStarted,
+				StartTs: util.TimeNow(),
+				ResourceUpdates: []resource_update.ResourceUpdate{
+					{
+						Operation: resource_update.OperationUpdate,
+						DesiredState: pkgmodel.Resource{
+							Label:      "test-resource",
+							Type:       "FakeAWS::S3::Bucket",
+							Stack:      "test-stack",
+							Properties: json.RawMessage(`{"foo":"snarf","baz":"sandwich","a":[4,3,2]}`),
+							Ksuid:      initialResource.DesiredState.Ksuid,
+						},
+					},
+				},
+			},
+		})
+
+		updateResource := resourceUpdateModifyingS3Bucket(initialResource.DesiredState.Ksuid)
+		err = spawnResourceUpdater(t, m.Node, helperPID,
+			initialResource.DesiredState.URI(), string(updateResource.Operation), "test-throttle-sync")
+		assert.NoError(t, err)
+
+		testutil.Send(m.Node, actornames.ResourceUpdater(initialResource.DesiredState.URI(), string(updateResource.Operation), "test-throttle-sync"), resource_update.StartResourceUpdate{
+			ResourceUpdate: *updateResource,
+			CommandID:      "test-throttle-sync",
+		})
+
+		testutil.ExpectMessageWithPredicate(t, messages, 10*time.Second, func(msg resource_update.ResourceUpdateFinished) bool {
+			return msg.Uri == initialResource.DesiredState.URI() &&
+				msg.State == resource_update.ResourceUpdateStateSuccess
+		})
+
+		assert.GreaterOrEqual(t, readCallCount, 2, "Read should have been called at least twice (initial + retry)")
+
+		resources, err := m.Datastore.LoadResourcesByStack("test-stack")
+		assert.NoError(t, err)
+		assert.Len(t, resources, 1)
+		assert.JSONEq(t, `{"foo":"snarf","baz":"sandwich","a":[4,3,2]}`, string(resources[0].Properties))
+
+		commandRes, err := testutil.Call(m.Node, "FormaCommandPersister", forma_persister.LoadFormaCommand{
+			CommandID: "test-throttle-sync",
+		})
+		assert.NoError(t, err)
+
+		commandLoadRes, ok := commandRes.(forma_persister.LoadFormaCommandResult)
+
+		var command *forma_command.FormaCommand
+
+		if ok {
+
+			command = commandLoadRes.Command
+
+		}
+		assert.True(t, ok)
+		assert.Equal(t, forma_command.CommandStateSuccess, command.State)
+	})
+}
+
+func TestResourceUpdater_RejectsUpdateWhenTheResourceIsOutOfSync(t *testing.T) {
+	testutil.RunTestFromProjectRoot(t, func(t *testing.T) {
+		var updateWrites atomic.Int64
+		overrides := &plugin.ResourcePluginOverrides{
+			Read: func(request *resource.ReadRequest) (*resource.ReadResult, error) {
+				return &resource.ReadResult{
+					ResourceType: "FakeAWS::S3::Bucket",
+					Properties:   `{"foo":"bar","baz":"qux","a":[3,4,2,1]}`,
+				}, nil
+			},
+			Update: func(*resource.UpdateRequest) (*resource.UpdateResult, error) {
+				updateWrites.Add(1)
+				return &resource.UpdateResult{ProgressResult: &resource.ProgressResult{
+					Operation: resource.OperationUpdate, OperationStatus: resource.OperationStatusSuccess,
+				}}, nil
+			},
+		}
+
+		m, def, err := test_helpers.NewTestMetastructure(t, overrides)
+		defer def()
+		if err != nil {
+			t.Fatalf("Failed to create metastructure: %v", err)
+			return
+		}
+
+		// start test helper actor to interact with the actors in the metastructure
+		messages := make(chan any, 1)
+		helperPID, err := testutil.StartTestHelperActor(m.Node, messages)
+		assert.NoError(t, err)
+
+		// store a forma command in the database - USE THE SAME KSUID
+		initialResource := successfullyFinishedResourceUpdateCreatingS3Bucket()
+
+		testutil.Call(m.Node, "FormaCommandPersister", forma_persister.StoreNewFormaCommand{
+			Command: forma_command.FormaCommand{
+				ID:    "test-forma-command",
+				State: forma_command.CommandStateNotStarted,
+				ResourceUpdates: []resource_update.ResourceUpdate{
+					{
+						Operation: resource_update.OperationUpdate,
+						DesiredState: pkgmodel.Resource{
+							Label: "test-resource",
+							Type:  "FakeAWS::S3::Bucket",
+							Stack: "test-stack",
+							Ksuid: initialResource.DesiredState.Ksuid,
+						},
+						PriorState: pkgmodel.Resource{
+							Label: "test-resource",
+							Type:  "FakeAWS::S3::Bucket",
+							Stack: "test-stack",
+							Ksuid: initialResource.DesiredState.Ksuid,
+						},
+					},
+				},
+			},
+		})
+
+		// store an S3 bucket
+		hash, err := testutil.Call(m.Node, "ResourcePersister", resource_update.PersistResourceUpdate{
+			PluginOperation: resource.OperationCreate,
+			ResourceUpdate:  *initialResource,
+		})
+		assert.NoError(t, err)
+		assert.NotEmpty(t, hash)
+
+		// start the resource updater
+		updateResource := resourceUpdateModifyingS3Bucket(initialResource.DesiredState.Ksuid)
+		err = spawnResourceUpdater(t, m.Node, helperPID,
+			initialResource.DesiredState.URI(), string(updateResource.Operation), "test-forma-command")
+		assert.NoError(t, err)
+
+		// send any update to the resource updater, which should be rejected
+		testutil.Send(m.Node, actornames.ResourceUpdater(initialResource.DesiredState.URI(), string(updateResource.Operation), "test-forma-command"), resource_update.StartResourceUpdate{
+			ResourceUpdate: *updateResource,
+			CommandID:      "test-forma-command",
+		})
+
+		// assert that we receive a message that the resource update was rejected
+		testutil.ExpectMessageWithPredicate(t, messages, 5*time.Second, func(msg resource_update.ResourceUpdateFinished) bool {
+			return msg.Uri == initialResource.DesiredState.URI() &&
+				msg.State == resource_update.ResourceUpdateStateRejected
+		})
+
+		// assert that the resource is correctly updated
+		resources, err := m.Datastore.LoadResourcesByStack(initialResource.DesiredState.Stack)
+		assert.NoError(t, err)
+
+		assert.Len(t, resources, 1)
+		assert.JSONEq(t, `{"foo":"bar","baz":"qux","a":[3,4,2,1]}`, string(resources[0].Properties))
+
+		// assert that the forma command in the database is updated with the rejected state
+		commandRes, err := testutil.Call(m.Node, "FormaCommandPersister", forma_persister.LoadFormaCommand{
+			CommandID: "test-forma-command",
+		})
+		assert.NoError(t, err)
+
+		commandLoadRes, ok := commandRes.(forma_persister.LoadFormaCommandResult)
+
+		var command *forma_command.FormaCommand
+
+		if ok {
+
+			command = commandLoadRes.Command
+
+		}
+		assert.True(t, ok)
+		assert.Equal(t, forma_command.CommandStateFailed, command.State)
+		assert.Len(t, command.ResourceUpdates, 1)
+		assert.Equal(t, resource_update.ResourceUpdateStateRejected, command.ResourceUpdates[0].State)
+		assert.Zero(t, updateWrites.Load(), "fresh drift rejection must happen before the provider Update")
+	})
+}
+
+func TestResourceUpdater_SuccessfullySynchronizesAResource(t *testing.T) {
+	testutil.RunTestFromProjectRoot(t, func(t *testing.T) {
+		overrides := &plugin.ResourcePluginOverrides{
+			Read: func(request *resource.ReadRequest) (*resource.ReadResult, error) {
+				return &resource.ReadResult{
+					ResourceType: "FakeAWS::S3::Bucket",
+					Properties:   `{"foo":"lucky","baz":"robot","a":[4,3,2]}`,
+				}, nil
+			},
+		}
+
+		m, def, err := test_helpers.NewTestMetastructure(t, overrides)
+		defer def()
+		if err != nil {
+			t.Fatalf("Failed to create metastructure: %v", err)
+			return
+		}
+
+		messages := make(chan any, 1)
+		helperPID, err := testutil.StartTestHelperActor(m.Node, messages)
+		assert.NoError(t, err)
+
+		initialResource := successfullyFinishedResourceUpdateCreatingS3Bucket()
+		hash, err := testutil.Call(m.Node, "ResourcePersister", resource_update.PersistResourceUpdate{
+			PluginOperation: resource.OperationCreate,
+			ResourceUpdate:  *initialResource,
+		})
+		assert.NoError(t, err)
+		assert.NotEmpty(t, hash)
+
+		testutil.Call(m.Node, "FormaCommandPersister", forma_persister.StoreNewFormaCommand{
+			Command: forma_command.FormaCommand{
+				ID:      "test-forma-command-sync",
+				State:   forma_command.CommandStateNotStarted,
+				StartTs: util.TimeNow(),
+				ResourceUpdates: []resource_update.ResourceUpdate{
+					{
+						Operation: resource_update.OperationRead, // Must match the operation used by resourceUpdateReadingS3Bucket
+						DesiredState: pkgmodel.Resource{
+							Label:      "test-resource",
+							Type:       "FakeAWS::S3::Bucket",
+							Stack:      "test-stack",
+							Properties: json.RawMessage(`{"foo":"snarf","baz":"sandwich","a":[4,3,2]}`),
+							Ksuid:      initialResource.DesiredState.Ksuid,
+						},
+					},
+				},
+			},
+		})
+
+		// start the resource update
+		syncResource := resourceUpdateReadingS3Bucket(initialResource.DesiredState.Ksuid)
+		err = spawnResourceUpdater(t, m.Node, helperPID,
+			initialResource.DesiredState.URI(), string(syncResource.Operation), "test-forma-command-sync")
+		assert.NoError(t, err)
+
+		// send the sync operation to the resource updater
+		testutil.Send(m.Node, actornames.ResourceUpdater(initialResource.DesiredState.URI(), string(syncResource.Operation), "test-forma-command-sync"), resource_update.StartResourceUpdate{
+			ResourceUpdate: *syncResource,
+			CommandID:      "test-forma-command-sync",
+		})
+
+		// assert that the resource updater has sent a resource updated finished message with the state success
+		testutil.ExpectMessageWithPredicate(t, messages, 5*time.Second, func(msg resource_update.ResourceUpdateFinished) bool {
+			return msg.Uri == initialResource.DesiredState.URI() && msg.State == resource_update.ResourceUpdateStateSuccess
+		})
+
+		// assert that the resource is created
+		resources, err := m.Datastore.LoadResourcesByStack("test-stack")
+		assert.NoError(t, err)
+
+		assert.Len(t, resources, 1)
+		assert.Equal(t, "test-resource", resources[0].Label)
+		assert.Equal(t, "FakeAWS::S3::Bucket", resources[0].Type)
+		assert.JSONEq(t, `{"foo":"lucky","baz":"robot","a":[4,3,2]}`, string(resources[0].Properties))
+
+		// assert that the forma command in the database is updated with the success state
+		commandRes, err := testutil.Call(m.Node, "FormaCommandPersister", forma_persister.LoadFormaCommand{
+			CommandID: "test-forma-command-sync",
+		})
+		assert.NoError(t, err)
+
+		commandLoadRes, ok := commandRes.(forma_persister.LoadFormaCommandResult)
+
+		var command *forma_command.FormaCommand
+
+		if ok {
+
+			command = commandLoadRes.Command
+
+		}
+		assert.True(t, ok)
+		assert.Equal(t, forma_command.CommandStateSuccess, command.State)
+		assert.Len(t, command.ResourceUpdates, 1)
+		assert.Equal(t, resource_update.ResourceUpdateStateSuccess, command.ResourceUpdates[0].State)
+	})
+}
+
+func TestResourceUpdater_SuccessfullyDeletesAResource(t *testing.T) {
+	testutil.RunTestFromProjectRoot(t, func(t *testing.T) {
+
+		overrides := &plugin.ResourcePluginOverrides{
+			Read: func(request *resource.ReadRequest) (*resource.ReadResult, error) {
+				return &resource.ReadResult{
+					ResourceType: "FakeAWS::S3::Bucket",
+					Properties:   `{"foo":"bar","baz":"qux","a":[3,4,2]}`,
+				}, nil
+			},
+			Delete: func(request *resource.DeleteRequest) (*resource.DeleteResult, error) {
+				return &resource.DeleteResult{
+					ProgressResult: &resource.ProgressResult{
+						Operation:          resource.OperationDelete,
+						OperationStatus:    resource.OperationStatusInProgress,
+						RequestID:          "test-request-id",
+						NativeID:           "test-native-id",
+						ResourceProperties: json.RawMessage(`{"foo":"bar","baz":"qux","a":[3,4,2]}`),
+					},
+				}, nil
+			},
+			Status: func(request *resource.StatusRequest) (*resource.StatusResult, error) {
+				return &resource.StatusResult{
+					ProgressResult: &resource.ProgressResult{
+						Operation:          resource.OperationDelete,
+						OperationStatus:    resource.OperationStatusSuccess,
+						RequestID:          "test-request-id",
+						NativeID:           "test-native-id",
+						ResourceProperties: json.RawMessage(`{"foo":"bar","baz":"qux","a":[3,4,2]}`),
+					},
+				}, nil
+			},
+		}
+
+		m, def, err := test_helpers.NewTestMetastructure(t, overrides)
+		defer def()
+		if err != nil {
+			t.Fatalf("Failed to create metastructure: %v", err)
+			return
+		}
+
+		// start test helper actor to interact with the actors in the metastructure
+		messages := make(chan any, 1)
+		helperPID, err := testutil.StartTestHelperActor(m.Node, messages)
+		assert.NoError(t, err)
+
+		// store the forma command in the database
+		initialResource := successfullyFinishedResourceUpdateCreatingS3Bucket()
+		testutil.Call(m.Node, "FormaCommandPersister", forma_persister.StoreNewFormaCommand{
+			Command: forma_command.FormaCommand{
+				ID:      "test-forma-command-delete",
+				State:   forma_command.CommandStateNotStarted,
+				StartTs: util.TimeNow(),
+				ResourceUpdates: []resource_update.ResourceUpdate{
+					{
+						Operation: resource_update.OperationDelete, // Must match the operation used by resourceUpdateDeletingS3Bucket
+						DesiredState: pkgmodel.Resource{
+							Label: "test-resource",
+							Type:  "FakeAWS::S3::Bucket",
+							Stack: "test-stack",
+							Ksuid: initialResource.DesiredState.Ksuid,
+						},
+					},
+				},
+			},
+		})
+
+		// store an S3 bucket resource
+		hash, err := testutil.Call(m.Node, "ResourcePersister", resource_update.PersistResourceUpdate{
+			PluginOperation: resource.OperationCreate,
+			ResourceUpdate:  *initialResource,
+		})
+		assert.NoError(t, err)
+		assert.NotEmpty(t, hash)
+
+		// start the resource updater
+		updateResource := resourceUpdateDeletingS3Bucket(initialResource.DesiredState.Ksuid)
+		err = spawnResourceUpdater(t, m.Node, helperPID,
+			initialResource.DesiredState.URI(), string(updateResource.Operation), "test-forma-command-delete")
+		assert.NoError(t, err)
+
+		// send the delete operation to the resource updater
+		testutil.Send(m.Node, actornames.ResourceUpdater(initialResource.DesiredState.URI(), string(updateResource.Operation), "test-forma-command-delete"), resource_update.StartResourceUpdate{
+			ResourceUpdate: *updateResource,
+			CommandID:      "test-forma-command-delete",
+		})
+
+		// assert that the resource updater has sent a resource updated finished message with the state success
+		testutil.ExpectMessageWithPredicate(t, messages, 5*time.Second, func(msg resource_update.ResourceUpdateFinished) bool {
+			return msg.Uri == initialResource.DesiredState.URI() &&
+				msg.State == resource_update.ResourceUpdateStateSuccess
+		})
+
+		// assert that the resource is deleted
+		resources, err := m.Datastore.LoadResourcesByStack(initialResource.DesiredState.Stack)
+		assert.NoError(t, err)
+		// there was only one resource in the stack, so the stack should be empty
+		assert.Empty(t, resources)
+
+		// assert that the forma command in the database is updated with the success state
+		commandRes, err := testutil.Call(m.Node, "FormaCommandPersister", forma_persister.LoadFormaCommand{
+			CommandID: "test-forma-command-delete",
+		})
+		assert.NoError(t, err)
+
+		commandLoadRes, ok := commandRes.(forma_persister.LoadFormaCommandResult)
+
+		var command *forma_command.FormaCommand
+
+		if ok {
+
+			command = commandLoadRes.Command
+
+		}
+		assert.True(t, ok)
+		assert.Equal(t, forma_command.CommandStateSuccess, command.State)
+		assert.Len(t, command.ResourceUpdates, 1)
+		assert.Equal(t, resource_update.ResourceUpdateStateSuccess, command.ResourceUpdates[0].State)
+	})
+}
+
+func TestResourceUpdater_DeleteOperationFailsWhenPluginCrashes(t *testing.T) {
+	testutil.RunTestFromProjectRoot(t, func(t *testing.T) {
+		// Reduce the plugin call timeout so the test doesn't wait 60s for the
+		// crashed PluginOperator's CallWithTimeout to expire.
+		orig := resource_update.PluginOperationCallTimeout
+		resource_update.PluginOperationCallTimeout = 3
+		t.Cleanup(func() { resource_update.PluginOperationCallTimeout = orig })
+
+		overrides := &plugin.ResourcePluginOverrides{
+			Read: func(request *resource.ReadRequest) (*resource.ReadResult, error) {
+				return &resource.ReadResult{
+					ResourceType: "FakeAWS::S3::Bucket",
+					Properties:   `{"foo":"bar","baz":"qux","a":[3,4,2]}`,
+				}, nil
+			},
+			// Return nil result (not an error) so the PluginOperator panics on
+			// result.ProgressResult, crashing the actor. This causes the
+			// ResourceUpdater's doPluginOperation → CallWithTimeout to return an
+			// error, exercising the "failed to start delete operation" path.
+			Delete: func(request *resource.DeleteRequest) (*resource.DeleteResult, error) {
+				return nil, nil
+			},
+		}
+
+		m, def, err := test_helpers.NewTestMetastructure(t, overrides)
+		defer def()
+		if err != nil {
+			t.Fatalf("Failed to create metastructure: %v", err)
+			return
+		}
+
+		messages := make(chan any, 1)
+		helperPID, err := testutil.StartTestHelperActor(m.Node, messages)
+		assert.NoError(t, err)
+
+		initialResource := successfullyFinishedResourceUpdateCreatingS3Bucket()
+		testutil.Call(m.Node, "FormaCommandPersister", forma_persister.StoreNewFormaCommand{
+			Command: forma_command.FormaCommand{
+				ID:      "test-forma-command-delete-crash",
+				State:   forma_command.CommandStateNotStarted,
+				StartTs: util.TimeNow(),
+				ResourceUpdates: []resource_update.ResourceUpdate{
+					{
+						Operation: resource_update.OperationDelete,
+						DesiredState: pkgmodel.Resource{
+							Label: "test-resource",
+							Type:  "FakeAWS::S3::Bucket",
+							Stack: "test-stack",
+							Ksuid: initialResource.DesiredState.Ksuid,
+						},
+					},
+				},
+			},
+		})
+
+		hash, err := testutil.Call(m.Node, "ResourcePersister", resource_update.PersistResourceUpdate{
+			PluginOperation: resource.OperationCreate,
+			ResourceUpdate:  *initialResource,
+		})
+		assert.NoError(t, err)
+		assert.NotEmpty(t, hash)
+
+		updateResource := resourceUpdateDeletingS3Bucket(initialResource.DesiredState.Ksuid)
+		err = spawnResourceUpdater(t, m.Node, helperPID,
+			initialResource.DesiredState.URI(), string(updateResource.Operation), "test-forma-command-delete-crash")
+		assert.NoError(t, err)
+
+		testutil.Send(m.Node, actornames.ResourceUpdater(initialResource.DesiredState.URI(), string(updateResource.Operation), "test-forma-command-delete-crash"), resource_update.StartResourceUpdate{
+			ResourceUpdate: *updateResource,
+			CommandID:      "test-forma-command-delete-crash",
+		})
+
+		// The delete operation should fail (not hang) because the PluginOperator
+		// crashed. Before the fix, the ResourceUpdater stayed stuck in StateDeleting
+		// and this assertion would time out.
+		testutil.ExpectMessageWithPredicate(t, messages, 10*time.Second, func(msg resource_update.ResourceUpdateFinished) bool {
+			return msg.Uri == initialResource.DesiredState.URI() &&
+				msg.State == resource_update.ResourceUpdateStateFailed
+		})
+
+		// Verify the forma command reflects the failure
+		commandRes, err := testutil.Call(m.Node, "FormaCommandPersister", forma_persister.LoadFormaCommand{
+			CommandID: "test-forma-command-delete-crash",
+		})
+		assert.NoError(t, err)
+
+		commandLoadRes, ok := commandRes.(forma_persister.LoadFormaCommandResult)
+
+		var command *forma_command.FormaCommand
+
+		if ok {
+
+			command = commandLoadRes.Command
+
+		}
+		assert.True(t, ok)
+		assert.Equal(t, forma_command.CommandStateFailed, command.State)
+		assert.Len(t, command.ResourceUpdates, 1)
+		assert.Equal(t, resource_update.ResourceUpdateStateFailed, command.ResourceUpdates[0].State)
+	})
+}
+
+// Sibling to TestResourceUpdater_PreservesPluginErrorMessageOnUpdateFailure — verifies
+// the same StatusMessage propagation for the delete handler.
+func TestResourceUpdater_PreservesPluginErrorMessageOnDeleteFailure(t *testing.T) {
+	testutil.RunTestFromProjectRoot(t, func(t *testing.T) {
+		const pluginErr = "simulated AWS API failure on DeleteResource"
+		overrides := &plugin.ResourcePluginOverrides{
+			Read: func(request *resource.ReadRequest) (*resource.ReadResult, error) {
+				return &resource.ReadResult{
+					ResourceType: "FakeAWS::S3::Bucket",
+					Properties:   `{"foo":"bar","baz":"qux","a":[3,4,2]}`,
+				}, nil
+			},
+			Delete: func(request *resource.DeleteRequest) (*resource.DeleteResult, error) {
+				return nil, errors.New(pluginErr)
+			},
+		}
+
+		m, def, err := test_helpers.NewTestMetastructure(t, overrides)
+		defer def()
+		if err != nil {
+			t.Fatalf("Failed to create metastructure: %v", err)
+			return
+		}
+
+		messages := make(chan any, 1)
+		helperPID, err := testutil.StartTestHelperActor(m.Node, messages)
+		assert.NoError(t, err)
+
+		initialResource := successfullyFinishedResourceUpdateCreatingS3Bucket()
+		testutil.Call(m.Node, "FormaCommandPersister", forma_persister.StoreNewFormaCommand{
+			Command: forma_command.FormaCommand{
+				ID:      "test-forma-command-delete-error-message",
+				State:   forma_command.CommandStateNotStarted,
+				StartTs: util.TimeNow(),
+				ResourceUpdates: []resource_update.ResourceUpdate{
+					{
+						Operation: resource_update.OperationDelete,
+						DesiredState: pkgmodel.Resource{
+							Label: "test-resource",
+							Type:  "FakeAWS::S3::Bucket",
+							Stack: "test-stack",
+							Ksuid: initialResource.DesiredState.Ksuid,
+						},
+					},
+				},
+			},
+		})
+
+		hash, err := testutil.Call(m.Node, "ResourcePersister", resource_update.PersistResourceUpdate{
+			PluginOperation: resource.OperationCreate,
+			ResourceUpdate:  *initialResource,
+		})
+		assert.NoError(t, err)
+		assert.NotEmpty(t, hash)
+
+		deleteResource := resourceUpdateDeletingS3Bucket(initialResource.DesiredState.Ksuid)
+		err = spawnResourceUpdater(t, m.Node, helperPID,
+			initialResource.DesiredState.URI(), string(deleteResource.Operation), "test-forma-command-delete-error-message")
+		assert.NoError(t, err)
+
+		testutil.Send(m.Node, actornames.ResourceUpdater(initialResource.DesiredState.URI(), string(deleteResource.Operation), "test-forma-command-delete-error-message"), resource_update.StartResourceUpdate{
+			ResourceUpdate: *deleteResource,
+			CommandID:      "test-forma-command-delete-error-message",
+		})
+
+		testutil.ExpectMessageWithPredicate(t, messages, 10*time.Second, func(msg resource_update.ResourceUpdateFinished) bool {
+			return msg.Uri == initialResource.DesiredState.URI() && msg.State == resource_update.ResourceUpdateStateFailed
+		})
+
+		commandRes, err := testutil.Call(m.Node, "FormaCommandPersister", forma_persister.LoadFormaCommand{
+			CommandID: "test-forma-command-delete-error-message",
+		})
+		assert.NoError(t, err)
+
+		commandLoadRes, ok := commandRes.(forma_persister.LoadFormaCommandResult)
+
+		var command *forma_command.FormaCommand
+
+		if ok {
+
+			command = commandLoadRes.Command
+
+		}
+		assert.True(t, ok)
+		assert.Len(t, command.ResourceUpdates, 1)
+		assert.Contains(t, command.ResourceUpdates[0].MostRecentFailureMessage(), pluginErr,
+			"plugin error message must propagate to MostRecentFailureMessage so operators can debug Delete failures")
+	})
+}
+
+func TestResourceUpdater_SuccessfullyCreatesAResource(t *testing.T) {
+	testutil.RunTestFromProjectRoot(t, func(t *testing.T) {
+		overrides := &plugin.ResourcePluginOverrides{
+			Read: func(request *resource.ReadRequest) (*resource.ReadResult, error) {
+				return &resource.ReadResult{
+					ResourceType: "FakeAWS::EC2::VPC",
+					Properties:   `{"VpcId":"vpc-12345678"}`,
+				}, nil
+			},
+			Create: func(request *resource.CreateRequest) (*resource.CreateResult, error) {
+				return &resource.CreateResult{
+					ProgressResult: &resource.ProgressResult{
+						Operation:          resource.OperationCreate,
+						OperationStatus:    resource.OperationStatusInProgress,
+						RequestID:          "test-request-id",
+						ResourceProperties: request.Properties,
+					},
+				}, nil
+			},
+			Status: func(request *resource.StatusRequest) (*resource.StatusResult, error) {
+				return &resource.StatusResult{
+					ProgressResult: &resource.ProgressResult{
+						Operation:          resource.OperationCreate,
+						OperationStatus:    resource.OperationStatusSuccess,
+						RequestID:          "test-request-id",
+						NativeID:           "test-native-id",
+						ResourceProperties: json.RawMessage(`{"VpcId":"vpc-12345678","baz":"qux","a":[3,4,2]}`),
+					},
+				}, nil
+			},
+		}
+
+		m, def, err := test_helpers.NewTestMetastructure(t, overrides)
+		defer def()
+		if err != nil {
+			t.Fatalf("Failed to create metastructure: %v", err)
+			return
+		}
+
+		received := make(chan any, 1)
+		helperPID, err := testutil.StartTestHelperActor(m.Node, received)
+		assert.NoError(t, err)
+
+		// ensure the resolve cache is started
+		err = spawnResolveCache(t, m.Node, "test-forma-command-create")
+		assert.NoError(t, err)
+
+		vpcKsuid := util.NewID()
+		bucketKsuid := util.NewID()
+
+		_, err = testutil.Call(m.Node, "ResourcePersister", target_update.PersistTargetUpdates{
+			CommandID: "test-forma-command-create",
+			TargetUpdates: []target_update.TargetUpdate{{
+				Target: pkgmodel.Target{
+					Label:     "test-target",
+					Namespace: "test-namespace",
+				},
+				Operation: target_update.TargetOperationCreate,
+			}},
+		})
+		assert.NoError(t, err)
+
+		// store the ref resource on the stack
+		referencedResource := resource_update.ResourceUpdate{
+			DesiredState: pkgmodel.Resource{
+				Label:      "test-vpc",
+				Type:       "FakeAWS::EC2::VPC",
+				Stack:      "test-stack",
+				Properties: json.RawMessage(`{"VpcId":"vpc-12345678"}`),
+				Target:     "test-target",
+				Managed:    true,
+				Ksuid:      vpcKsuid,
+			},
+			ResourceTarget: pkgmodel.Target{
+				Label:     "test-target",
+				Namespace: "test-namespace",
+			},
+			ProgressResult: []plugin.TrackedProgress{
+				{
+					ProgressResult: resource.ProgressResult{
+						Operation:          resource.OperationCreate,
+						OperationStatus:    resource.OperationStatusSuccess,
+						NativeID:           "vpc-12345678",
+						ResourceProperties: json.RawMessage(`{"VpcId":"vpc-12345678"}`),
+					},
+					ResourceType: "FakeAWS::EC2::VPC",
+				},
+			},
+			Operation:  resource_update.OperationCreate,
+			State:      resource_update.ResourceUpdateStateNotStarted,
+			StartTs:    util.TimeNow(),
+			StackLabel: "test-stack",
+		}
+		hash, err := testutil.Call(m.Node, "ResourcePersister", resource_update.PersistResourceUpdate{
+			PluginOperation: resource.OperationCreate,
+			ResourceUpdate:  referencedResource,
+		})
+		assert.NoError(t, err)
+		assert.NotEmpty(t, hash)
+
+		// store the forma command in the database
+		command := forma_command.FormaCommand{
+			ID:      "test-forma-command-create",
+			State:   forma_command.CommandStateNotStarted,
+			StartTs: util.TimeNow(),
+			ResourceUpdates: []resource_update.ResourceUpdate{
+				{
+					Operation: resource_update.OperationCreate,
+					DesiredState: pkgmodel.Resource{
+						Label:      "test-resource",
+						Type:       "FakeAWS::S3::Bucket",
+						Stack:      "test-stack",
+						Properties: json.RawMessage(fmt.Sprintf(`{"VpcId":{"$ref":"formae://%s#/VpcId"},"baz":"qux","a":[3,4,2]}`, vpcKsuid)),
+						Target:     "test-target",
+						Managed:    true,
+						Ksuid:      bucketKsuid,
+					},
+					ResourceTarget: pkgmodel.Target{
+						Label:     "test-target",
+						Namespace: "test-namespace",
+					},
+					RemainingResolvables: []pkgmodel.FormaeURI{pkgmodel.NewFormaeURI(vpcKsuid, "VpcId")},
+				},
+			},
+		}
+		testutil.Call(m.Node, "FormaCommandPersister", forma_persister.StoreNewFormaCommand{
+			Command: command,
+		})
+
+		// start the resource update
+		newResourceUri := command.ResourceUpdates[0].DesiredState.URI()
+		createResource := resourceUpdateCreatingS3Bucket(bucketKsuid, vpcKsuid)
+		err = spawnResourceUpdater(t, m.Node, helperPID,
+			createResource.DesiredState.URI(), string(createResource.Operation), "test-forma-command-create")
+		assert.NoError(t, err)
+
+		// send the create operation to the resource updater
+		testutil.Send(m.Node, actornames.ResourceUpdater(createResource.DesiredState.URI(), string(createResource.Operation), "test-forma-command-create"), resource_update.StartResourceUpdate{
+			ResourceUpdate: *createResource,
+			CommandID:      "test-forma-command-create",
+		})
+
+		// assert that the resource updater has sent a resource updated finished message with the state success
+		testutil.ExpectMessageWithPredicate(t, received, 50*time.Second, func(msg resource_update.ResourceUpdateFinished) bool {
+			return msg.Uri == newResourceUri && msg.State == resource_update.ResourceUpdateStateSuccess
+		})
+
+		// load the resources from the stacker
+		loadResult, err := testutil.Call(m.Node, "ResourcePersister", messages.LoadResource{
+			ResourceURI: newResourceUri,
+		})
+		assert.NoError(t, err)
+		loadedResult, ok := loadResult.(messages.LoadResourceResult)
+		newResource := loadedResult.Resource
+		assert.True(t, ok)
+
+		assert.Equal(t, "test-resource", newResource.Label)
+		assert.Equal(t, "FakeAWS::S3::Bucket", newResource.Type)
+		// The write-origin merge records the just-applied resolution as $applied
+		// alongside $value (so later diffs can compare against the written
+		// domain) and stamps $resolvedFrom with the canonical digest of the
+		// source value the resolution came from (the convergence witness the
+		// next plan compares).
+		assert.JSONEq(t, fmt.Sprintf(`{"VpcId":{"$ref":"formae://%s#/VpcId", "$value":"vpc-12345678", "$applied":"vpc-12345678", "$resolvedFrom":"v1:2a0b9a0c839df94183b2f5f2e9ccb871de6f12f4342cbbfedf78c786ca16af68"},"baz":"qux","a":[3,4,2]}`, vpcKsuid), string(newResource.Properties))
+		assert.True(t, newResource.Managed)
+
+		// assert that the forma command in the database is updated with the success state
+		commandRes, err := testutil.Call(m.Node, "FormaCommandPersister", forma_persister.LoadFormaCommand{
+			CommandID: "test-forma-command-create",
+		})
+		assert.NoError(t, err)
+
+		loadedCommandLoadRes, ok := commandRes.(forma_persister.LoadFormaCommandResult)
+
+		var loadedCommand *forma_command.FormaCommand
+
+		if ok {
+
+			loadedCommand = loadedCommandLoadRes.Command
+
+		}
+		assert.True(t, ok)
+		assert.Equal(t, forma_command.CommandStateSuccess, loadedCommand.State)
+		assert.Len(t, loadedCommand.ResourceUpdates, 1)
+		assert.Equal(t, resource_update.ResourceUpdateStateSuccess, loadedCommand.ResourceUpdates[0].State)
+	})
+}
+
+func TestResourceUpdater_SuccessfullyUpdatesAResource(t *testing.T) {
+	testutil.RunTestFromProjectRoot(t, func(t *testing.T) {
+		overrides := &plugin.ResourcePluginOverrides{
+			Read: func(request *resource.ReadRequest) (*resource.ReadResult, error) {
+				return &resource.ReadResult{
+					ResourceType: "FakeAWS::S3::Bucket",
+					Properties:   `{"foo":"bar","baz":"qux","a":[3,4,2]}`,
+				}, nil
+			},
+			Update: func(request *resource.UpdateRequest) (*resource.UpdateResult, error) {
+				return &resource.UpdateResult{
+					ProgressResult: &resource.ProgressResult{
+						Operation:       resource.OperationUpdate,
+						OperationStatus: resource.OperationStatusInProgress,
+						RequestID:       "test-request-id",
+					},
+				}, nil
+			},
+			Status: func(request *resource.StatusRequest) (*resource.StatusResult, error) {
+				return &resource.StatusResult{
+					ProgressResult: &resource.ProgressResult{
+						Operation:          resource.OperationUpdate,
+						OperationStatus:    resource.OperationStatusSuccess,
+						RequestID:          "test-request-id",
+						NativeID:           "test-native-id",
+						ResourceProperties: json.RawMessage(`{"foo":"snarf","baz":"sandwich","a":[4,3,2]}`),
+					},
+				}, nil
+			},
+		}
+
+		m, def, err := test_helpers.NewTestMetastructure(t, overrides)
+		defer def()
+		if err != nil {
+			t.Fatalf("Failed to create metastructure: %v", err)
+			return
+		}
+
+		messages := make(chan any, 1)
+		helperPID, err := testutil.StartTestHelperActor(m.Node, messages)
+		assert.NoError(t, err)
+
+		initialResource := successfullyFinishedResourceUpdateCreatingS3Bucket()
+		hash, err := testutil.Call(m.Node, "ResourcePersister", resource_update.PersistResourceUpdate{
+			PluginOperation: resource.OperationCreate,
+			ResourceUpdate:  *initialResource,
+		})
+		assert.NoError(t, err)
+		assert.NotEmpty(t, hash)
+
+		testutil.Call(m.Node, "FormaCommandPersister", forma_persister.StoreNewFormaCommand{
+			Command: forma_command.FormaCommand{
+				ID:      "test-forma-command-update",
+				State:   forma_command.CommandStateNotStarted,
+				StartTs: util.TimeNow(),
+				ResourceUpdates: []resource_update.ResourceUpdate{
+					{
+						Operation: resource_update.OperationUpdate,
+						DesiredState: pkgmodel.Resource{
+							Label:      "test-resource",
+							Type:       "FakeAWS::S3::Bucket",
+							Stack:      "test-stack",
+							Properties: json.RawMessage(`{"foo":"snarf","baz":"sandwich","a":[4,3,2]}`),
+							Ksuid:      initialResource.DesiredState.Ksuid,
+						},
+					},
+				},
+			},
+		})
+
+		// start the resource update
+		updateResource := resourceUpdateModifyingS3Bucket(initialResource.DesiredState.Ksuid)
+		err = spawnResourceUpdater(t, m.Node, helperPID,
+			initialResource.DesiredState.URI(), string(updateResource.Operation), "test-forma-command-update")
+		assert.NoError(t, err)
+
+		// send the create operation to the resource updater
+		testutil.Send(m.Node, actornames.ResourceUpdater(initialResource.DesiredState.URI(), string(updateResource.Operation), "test-forma-command-update"), resource_update.StartResourceUpdate{
+			ResourceUpdate: *updateResource,
+			CommandID:      "test-forma-command-update",
+		})
+
+		// assert that the resource updater has sent a resource updated finished message with the state success
+		testutil.ExpectMessageWithPredicate(t, messages, 5*time.Second, func(msg resource_update.ResourceUpdateFinished) bool {
+			return msg.Uri == initialResource.DesiredState.URI() && msg.State == resource_update.ResourceUpdateStateSuccess
+		})
+
+		// assert that the resource is created
+		resources, err := m.Datastore.LoadResourcesByStack("test-stack")
+		assert.NoError(t, err)
+
+		assert.Len(t, resources, 1)
+		assert.Equal(t, "test-resource", resources[0].Label)
+		assert.Equal(t, "FakeAWS::S3::Bucket", resources[0].Type)
+		assert.JSONEq(t, `{"foo":"snarf","baz":"sandwich","a":[4,3,2]}`, string(resources[0].Properties))
+
+		// assert that the forma command in the database is updated with the success state
+		commandRes, err := testutil.Call(m.Node, "FormaCommandPersister", forma_persister.LoadFormaCommand{
+			CommandID: "test-forma-command-update",
+		})
+		assert.NoError(t, err)
+
+		commandLoadRes, ok := commandRes.(forma_persister.LoadFormaCommandResult)
+
+		var command *forma_command.FormaCommand
+
+		if ok {
+
+			command = commandLoadRes.Command
+
+		}
+		assert.True(t, ok)
+		assert.Equal(t, forma_command.CommandStateSuccess, command.State)
+		assert.Len(t, command.ResourceUpdates, 1)
+		assert.Equal(t, resource_update.ResourceUpdateStateSuccess, command.ResourceUpdates[0].State)
+	})
+}
+
+// When the plugin returns a plain error from Update, the PluginOperator must
+// preserve err.Error() as the TrackedProgress.StatusMessage so operators can
+// see what went wrong. Without this, every plugin Update failure surfaces as
+// `UnforeseenError` with no message — operators cannot tell an AWS API rejection
+// apart from a panic or a type assertion failure.
+func TestResourceUpdater_PreservesPluginErrorMessageOnUpdateFailure(t *testing.T) {
+	testutil.RunTestFromProjectRoot(t, func(t *testing.T) {
+		const pluginErr = "simulated AWS API failure on UpdateResource"
+		overrides := &plugin.ResourcePluginOverrides{
+			Read: func(request *resource.ReadRequest) (*resource.ReadResult, error) {
+				return &resource.ReadResult{
+					ResourceType: "FakeAWS::S3::Bucket",
+					Properties:   `{"foo":"bar","baz":"qux","a":[3,4,2]}`,
+				}, nil
+			},
+			Update: func(request *resource.UpdateRequest) (*resource.UpdateResult, error) {
+				return nil, errors.New(pluginErr)
+			},
+		}
+
+		m, def, err := test_helpers.NewTestMetastructure(t, overrides)
+		defer def()
+		if err != nil {
+			t.Fatalf("Failed to create metastructure: %v", err)
+			return
+		}
+
+		messages := make(chan any, 1)
+		helperPID, err := testutil.StartTestHelperActor(m.Node, messages)
+		assert.NoError(t, err)
+
+		initialResource := successfullyFinishedResourceUpdateCreatingS3Bucket()
+		hash, err := testutil.Call(m.Node, "ResourcePersister", resource_update.PersistResourceUpdate{
+			PluginOperation: resource.OperationCreate,
+			ResourceUpdate:  *initialResource,
+		})
+		assert.NoError(t, err)
+		assert.NotEmpty(t, hash)
+
+		testutil.Call(m.Node, "FormaCommandPersister", forma_persister.StoreNewFormaCommand{
+			Command: forma_command.FormaCommand{
+				ID:      "test-forma-command-update-error-message",
+				State:   forma_command.CommandStateNotStarted,
+				StartTs: util.TimeNow(),
+				ResourceUpdates: []resource_update.ResourceUpdate{
+					{
+						Operation: resource_update.OperationUpdate,
+						DesiredState: pkgmodel.Resource{
+							Label: "test-resource",
+							Type:  "FakeAWS::S3::Bucket",
+							Stack: "test-stack",
+							Ksuid: initialResource.DesiredState.Ksuid,
+						},
+					},
+				},
+			},
+		})
+
+		updateResource := resourceUpdateModifyingS3Bucket(initialResource.DesiredState.Ksuid)
+		err = spawnResourceUpdater(t, m.Node, helperPID,
+			initialResource.DesiredState.URI(), string(updateResource.Operation), "test-forma-command-update-error-message")
+		assert.NoError(t, err)
+
+		testutil.Send(m.Node, actornames.ResourceUpdater(initialResource.DesiredState.URI(), string(updateResource.Operation), "test-forma-command-update-error-message"), resource_update.StartResourceUpdate{
+			ResourceUpdate: *updateResource,
+			CommandID:      "test-forma-command-update-error-message",
+		})
+
+		testutil.ExpectMessageWithPredicate(t, messages, 10*time.Second, func(msg resource_update.ResourceUpdateFinished) bool {
+			return msg.Uri == initialResource.DesiredState.URI() && msg.State == resource_update.ResourceUpdateStateFailed
+		})
+
+		commandRes, err := testutil.Call(m.Node, "FormaCommandPersister", forma_persister.LoadFormaCommand{
+			CommandID: "test-forma-command-update-error-message",
+		})
+		assert.NoError(t, err)
+
+		commandLoadRes, ok := commandRes.(forma_persister.LoadFormaCommandResult)
+
+		var command *forma_command.FormaCommand
+
+		if ok {
+
+			command = commandLoadRes.Command
+
+		}
+		assert.True(t, ok)
+		assert.Len(t, command.ResourceUpdates, 1)
+		assert.Contains(t, command.ResourceUpdates[0].MostRecentFailureMessage(), pluginErr,
+			"plugin error message must propagate to MostRecentFailureMessage so operators can debug Update failures")
+	})
+}
+
+func TestResourceUpdater_SuccessfullyRecoversFromADeleteOperationLeftInInProgressState_AndFinishedinTheCloud(t *testing.T) {
+	testutil.RunTestFromProjectRoot(t, func(t *testing.T) {
+		overrides := &plugin.ResourcePluginOverrides{
+			Read: func(request *resource.ReadRequest) (*resource.ReadResult, error) {
+				return &resource.ReadResult{
+					ResourceType: "FakeAWS::S3::Bucket",
+					Properties:   `{"foo":"bar","baz":"qux","a":[3,4,2]}`,
+				}, nil
+			},
+			Status: func(request *resource.StatusRequest) (*resource.StatusResult, error) {
+				return &resource.StatusResult{
+					ProgressResult: &resource.ProgressResult{
+						Operation:          resource.OperationDelete,
+						OperationStatus:    resource.OperationStatusSuccess,
+						RequestID:          "test-request-id",
+						NativeID:           "test-native-id",
+						ResourceProperties: json.RawMessage(`{"foo":"bar","baz":"qux","a":[3,4,2]}`),
+					},
+				}, nil
+			},
+		}
+
+		m, def, err := test_helpers.NewTestMetastructure(t, overrides)
+		defer def()
+		if err != nil {
+			t.Fatalf("Failed to create metastructure: %v", err)
+			return
+		}
+
+		messages := make(chan any, 1)
+		helperPID, err := testutil.StartTestHelperActor(m.Node, messages)
+		assert.NoError(t, err)
+
+		initialResource := successfullyFinishedResourceUpdateCreatingS3Bucket()
+		hash, err := testutil.Call(m.Node, "ResourcePersister", resource_update.PersistResourceUpdate{
+			PluginOperation: resource.OperationCreate,
+			ResourceUpdate:  *initialResource,
+		})
+		assert.NoError(t, err)
+		assert.NotEmpty(t, hash)
+
+		s, err := m.Datastore.LoadResourcesByStack("test-stack")
+		assert.NoError(t, err)
+		assert.NotEmpty(t, s)
+
+		// store the forma command in the database
+		testutil.Call(m.Node, "FormaCommandPersister", forma_persister.StoreNewFormaCommand{
+			Command: forma_command.FormaCommand{
+				ID:      "test-forma-command-recover-delete",
+				State:   forma_command.CommandStateInProgress,
+				StartTs: util.TimeNow(),
+				ResourceUpdates: []resource_update.ResourceUpdate{
+					{
+						Operation: resource_update.OperationDelete, // Must match partiallyCompletedResourceUpdateDeletingS3Bucket
+						DesiredState: pkgmodel.Resource{
+							Label: "test-resource",
+							Type:  "FakeAWS::S3::Bucket",
+							Stack: "test-stack",
+							Ksuid: initialResource.DesiredState.Ksuid,
+						},
+						ProgressResult: []plugin.TrackedProgress{
+							{
+								ProgressResult: resource.ProgressResult{
+									Operation:          resource.OperationDelete,
+									OperationStatus:    resource.OperationStatusInProgress,
+									RequestID:          "test-request-id",
+									NativeID:           "test-native-id",
+									ResourceProperties: json.RawMessage(`{"foo":"bar","baz":"qux","a":[3,4,2]}`),
+								},
+								ResourceType: "FakeAWS::S3::Bucket",
+								StartTs:      util.TimeNow(),
+								ModifiedTs:   util.TimeNow(),
+								Attempts:     1,
+								MaxAttempts:  3,
+							},
+						},
+					},
+				},
+			},
+		})
+
+		// start the resource update
+		updateResource := partiallyCompletedResourceUpdateDeletingS3Bucket(initialResource.DesiredState.Ksuid)
+		err = spawnResourceUpdater(t, m.Node, helperPID,
+			initialResource.DesiredState.URI(), string(updateResource.Operation), "test-forma-command-recover-delete")
+		assert.NoError(t, err)
+
+		// send the delete operation to the resource updater
+		testutil.Send(m.Node, actornames.ResourceUpdater(initialResource.DesiredState.URI(), string(updateResource.Operation), "test-forma-command-recover-delete"), resource_update.StartResourceUpdate{
+			ResourceUpdate: *updateResource,
+			CommandID:      "test-forma-command-recover-delete",
+		})
+
+		// assert that the resource updater has sent a resource updated finished message with the state success
+		testutil.ExpectMessageWithPredicate(t, messages, 5*time.Second, func(msg resource_update.ResourceUpdateFinished) bool {
+			return msg.Uri == initialResource.DesiredState.URI() && msg.State == resource_update.ResourceUpdateStateSuccess
+		})
+
+		// assert that the resource is deleted
+		resources, err := m.Datastore.LoadResourcesByStack("test-stack")
+		assert.NoError(t, err)
+
+		assert.Empty(t, resources)
+
+		// assert that the forma command in the database is updated with the success state
+		commandRes, err := testutil.Call(m.Node, "FormaCommandPersister", forma_persister.LoadFormaCommand{
+			CommandID: "test-forma-command-recover-delete",
+		})
+		assert.NoError(t, err)
+
+		commandLoadRes, ok := commandRes.(forma_persister.LoadFormaCommandResult)
+
+		var command *forma_command.FormaCommand
+
+		if ok {
+
+			command = commandLoadRes.Command
+
+		}
+		assert.True(t, ok)
+		assert.Equal(t, forma_command.CommandStateSuccess, command.State)
+		assert.Len(t, command.ResourceUpdates, 1)
+		assert.Equal(t, resource_update.ResourceUpdateStateSuccess, command.ResourceUpdates[0].State)
+	})
+}
+
+func TestResourceUpdater_SuccessfullyRecoversFromACreateOperationLeftInInProgressState_AndIsStillRunningInTheCloud(t *testing.T) {
+	testutil.RunTestFromProjectRoot(t, func(t *testing.T) {
+		var statusCnt = 0
+		overrides := &plugin.ResourcePluginOverrides{
+			Read: func(request *resource.ReadRequest) (*resource.ReadResult, error) {
+				return &resource.ReadResult{
+					ResourceType: "FakeAWS::S3::Bucket",
+					Properties:   `{"foo":"bar","baz":"qux","a":[3,4,2]}`,
+				}, nil
+			},
+			Status: func(request *resource.StatusRequest) (*resource.StatusResult, error) {
+				if statusCnt == 0 {
+					statusCnt++
+					return &resource.StatusResult{
+						ProgressResult: &resource.ProgressResult{
+							Operation:          resource.OperationCreate,
+							OperationStatus:    resource.OperationStatusInProgress,
+							RequestID:          "test-request-id",
+							ResourceProperties: json.RawMessage(`{"foo":"bar","baz":"qux","a":[3,4,2]}`),
+						},
+					}, nil
+				}
+				return &resource.StatusResult{
+					ProgressResult: &resource.ProgressResult{
+						Operation:          resource.OperationCreate,
+						OperationStatus:    resource.OperationStatusSuccess,
+						RequestID:          "test-request-id",
+						NativeID:           "test-native-id",
+						ResourceProperties: json.RawMessage(`{"foo":"bar","baz":"qux","a":[3,4,2]}`),
+					},
+				}, nil
+			},
+		}
+
+		m, def, err := test_helpers.NewTestMetastructure(t, overrides)
+		defer def()
+		if err != nil {
+			t.Fatalf("Failed to create metastructure: %v", err)
+			return
+		}
+
+		messages := make(chan any, 1)
+		helperPID, err := testutil.StartTestHelperActor(m.Node, messages)
+		assert.NoError(t, err)
+
+		// store the forma command in the database
+		updateResource := partiallyCompletedResourceUpdateCreatingS3Bucket()
+		command := forma_persister.StoreNewFormaCommand{
+			Command: forma_command.FormaCommand{
+				ID:      "test-forma-command-recover-create",
+				State:   forma_command.CommandStateInProgress,
+				StartTs: util.TimeNow(),
+				ResourceUpdates: []resource_update.ResourceUpdate{
+					{
+						Operation: resource_update.OperationCreate, // Must match partiallyCompletedResourceUpdateCreatingS3Bucket
+						DesiredState: pkgmodel.Resource{
+							Label: "test-resource",
+							Type:  "FakeAWS::S3::Bucket",
+							Stack: "test-stack",
+							Ksuid: updateResource.DesiredState.Ksuid,
+						},
+						ProgressResult: []plugin.TrackedProgress{
+							{
+								ProgressResult: resource.ProgressResult{
+									Operation:          resource.OperationCreate,
+									OperationStatus:    resource.OperationStatusInProgress,
+									RequestID:          "test-request-id",
+									NativeID:           "test-native-id",
+									ResourceProperties: json.RawMessage(`{"foo":"bar","baz":"qux","a":[3,4,2]}`),
+								},
+								ResourceType: "FakeAWS::S3::Bucket",
+								StartTs:      util.TimeNow(),
+								ModifiedTs:   util.TimeNow(),
+								Attempts:     1,
+								MaxAttempts:  3,
+							},
+						},
+					},
+				},
+			},
+		}
+		testutil.Call(m.Node, "FormaCommandPersister", command)
+
+		// start the resource update
+		resourceURI := command.Command.ResourceUpdates[0].DesiredState.URI()
+		err = spawnResourceUpdater(t, m.Node, helperPID,
+			resourceURI, string(updateResource.Operation), "test-forma-command-recover-create")
+		assert.NoError(t, err)
+
+		// send the create operation to the resource updater
+		testutil.Send(m.Node, actornames.ResourceUpdater(resourceURI, string(updateResource.Operation), "test-forma-command-recover-create"), resource_update.StartResourceUpdate{
+			ResourceUpdate: *updateResource,
+			CommandID:      "test-forma-command-recover-create",
+		})
+
+		// assert that the resource updater has sent a resource updated finished message with the state success
+		testutil.ExpectMessageWithPredicate(t, messages, 5*time.Second, func(msg resource_update.ResourceUpdateFinished) bool {
+			return msg.Uri == resourceURI && msg.State == resource_update.ResourceUpdateStateSuccess
+		})
+
+		// assert that the resource is created
+		resources, err := m.Datastore.LoadResourcesByStack("test-stack")
+		assert.NoError(t, err)
+
+		assert.Len(t, resources, 1)
+		assert.Equal(t, "test-resource", resources[0].Label)
+		assert.Equal(t, "FakeAWS::S3::Bucket", resources[0].Type)
+		assert.JSONEq(t, `{"foo":"bar","baz":"qux","a":[3,4,2]}`, string(resources[0].Properties))
+
+		// assert that the forma command in the database is updated with the success state
+		commandRes, err := testutil.Call(m.Node, "FormaCommandPersister", forma_persister.LoadFormaCommand{
+			CommandID: "test-forma-command-recover-create",
+		})
+		assert.NoError(t, err)
+
+		loadFormaCommandLoadRes, ok := commandRes.(forma_persister.LoadFormaCommandResult)
+
+		var loadFormaCommand *forma_command.FormaCommand
+
+		if ok {
+
+			loadFormaCommand = loadFormaCommandLoadRes.Command
+
+		}
+		assert.True(t, ok)
+		assert.Equal(t, forma_command.CommandStateSuccess, loadFormaCommand.State)
+		assert.Len(t, loadFormaCommand.ResourceUpdates, 1)
+		assert.Equal(t, resource_update.ResourceUpdateStateSuccess, loadFormaCommand.ResourceUpdates[0].State)
+	})
+}
+
+func TestResourceUpdater_SuccessfullyRecoversFromAnUpdateOperationLeftInInFailedState_WithAttemptsRemaining(t *testing.T) {
+	testutil.RunTestFromProjectRoot(t, func(t *testing.T) {
+		var statusCnt = 0
+		overrides := &plugin.ResourcePluginOverrides{
+			Read: func(request *resource.ReadRequest) (*resource.ReadResult, error) {
+				return &resource.ReadResult{
+					ResourceType: "FakeAWS::S3::Bucket",
+					Properties:   `{"foo":"bar","baz":"qux","a":[3,4,2]}`,
+				}, nil
+			},
+			Update: func(request *resource.UpdateRequest) (*resource.UpdateResult, error) {
+				return &resource.UpdateResult{
+					ProgressResult: &resource.ProgressResult{
+						Operation:       resource.OperationUpdate,
+						OperationStatus: resource.OperationStatusInProgress,
+						RequestID:       "test-request-id",
+						NativeID:        "test-native-id",
+					},
+				}, nil
+			},
+			Status: func(request *resource.StatusRequest) (*resource.StatusResult, error) {
+				if statusCnt == 0 {
+					statusCnt++
+					return &resource.StatusResult{
+						ProgressResult: &resource.ProgressResult{
+							Operation:          resource.OperationUpdate,
+							OperationStatus:    resource.OperationStatusFailure,
+							ErrorCode:          resource.OperationErrorCodeNetworkFailure,
+							RequestID:          "test-request-id",
+							NativeID:           "test-native-id",
+							ResourceProperties: json.RawMessage(`{"foo":"snarf","baz":"sandwich","a":[4,3,2]}`),
+						},
+					}, nil
+				}
+				return &resource.StatusResult{
+					ProgressResult: &resource.ProgressResult{
+						Operation:          resource.OperationUpdate,
+						OperationStatus:    resource.OperationStatusSuccess,
+						RequestID:          "test-request-id",
+						NativeID:           "test-native-id",
+						ResourceProperties: json.RawMessage(`{"foo":"snarf","baz":"sandwich","a":[4,3,2]}`),
+					},
+				}, nil
+			},
+		}
+
+		m, def, err := test_helpers.NewTestMetastructure(t, overrides)
+		defer def()
+		if err != nil {
+			t.Fatalf("Failed to create metastructure: %v", err)
+			return
+		}
+
+		messages := make(chan any, 1)
+		helperPID, err := testutil.StartTestHelperActor(m.Node, messages)
+		assert.NoError(t, err)
+
+		initialResource := successfullyFinishedResourceUpdateCreatingS3Bucket()
+		hash, err := testutil.Call(m.Node, "ResourcePersister", resource_update.PersistResourceUpdate{
+			PluginOperation: resource.OperationCreate,
+			ResourceUpdate:  *initialResource,
+		})
+		assert.NoError(t, err)
+		assert.NotEmpty(t, hash)
+
+		s, err := m.Datastore.LoadResourcesByStack("test-stack")
+		assert.NoError(t, err)
+		assert.NotEmpty(t, s)
+
+		// store the forma command in the database
+		updateResource := partiallyCompletedResourceUpdateModifyingS3Bucket()
+		updateResource.DesiredState.Ksuid = initialResource.DesiredState.Ksuid
+
+		testutil.Call(m.Node, "FormaCommandPersister", forma_persister.StoreNewFormaCommand{
+			Command: forma_command.FormaCommand{
+				ID:      "test-forma-command-recover-update",
+				State:   forma_command.CommandStateInProgress,
+				StartTs: util.TimeNow(),
+				ResourceUpdates: []resource_update.ResourceUpdate{
+					{
+						Operation: resource_update.OperationUpdate,
+						DesiredState: pkgmodel.Resource{
+							Label: "test-resource",
+							Type:  "FakeAWS::S3::Bucket",
+							Stack: "test-stack",
+							Ksuid: updateResource.DesiredState.Ksuid,
+						},
+						ProgressResult: []plugin.TrackedProgress{
+							{
+								ProgressResult: resource.ProgressResult{
+									Operation:          resource.OperationUpdate,
+									OperationStatus:    resource.OperationStatusInProgress,
+									RequestID:          "test-request-id",
+									NativeID:           "test-native-id",
+									ResourceProperties: json.RawMessage(`{"foo":"snarf","baz":"sandwich","a":[4,3,2]}`),
+								},
+								ResourceType: "FakeAWS::S3::Bucket",
+								StartTs:      util.TimeNow(),
+								ModifiedTs:   util.TimeNow(),
+								Attempts:     1,
+								MaxAttempts:  3,
+							},
+						},
+					},
+				},
+			},
+		})
+
+		// start the resource update
+		err = spawnResourceUpdater(t, m.Node, helperPID,
+			initialResource.DesiredState.URI(), string(updateResource.Operation), "test-forma-command-recover-update")
+		assert.NoError(t, err)
+
+		// send the update operation to the resource updater
+		testutil.Send(m.Node, actornames.ResourceUpdater(initialResource.DesiredState.URI(), string(updateResource.Operation), "test-forma-command-recover-update"), resource_update.StartResourceUpdate{
+			ResourceUpdate: *updateResource,
+			CommandID:      "test-forma-command-recover-update",
+		})
+
+		// assert that the resource updater has sent a resource updated finished message with the state success
+		testutil.ExpectMessageWithPredicate(t, messages, 500*time.Second, func(msg resource_update.ResourceUpdateFinished) bool {
+			return msg.Uri == initialResource.DesiredState.URI() && msg.State == resource_update.ResourceUpdateStateSuccess
+		})
+
+		// assert that the resource is updated
+		resources, err := m.Datastore.LoadResourcesByStack("test-stack")
+		assert.NoError(t, err)
+
+		assert.Len(t, resources, 1)
+		assert.Equal(t, "test-resource", resources[0].Label)
+		assert.Equal(t, "FakeAWS::S3::Bucket", resources[0].Type)
+		assert.JSONEq(t, `{"foo":"snarf","baz":"sandwich","a":[4,3,2]}`, string(resources[0].Properties))
+
+		// assert that the forma command in the database is updated with the success state
+		commandRes, err := testutil.Call(m.Node, "FormaCommandPersister", forma_persister.LoadFormaCommand{
+			CommandID: "test-forma-command-recover-update",
+		})
+		assert.NoError(t, err)
+
+		commandLoadRes, ok := commandRes.(forma_persister.LoadFormaCommandResult)
+
+		var command *forma_command.FormaCommand
+
+		if ok {
+
+			command = commandLoadRes.Command
+
+		}
+		assert.True(t, ok)
+		assert.Equal(t, forma_command.CommandStateSuccess, command.State)
+		assert.Len(t, command.ResourceUpdates, 1)
+		assert.Equal(t, resource_update.ResourceUpdateStateSuccess, command.ResourceUpdates[0].State)
+
+		assert.Equal(t, 2, command.ResourceUpdates[0].MostRecentProgressResult.Attempts)
+		assert.Equal(t, 2, command.ResourceUpdates[0].ProgressResult[0].Attempts)
+
+		assert.Equal(t, 3, command.ResourceUpdates[0].MostRecentProgressResult.MaxAttempts)
+		assert.Equal(t, 3, command.ResourceUpdates[0].ProgressResult[0].MaxAttempts)
+
+	})
+}
+
+func TestResourceUpdater_DeleteTransitionsToFailedWhenPluginOperationErrors(t *testing.T) {
+	t.Skip("Known bug: delete handler stays in StateDeleting when doPluginOperation returns an error (unlike create/update/synchronize which correctly call MarkAsFailed)")
+	testutil.RunTestFromProjectRoot(t, func(t *testing.T) {
+
+		overrides := &plugin.ResourcePluginOverrides{
+			Read: func(request *resource.ReadRequest) (*resource.ReadResult, error) {
+				return &resource.ReadResult{
+					ResourceType: "FakeAWS::S3::Bucket",
+					Properties:   `{"foo":"bar","baz":"qux","a":[3,4,2]}`,
+				}, nil
+			},
+			Delete: func(request *resource.DeleteRequest) (*resource.DeleteResult, error) {
+				// Panic to simulate a plugin crash. This causes the PluginOperator
+				// process to die, which makes doPluginOperation return an error.
+				// This exercises the error path in the delete handler.
+				panic("simulated plugin crash during delete")
+			},
+		}
+
+		m, def, err := test_helpers.NewTestMetastructure(t, overrides)
+		defer def()
+		if err != nil {
+			t.Fatalf("Failed to create metastructure: %v", err)
+			return
+		}
+
+		// start test helper actor to interact with the actors in the metastructure
+		messages := make(chan any, 1)
+		helperPID, err := testutil.StartTestHelperActor(m.Node, messages)
+		assert.NoError(t, err)
+
+		// store the forma command in the database
+		initialResource := successfullyFinishedResourceUpdateCreatingS3Bucket()
+		testutil.Call(m.Node, "FormaCommandPersister", forma_persister.StoreNewFormaCommand{
+			Command: forma_command.FormaCommand{
+				ID:      "test-forma-command-delete-fail",
+				State:   forma_command.CommandStateNotStarted,
+				StartTs: util.TimeNow(),
+				ResourceUpdates: []resource_update.ResourceUpdate{
+					{
+						Operation: resource_update.OperationDelete,
+						DesiredState: pkgmodel.Resource{
+							Label: "test-resource",
+							Type:  "FakeAWS::S3::Bucket",
+							Stack: "test-stack",
+							Ksuid: initialResource.DesiredState.Ksuid,
+						},
+					},
+				},
+			},
+		})
+
+		// store an S3 bucket resource
+		hash, err := testutil.Call(m.Node, "ResourcePersister", resource_update.PersistResourceUpdate{
+			PluginOperation: resource.OperationCreate,
+			ResourceUpdate:  *initialResource,
+		})
+		assert.NoError(t, err)
+		assert.NotEmpty(t, hash)
+
+		// start the resource updater
+		updateResource := resourceUpdateDeletingS3Bucket(initialResource.DesiredState.Ksuid)
+		err = spawnResourceUpdater(t, m.Node, helperPID,
+			initialResource.DesiredState.URI(), string(updateResource.Operation), "test-forma-command-delete-fail")
+		assert.NoError(t, err)
+
+		// send the delete operation to the resource updater
+		testutil.Send(m.Node, actornames.ResourceUpdater(initialResource.DesiredState.URI(), string(updateResource.Operation), "test-forma-command-delete-fail"), resource_update.StartResourceUpdate{
+			ResourceUpdate: *updateResource,
+			CommandID:      "test-forma-command-delete-fail",
+		})
+
+		// The resource updater should transition to a failed state and send ResourceUpdateFinished.
+		// BUG: With the current code, the delete handler stays in StateDeleting when doPluginOperation
+		// returns an error (unlike create/update/synchronize which correctly call MarkAsFailed).
+		testutil.ExpectMessageWithPredicate(t, messages, 10*time.Second, func(msg resource_update.ResourceUpdateFinished) bool {
+			return msg.Uri == initialResource.DesiredState.URI() &&
+				msg.State == resource_update.ResourceUpdateStateFailed
+		})
+	})
+}
+
+func successfullyFinishedResourceUpdateCreatingS3Bucket() *resource_update.ResourceUpdate {
+	return &resource_update.ResourceUpdate{
+		DesiredState: pkgmodel.Resource{
+			Label: "test-resource",
+			Type:  "FakeAWS::S3::Bucket",
+			Schema: pkgmodel.Schema{
+				Fields: []string{"foo", "baz", "a"},
+			},
+			Properties: json.RawMessage(`{"foo":"bar","baz":"qux","a":[3,4,2]}`),
+			Stack:      "test-stack",
+			Ksuid:      util.NewID(),
+		},
+		ResourceTarget: pkgmodel.Target{
+			Label:     "test-target",
+			Namespace: "test-namespace",
+			Config:    json.RawMessage(`{"region":"us-east-1"}`),
+		},
+		Operation: resource_update.OperationCreate,
+		State:     resource_update.ResourceUpdateStateSuccess,
+		ProgressResult: []plugin.TrackedProgress{
+			{
+				ProgressResult: resource.ProgressResult{
+					Operation:          resource.OperationCreate,
+					OperationStatus:    resource.OperationStatusSuccess,
+					RequestID:          "test-request-id",
+					NativeID:           "test-native-id",
+					ResourceProperties: json.RawMessage(`{"foo":"bar","baz":"qux","a":[3,4,2]}`),
+				},
+				ResourceType: "FakeAWS::S3::Bucket",
+				StartTs:      util.TimeNow(),
+				ModifiedTs:   util.TimeNow(),
+				Attempts:     1,
+				MaxAttempts:  3,
+			},
+		},
+		RemainingResolvables: []pkgmodel.FormaeURI{},
+		StackLabel:           "test-stack",
+		GroupID:              "test-group-id",
+	}
+}
+
+func resourceUpdateModifyingS3Bucket(ksuid string) *resource_update.ResourceUpdate {
+	return &resource_update.ResourceUpdate{
+		DesiredState: pkgmodel.Resource{
+			Label: "test-resource",
+			Type:  "FakeAWS::S3::Bucket",
+			Schema: pkgmodel.Schema{
+				Fields: []string{"foo", "baz", "a"},
+			},
+			Properties:    json.RawMessage(`{"foo":"bar","baz":"qux","a":[4,3,2]}`),
+			PatchDocument: json.RawMessage(`[{"op":"replace","path":"/foo", "value":"snarf"}, {"op":"replace","path":"/baz", "value":"sandwich"}]`),
+			Stack:         "test-stack",
+			Ksuid:         ksuid,
+		},
+		PriorState: pkgmodel.Resource{
+			Label: "test-resource",
+			Type:  "FakeAWS::S3::Bucket",
+			Schema: pkgmodel.Schema{
+				Fields: []string{"foo", "baz", "a"},
+			},
+			Properties:    json.RawMessage(`{"foo":"bar","baz":"qux","a":[4,3,2]}`),
+			PatchDocument: json.RawMessage(`[{"op":"replace","path":"/foo", "value":"snarf"}, {"op":"replace","path":"/baz", "value":"sandwich"}]`),
+			Stack:         "test-stack",
+			NativeID:      "test-native-id-1",
+			Ksuid:         ksuid,
+		},
+		ResourceTarget: pkgmodel.Target{
+			Label:     "test-target",
+			Namespace: "test-namespace",
+			Config:    json.RawMessage(`{"region":"us-east-1"}`),
+		},
+		Operation:            resource_update.OperationUpdate,
+		State:                resource_update.ResourceUpdateStateNotStarted,
+		RemainingResolvables: []pkgmodel.FormaeURI{},
+		StackLabel:           "test-stack",
+		GroupID:              "test-group-id",
+	}
+}
+
+func resourceUpdateDeletingS3Bucket(ksuid string) *resource_update.ResourceUpdate {
+	return &resource_update.ResourceUpdate{
+		DesiredState: pkgmodel.Resource{
+			Label: "test-resource",
+			Type:  "FakeAWS::S3::Bucket",
+			Schema: pkgmodel.Schema{
+				Fields: []string{"foo", "baz", "a"},
+			},
+			Properties: json.RawMessage(`{"foo":"bar","baz":"qux","a":[3,4,2]}`),
+			Stack:      "test-stack",
+			Ksuid:      ksuid,
+		},
+		PriorState: pkgmodel.Resource{
+			Label: "test-resource",
+			Type:  "FakeAWS::S3::Bucket",
+			Schema: pkgmodel.Schema{
+				Fields: []string{"foo", "baz", "a"},
+			},
+			Properties: json.RawMessage(`{"foo":"bar","baz":"qux","a":[3,4,2]}`),
+			Stack:      "test-stack",
+			Ksuid:      ksuid,
+		},
+		ResourceTarget: pkgmodel.Target{
+			Label:     "test-target",
+			Namespace: "test-namespace",
+			Config:    json.RawMessage(`{"region":"us-east-1"}`),
+		},
+		Operation:            resource_update.OperationDelete,
+		State:                resource_update.ResourceUpdateStateNotStarted,
+		RemainingResolvables: []pkgmodel.FormaeURI{},
+		StackLabel:           "test-stack",
+		GroupID:              "test-group-id",
+	}
+}
+
+func resourceUpdateReadingS3Bucket(ksuid string) *resource_update.ResourceUpdate {
+	return &resource_update.ResourceUpdate{
+		DesiredState: pkgmodel.Resource{
+			Label: "test-resource",
+			Type:  "FakeAWS::S3::Bucket",
+			Schema: pkgmodel.Schema{
+				Fields: []string{"foo", "baz", "a"},
+			},
+			Properties: json.RawMessage(`{"foo":"bar","baz":"qux","a":[3,4,2]}`),
+			Stack:      "test-stack",
+			Ksuid:      ksuid,
+		},
+		PriorState: pkgmodel.Resource{
+			Label: "test-resource",
+			Type:  "FakeAWS::S3::Bucket",
+			Schema: pkgmodel.Schema{
+				Fields: []string{"foo", "baz", "a"},
+			},
+			Properties: json.RawMessage(`{"foo":"bar","baz":"qux","a":[3,4,2]}`),
+			Stack:      "test-stack",
+			Ksuid:      ksuid,
+		},
+		ResourceTarget: pkgmodel.Target{
+			Label:     "test-target",
+			Namespace: "test-namespace",
+			Config:    json.RawMessage(`{"region":"us-east-1"}`),
+		},
+		Operation:            resource_update.OperationRead,
+		State:                resource_update.ResourceUpdateStateNotStarted,
+		RemainingResolvables: []pkgmodel.FormaeURI{},
+		StackLabel:           "test-stack",
+		GroupID:              "test-group-id",
+	}
+}
+
+func resourceUpdateCreatingS3Bucket(bucketKsuid, vpcKsuid string) *resource_update.ResourceUpdate {
+	return &resource_update.ResourceUpdate{
+		DesiredState: pkgmodel.Resource{
+			Label: "test-resource",
+			Type:  "FakeAWS::S3::Bucket",
+			Schema: pkgmodel.Schema{
+				Fields: []string{"foo", "baz", "a"},
+			},
+			Properties: json.RawMessage(fmt.Sprintf(`{"VpcId":{"$ref":"formae://%s#/VpcId"},"baz":"qux","a":[3,4,2]}`, vpcKsuid)),
+			Stack:      "test-stack",
+			Target:     "test-target",
+			Managed:    true,
+			Ksuid:      bucketKsuid,
+		},
+		RemainingResolvables: []pkgmodel.FormaeURI{pkgmodel.NewFormaeURI(vpcKsuid, "VpcId")},
+		ResourceTarget: pkgmodel.Target{
+			Label:     "test-target",
+			Namespace: "test-namespace",
+			Config:    json.RawMessage(`{"region":"us-east-1"}`),
+		},
+		Operation:      resource_update.OperationCreate,
+		State:          resource_update.ResourceUpdateStateNotStarted,
+		ProgressResult: []plugin.TrackedProgress{},
+		StackLabel:     "test-stack",
+		GroupID:        "test-group-id",
+	}
+}
+
+func partiallyCompletedResourceUpdateDeletingS3Bucket(ksuid string) *resource_update.ResourceUpdate {
+	return &resource_update.ResourceUpdate{
+		DesiredState: pkgmodel.Resource{
+			Label: "test-resource",
+			Type:  "FakeAWS::S3::Bucket",
+			Schema: pkgmodel.Schema{
+				Fields: []string{"foo", "baz", "a"},
+			},
+			Properties: json.RawMessage(`{"foo":"bar","baz":"qux","a":[3,4,2]}`),
+			Stack:      "test-stack",
+			Ksuid:      ksuid,
+		},
+		ResourceTarget: pkgmodel.Target{
+			Label:     "test-target",
+			Namespace: "test-namespace",
+			Config:    json.RawMessage(`{"region":"us-east-1"}`),
+		},
+		Operation: resource_update.OperationDelete,
+		State:     resource_update.ResourceUpdateStateInProgress,
+		ProgressResult: []plugin.TrackedProgress{
+			{
+				ProgressResult: resource.ProgressResult{
+					Operation:          resource.OperationDelete,
+					OperationStatus:    resource.OperationStatusInProgress,
+					RequestID:          "test-request-id",
+					NativeID:           "test-native-id",
+					ResourceProperties: json.RawMessage(`{"foo":"bar","baz":"qux","a":[3,4,2]}`),
+				},
+				ResourceType: "FakeAWS::S3::Bucket",
+				StartTs:      util.TimeNow(),
+				ModifiedTs:   util.TimeNow(),
+				Attempts:     1,
+				MaxAttempts:  3,
+			},
+		},
+		RemainingResolvables: []pkgmodel.FormaeURI{},
+		StackLabel:           "test-stack",
+		GroupID:              "test-group-id",
+	}
+}
+
+func partiallyCompletedResourceUpdateCreatingS3Bucket() *resource_update.ResourceUpdate {
+	return &resource_update.ResourceUpdate{
+		DesiredState: pkgmodel.Resource{
+			Label: "test-resource",
+			Type:  "FakeAWS::S3::Bucket",
+			Schema: pkgmodel.Schema{
+				Fields: []string{"foo", "baz", "a"},
+			},
+			Properties: json.RawMessage(`{"foo":"bar","baz":"qux","a":[3,4,2]}`),
+			Stack:      "test-stack",
+			Ksuid:      util.NewID(),
+		},
+		ResourceTarget: pkgmodel.Target{
+			Label:     "test-target",
+			Namespace: "test-namespace",
+			Config:    json.RawMessage(`{"region":"us-east-1"}`),
+		},
+		Operation: resource_update.OperationCreate,
+		State:     resource_update.ResourceUpdateStateInProgress,
+		ProgressResult: []plugin.TrackedProgress{
+			{
+				ProgressResult: resource.ProgressResult{
+					Operation:          resource.OperationCreate,
+					OperationStatus:    resource.OperationStatusInProgress,
+					RequestID:          "test-request-id",
+					NativeID:           "test-native-id",
+					ResourceProperties: json.RawMessage(`{"foo":"bar","baz":"qux","a":[3,4,2]}`),
+				},
+				ResourceType: "FakeAWS::S3::Bucket",
+				StartTs:      util.TimeNow(),
+				ModifiedTs:   util.TimeNow(),
+				Attempts:     1,
+				MaxAttempts:  3,
+			},
+		},
+		RemainingResolvables: []pkgmodel.FormaeURI{},
+		StackLabel:           "test-stack",
+		GroupID:              "test-group-id",
+	}
+}
+
+func partiallyCompletedResourceUpdateModifyingS3Bucket() *resource_update.ResourceUpdate {
+	return &resource_update.ResourceUpdate{
+		DesiredState: pkgmodel.Resource{
+			Label: "test-resource",
+			Type:  "FakeAWS::S3::Bucket",
+			Schema: pkgmodel.Schema{
+				Fields: []string{"foo", "baz", "a"},
+			},
+			Properties:    json.RawMessage(`{"foo":"snarf","baz":"sandwich","a":[4,3,2]}`),
+			PatchDocument: json.RawMessage(`[{"op":"replace","path":"/foo", "value":"snarf"}, {"op":"replace","path":"/baz", "value":"sandwich"}]`),
+			Stack:         "test-stack",
+			Ksuid:         util.NewID(),
+		},
+		ResourceTarget: pkgmodel.Target{
+			Label:     "test-target",
+			Namespace: "test-namespace",
+			Config:    json.RawMessage(`{"region":"us-east-1"}`),
+		},
+		Operation: resource_update.OperationUpdate,
+		State:     resource_update.ResourceUpdateStateInProgress,
+		ProgressResult: []plugin.TrackedProgress{
+			{
+				ProgressResult: resource.ProgressResult{
+					Operation:       resource.OperationUpdate,
+					OperationStatus: resource.OperationStatusFailure,
+					ErrorCode:       resource.OperationErrorCodeThrottling,
+					RequestID:       "test-request-id",
+					NativeID:        "test-native-id",
+				},
+				ResourceType: "FakeAWS::S3::Bucket",
+				StartTs:      util.TimeNow(),
+				ModifiedTs:   util.TimeNow(),
+				Attempts:     1,
+				MaxAttempts:  3,
+			},
+		},
+		RemainingResolvables: []pkgmodel.FormaeURI{},
+		StackLabel:           "test-stack",
+		GroupID:              "test-group-id",
+	}
+}

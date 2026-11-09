@@ -1,0 +1,142 @@
+// © 2025 Platform Engineering Labs Inc.
+//
+// SPDX-License-Identifier: FSL-1.1-ALv2
+
+package resource_update
+
+import (
+	"encoding/json"
+	"fmt"
+	"strconv"
+	"strings"
+
+	"github.com/theory/jsonpath"
+	"github.com/theory/jsonpath/registry"
+
+	pkgmodel "github.com/platform-engineering-labs/formae/pkg/model"
+)
+
+const labelSeparator = "-"
+
+// labelJSONPathParser is a package-level parser for JSONPath queries used in label extraction.
+var labelJSONPathParser = jsonpath.NewParser(jsonpath.WithRegistry(registry.New()))
+
+type ResourceLabeler struct {
+	datastore ResourceDataLookup
+}
+
+func NewResourceLabeler(ds ResourceDataLookup) *ResourceLabeler {
+	return &ResourceLabeler{
+		datastore: ds,
+	}
+}
+
+// LabelForUnmanagedResource generates a label for a discovered resource.
+// Uses JSONPath query from labelConfig to extract label value from properties.
+// Falls back to nativeID if no label can be extracted.
+//
+// Resolution order:
+// 1. Plugin's ResourceOverrides[resourceType] (if exists)
+// 2. Plugin's DefaultQuery
+// 3. NativeID (fallback)
+func (l *ResourceLabeler) LabelForUnmanagedResource(
+	nativeID string,
+	resourceType string,
+	properties json.RawMessage,
+	labelConfig pkgmodel.LabelConfig,
+) string {
+	// Try JSONPath query first (from LabelConfig)
+	query := labelConfig.QueryForResourceType(resourceType)
+	if query != "" {
+		if label := l.extractLabelFromQuery(properties, query); label != "" {
+			return l.ensureUnique(label)
+		}
+	}
+
+	// Final fallback: use nativeID
+	return l.ensureUnique(nativeID)
+}
+
+// extractLabelFromQuery evaluates a JSONPath query against properties and returns
+// concatenated string results. When the query returns multiple values (e.g., from
+// a filter with OR conditions), all values are joined with the label separator.
+func (l *ResourceLabeler) extractLabelFromQuery(properties json.RawMessage, query string) string {
+	if len(properties) == 0 {
+		return ""
+	}
+
+	path, err := labelJSONPathParser.Parse(query)
+	if err != nil {
+		return ""
+	}
+
+	var data any
+	if err := json.Unmarshal(properties, &data); err != nil {
+		return ""
+	}
+
+	results := path.Select(data)
+	if len(results) == 0 {
+		return ""
+	}
+
+	// Collect all string values from results
+	var parts []string
+	for _, result := range results {
+		// Handle array result (e.g., from tag filter query)
+		if arr, ok := result.([]any); ok {
+			for _, item := range arr {
+				if str, ok := item.(string); ok && str != "" {
+					parts = append(parts, str)
+				}
+			}
+			continue
+		}
+
+		// Handle direct string result
+		if str, ok := result.(string); ok && str != "" {
+			parts = append(parts, str)
+		}
+	}
+
+	return strings.Join(parts, labelSeparator)
+}
+
+// ensureUnique returns a label that no existing resource holds, incrementing
+// the version suffix as often as needed. A single increment is not enough:
+// when the base label itself ends in "-<number>" ("server-1"), incrementing it
+// lands on a neighboring label ("server-2") that another resource may already
+// hold as its natural name, and the minted variant is invisible to a later
+// lookup for the original base — so every candidate is re-checked until one
+// is free.
+func (l *ResourceLabeler) ensureUnique(label string) string {
+	candidate := label
+	for {
+		res, err := l.datastore.LatestLabelForResource(candidate)
+		if err != nil {
+			return candidate
+		}
+
+		// No existing resource with this label or a versioned variant of it
+		if res == "" {
+			return candidate
+		}
+
+		candidate = incrementVersion(res)
+	}
+}
+
+func incrementVersion(version string) string {
+	lastHyphenIndex := strings.LastIndex(version, "-")
+
+	if lastHyphenIndex != -1 && lastHyphenIndex < len(version)-1 {
+		versionStr := version[lastHyphenIndex+1:]
+		if num, err := strconv.Atoi(versionStr); err == nil {
+			newNum := num + 1
+			baseName := version[:lastHyphenIndex]
+			return fmt.Sprintf("%s-%d", baseName, newNum)
+		}
+	}
+
+	return fmt.Sprintf("%s-%d", version, 1)
+}

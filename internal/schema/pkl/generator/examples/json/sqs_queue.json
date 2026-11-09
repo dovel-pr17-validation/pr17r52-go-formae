@@ -1,0 +1,49 @@
+{
+  "Targets": [
+    {
+      "Label": "testprovider-target",
+      "Namespace": "TestProvider",
+      "Config": {
+        "Type": "TestProvider",
+        "Region": "us-east-1"
+      }
+    }
+  ],
+  "Stacks": [
+    {
+      "Label": "queue-stack",
+      "Description": "SQS queue test stack"
+    }
+  ],
+  "Resources": [
+    {
+      "Label": "dead-letter-queue",
+      "Type": "TestProvider::SQS::Queue",
+      "Stack": "queue-stack",
+      "Target": "testprovider-target",
+      "Properties": {
+        "QueueName": "my-dlq",
+        "MessageRetentionPeriod": 1209600,
+        "VisibilityTimeout": 60,
+        "Tags": [
+          { "Key": "Environment", "Value": "test" }
+        ]
+      }
+    },
+    {
+      "Label": "main-queue",
+      "Type": "TestProvider::SQS::Queue",
+      "Stack": "queue-stack",
+      "Target": "testprovider-target",
+      "Properties": {
+        "QueueName": "my-main-queue",
+        "DelaySeconds": 5,
+        "VisibilityTimeout": 30,
+        "Tags": [
+          { "Key": "Environment", "Value": "test" },
+          { "Key": "Team", "Value": "platform" }
+        ]
+      }
+    }
+  ]
+}

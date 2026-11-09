@@ -1,0 +1,433 @@
+// © 2025 Platform Engineering Labs Inc.
+//
+// SPDX-License-Identifier: FSL-1.1-ALv2
+
+package model
+
+import (
+	"encoding/json"
+	"fmt"
+
+	pkgmodel "github.com/platform-engineering-labs/formae/pkg/model"
+)
+
+type APIError string
+
+const (
+	DriftResolutionRejected          APIError = "DriftResolutionRejected"
+	ConflictingCommands              APIError = "ConflictingCommands"
+	PatchRejected                    APIError = "PatchRejected"
+	ReconcileRejected                APIError = "ReconcileRejected"
+	CyclesDetected                   APIError = "CyclesDetected"
+	EmptyStackRejected               APIError = "EmptyStackRejected"
+	TargetAlreadyExists              APIError = "TargetAlreadyExists"
+	TargetReaped                     APIError = "TargetReaped"
+	ReferencedResourcesNotFound      APIError = "ReferencedResourcesNotFound"
+	ReferencedGeneratorsNotFound     APIError = "ReferencedGeneratorsNotFound"
+	RequiredFieldMissingOnCreate     APIError = "RequiredFieldMissingOnCreate"
+	StackReferenceNotFound           APIError = "StackReferenceNotFound"
+	TargetReferenceNotFound          APIError = "TargetReferenceNotFound"
+	InvalidQuery                     APIError = "InvalidQueryError"
+	StackDeletedDuringApply          APIError = "StackDeletedDuringApply"
+	ReconcilePolicyRequired          APIError = "ReconcilePolicyRequired"
+	NonPortableResources             APIError = "NonPortableResources"
+	PluginNotFound                   APIError = "PluginNotFound"
+	PluginVersionNotFound            APIError = "PluginVersionNotFound"
+	PluginDependencyConflict         APIError = "PluginDependencyConflict"
+	PluginRepositoryUnreachable      APIError = "PluginRepositoryUnreachable"
+	PluginSignatureInvalid           APIError = "PluginSignatureInvalid"
+	TargetHasDependents              APIError = "TargetHasDependents"
+	ResourceHasDependents            APIError = "ResourceHasDependents"
+	GeneratorDestinationsUnreachable APIError = "GeneratorDestinationsUnreachable"
+	GeneratorBoundToSetOnceField     APIError = "GeneratorBoundToSetOnceField"
+	GeneratorHasDependents           APIError = "GeneratorHasDependents"
+)
+
+type ErrorResponse[T any] struct {
+	ErrorType APIError `json:"error"`
+	Data      T        `json:"data"`
+}
+
+// Error allows ErrorResponse satisfy the error interface
+func (e ErrorResponse[T]) Error() string {
+	return string(e.ErrorType)
+}
+
+type FormaConflictingCommandsError struct {
+	ConflictingCommands []Command `json:"ConflictingCommands"`
+}
+
+func (e FormaConflictingCommandsError) Error() string {
+	return "conflicting resource commands detected"
+}
+
+type FormaReconcileRejectedError struct {
+	ObservationID  string                   `json:"ObservationID,omitempty"`
+	ModifiedStacks map[string]ModifiedStack `json:"ModifiedStacks"`
+}
+
+func (e FormaReconcileRejectedError) Error() string {
+	return "forma rejected because the stack has been modified since the last reconcile"
+}
+
+type ResourceModification struct {
+	// ExternalChangesOnly proves all physical versions after the desired
+	// baseline came from synchronization. Absence/false is not proof of a patch.
+	ExternalChangesOnly bool                    `json:"ExternalChangesOnly,omitempty"`
+	ObservedCommandID   string                  `json:"ObservedCommandID,omitempty"`
+	ObservedCommand     pkgmodel.Command        `json:"ObservedCommand,omitempty"`
+	ObservedMode        pkgmodel.FormaApplyMode `json:"ObservedMode,omitempty"`
+	ObservedSource      string                  `json:"ObservedSource,omitempty"`
+	ResourceID          string                  `json:"ResourceID,omitempty"`
+	ObservedVersion     string                  `json:"ObservedVersion,omitempty"`
+	StackID             string                  `json:"StackID,omitempty"`
+	Stack               string                  `json:"Stack"`
+	Type                string                  `json:"Type"`
+	Label               string                  `json:"Label"`
+	Operation           string                  `json:"Operation"`
+	PatchDocument       json.RawMessage         `json:"PatchDocument,omitempty"` // JSON-patch diff between OldProperties and Properties — update ops only
+	Properties          json.RawMessage         `json:"Properties,omitempty"`    // current (cloud) properties — update ops only
+	OldProperties       json.RawMessage         `json:"OldProperties,omitempty"` // properties at last reconcile — update ops only
+}
+
+type ModifiedStack struct {
+	ModifiedResources []ResourceModification `json:"ModifiedResources"`
+}
+
+type FormaCyclesDetectedError struct{}
+
+func (e FormaCyclesDetectedError) Error() string {
+	return "forma contains cycles"
+}
+
+type FormaPatchRejectedError struct {
+	UnknownStacks []*pkgmodel.Stack `json:"UnknownStacks"`
+}
+
+func (e FormaPatchRejectedError) Error() string {
+	return "forma command rejected because an unknown stack cannot be patched"
+}
+
+type FormaEmptyStackRejectedError struct {
+	EmptyStacks []string `json:"EmptyStacks"`
+}
+
+func (e FormaEmptyStackRejectedError) Error() string {
+	return "forma rejected because creating empty stacks is not allowed"
+}
+
+type FormaReferencedResourcesNotFoundError struct {
+	MissingResources []*pkgmodel.Resource `json:"MissingResources"`
+}
+
+func (e FormaReferencedResourcesNotFoundError) Error() string {
+	return "forma rejected because one or more resolvables were not found"
+}
+
+// FormaReferencedGeneratorsNotFoundError names every $gen that resolved to
+// no live generator, or that named an output its generator does not
+// produce. A dangling generator reference is a hard error, never silently
+// absorbed — PKL cannot reject a $gen naming a generator the forma never
+// declares (a bare `local` generator still renders a well-formed envelope),
+// so this is the only check standing between such a forma and an apply.
+type FormaReferencedGeneratorsNotFoundError struct {
+	Missing []pkgmodel.MissingGenerator `json:"Missing"`
+}
+
+func (e FormaReferencedGeneratorsNotFoundError) Error() string {
+	return "forma rejected because one or more generator references were not found"
+}
+
+// UnreachableGeneratorDestination names one live resource bound to a
+// generator that has to draw, which the command being admitted does not
+// reach. GeneratorLabel and GeneratorStack identify the generator as the
+// forma names it; Stack, Label and Type are enough to find the destination.
+type UnreachableGeneratorDestination struct {
+	GeneratorLabel string `json:"GeneratorLabel"`
+	GeneratorStack string `json:"GeneratorStack"`
+	Stack          string `json:"Stack"`
+	Label          string `json:"Label"`
+	Type           string `json:"Type"`
+}
+
+// FormaGeneratorDestinationsUnreachableError refuses an apply that would draw
+// a generator's value for only some of the resources bound to it.
+//
+// formae keeps a hash of a drawn value, never the value, so a destination
+// outside the command when the draw happened can never be caught up
+// afterwards: the only way to give it a value is to draw again, which puts
+// its siblings behind. Refusing is the only outcome that converges.
+type FormaGeneratorDestinationsUnreachableError struct {
+	Unreachable []UnreachableGeneratorDestination `json:"Unreachable"`
+}
+
+func (e FormaGeneratorDestinationsUnreachableError) Error() string {
+	return "forma rejected because a generator must draw a new value and the command does not reach every resource bound to it"
+}
+
+// SetOnceGeneratorField names one field in a drawing generator's reachable
+// graph whose value strategy is SetOnce. GeneratorLabel and GeneratorStack
+// identify the generator; Stack, Label and Type locate the resource; Field is
+// the property path on it, which is the thing the operator has to edit.
+type SetOnceGeneratorField struct {
+	GeneratorLabel string `json:"GeneratorLabel"`
+	GeneratorStack string `json:"GeneratorStack"`
+	Stack          string `json:"Stack"`
+	Label          string `json:"Label"`
+	Type           string `json:"Type"`
+	Field          string `json:"Field"`
+}
+
+// FormaGeneratorBoundToSetOnceFieldError refuses an apply that would draw a
+// generator's value into a field whose strategy is SetOnce.
+//
+// A generator exists to move a credential. A SetOnce field is one whose value
+// is written once and never updated afterwards. The two together are
+// contradictory by construction: the credential moves at the generator and
+// stays put at the field, and no later apply can level them, because formae
+// keeps a digest of a drawn value rather than the value. Nothing fails while
+// that happens, which is what makes it worth refusing rather than reporting.
+type FormaGeneratorBoundToSetOnceFieldError struct {
+	Fields []SetOnceGeneratorField `json:"Fields"`
+}
+
+func (e FormaGeneratorBoundToSetOnceFieldError) Error() string {
+	return "forma rejected because a generator must draw a new value and a field it reaches will not accept one"
+}
+
+type TargetAlreadyExistsError struct {
+	TargetLabel       string          `json:"TargetLabel"`
+	MismatchType      string          `json:"MismatchType"` // namespace | config
+	ExistingNamespace string          `json:"ExistingNamespace,omitempty"`
+	FormaNamespace    string          `json:"FormaNamespace,omitempty"`
+	ExistingConfig    json.RawMessage `json:"ExistingConfig,omitempty"`
+	FormaConfig       json.RawMessage `json:"FormaConfig,omitempty"`
+}
+
+func (e TargetAlreadyExistsError) Error() string {
+	switch e.MismatchType {
+	case "namespace":
+		return fmt.Sprintf("target '%s' namespace mismatch: existing='%s', forma='%s'",
+			e.TargetLabel, e.ExistingNamespace, e.FormaNamespace)
+	case "config":
+		return fmt.Sprintf("target '%s' has different configuration than specified in forma", e.TargetLabel)
+	default:
+		return fmt.Sprintf("target '%s' already exists", e.TargetLabel)
+	}
+}
+
+// TargetReapedError is returned when an apply touches one or more reaped
+// targets without re-declaring them. A reaped target has been tombstoned after
+// prolonged unreachability; a resource-only or stale apply that references it
+// (but does not re-declare the target) would silently resurrect it against a
+// target the agent believes is dead. Re-declaring the target in the forma
+// recovers it instead — that path is allowed.
+type TargetReapedError struct {
+	TargetLabels []string `json:"TargetLabels"`
+}
+
+func (e TargetReapedError) Error() string {
+	if len(e.TargetLabels) == 1 {
+		return fmt.Sprintf("target %q is reaped; re-declare it in your forma to recover it before applying resources to it", e.TargetLabels[0])
+	}
+	return fmt.Sprintf("targets %v are reaped; re-declare them in your forma to recover them before applying resources to them", e.TargetLabels)
+}
+
+type RequiredFieldMissingOnCreateError struct {
+	MissingFields []string `json:"MissingFields"`
+	Stack         string   `json:"Stack"`
+	Label         string   `json:"Label"`
+	Type          string   `json:"Type"`
+}
+
+func (e RequiredFieldMissingOnCreateError) Error() string {
+	if len(e.MissingFields) == 1 {
+		return fmt.Sprintf("resource %s (type: %s, stack: %s) cannot be created - missing required field: %s",
+			e.Label, e.Type, e.Stack, e.MissingFields[0])
+	}
+	return fmt.Sprintf("resource %s (type: %s, stack: %s) cannot be created - missing required fields: %v",
+		e.Label, e.Type, e.Stack, e.MissingFields)
+}
+
+type InvalidQueryError struct {
+	Reason string `json:"Reason"`
+}
+
+func (e InvalidQueryError) Error() string {
+	return fmt.Sprintf("The provided query is invalid: %s", e.Reason)
+}
+
+type StackReferenceNotFoundError struct {
+	StackLabel string `json:"StackLabel"`
+}
+
+func (e StackReferenceNotFoundError) Error() string {
+	return fmt.Sprintf("stack res provided: %s does not exist", e.StackLabel)
+}
+
+type TargetReferenceNotFoundError struct {
+	TargetLabel string `json:"TargetLabel"`
+}
+
+func (e TargetReferenceNotFoundError) Error() string {
+	return fmt.Sprintf("target %s does not exist in existing targets and added targets", e.TargetLabel)
+}
+
+type StackDeletedDuringApplyError struct {
+	StackLabel string `json:"StackLabel"`
+}
+
+func (e StackDeletedDuringApplyError) Error() string {
+	return fmt.Sprintf("stack %q was deleted during apply setup", e.StackLabel)
+}
+
+type ReconcilePolicyRequiredError struct {
+	StackLabel string `json:"StackLabel"`
+}
+
+func (e ReconcilePolicyRequiredError) Error() string {
+	return fmt.Sprintf("stack '%s' does not have an auto-reconcile policy attached; force-reconcile is not allowed without one", e.StackLabel)
+}
+
+type NonPortableResourcesError struct {
+	TargetLabel string   `json:"TargetLabel"`
+	Resources   []string `json:"Resources"` // e.g. "test-stack/AWS::S3::Bucket/test-bucket"
+}
+
+func (e NonPortableResourcesError) Error() string {
+	return fmt.Sprintf("cannot replace target %q: %d non-portable resource(s) cannot be recreated on a different target",
+		e.TargetLabel, len(e.Resources))
+}
+
+type TargetHasResourcesError struct {
+	TargetLabel   string `json:"TargetLabel"`
+	ResourceCount int    `json:"ResourceCount"`
+}
+
+func (e TargetHasResourcesError) Error() string {
+	return fmt.Sprintf("target %s cannot be deleted: has %d deployed resources", e.TargetLabel, e.ResourceCount)
+}
+
+// TargetDependent names a target whose config references a resource being
+// deleted, along with the source resource that triggers the cascade.
+type TargetDependent struct {
+	TargetLabel   string `json:"TargetLabel"`
+	CascadeSource string `json:"CascadeSource"`
+}
+
+// FormaTargetHasDependentsError is returned when a destroy would cascade onto one
+// or more targets whose config references a resource being deleted (e.g. a secret),
+// but the command was not run with on-dependents=cascade. The default is to abort
+// so the user does not unknowingly tear down dependent targets and their resources.
+type FormaTargetHasDependentsError struct {
+	Dependents []TargetDependent `json:"Dependents"`
+}
+
+func (e FormaTargetHasDependentsError) Error() string {
+	if len(e.Dependents) == 1 {
+		return fmt.Sprintf("deleting %q would cascade-delete dependent target %q; re-run with --on-dependents=cascade to proceed",
+			e.Dependents[0].CascadeSource, e.Dependents[0].TargetLabel)
+	}
+	labels := make([]string, len(e.Dependents))
+	for i, d := range e.Dependents {
+		labels[i] = d.TargetLabel
+	}
+	return fmt.Sprintf("this delete would cascade-delete %d dependent target(s) %v; re-run with --on-dependents=cascade to proceed",
+		len(e.Dependents), labels)
+}
+
+// ResourceDependent names a resource whose config references (on a CreateOnly
+// field) a resource being deleted, along with the source resource that triggers
+// the cascade. The dependent may live in a different stack.
+type ResourceDependent struct {
+	ResourceLabel string `json:"ResourceLabel"`
+	ResourceType  string `json:"ResourceType"`
+	Stack         string `json:"Stack"`
+	CascadeSource string `json:"CascadeSource"`
+}
+
+// FormaResourceHasDependentsError is returned when a destroy would cascade-delete
+// one or more dependent resources (a resource whose CreateOnly field references a
+// resource being deleted, possibly across stacks) but the command was not run with
+// on-dependents=cascade. The default is to abort so the user does not unknowingly
+// tear down dependent resources, mirroring the target-cascade default.
+type FormaResourceHasDependentsError struct {
+	Dependents []ResourceDependent `json:"Dependents"`
+}
+
+func (e FormaResourceHasDependentsError) Error() string {
+	if len(e.Dependents) == 1 {
+		return fmt.Sprintf("deleting %q would cascade-delete dependent resource %q; re-run with --on-dependents=cascade to proceed",
+			e.Dependents[0].CascadeSource, e.Dependents[0].ResourceLabel)
+	}
+	labels := make([]string, len(e.Dependents))
+	for i, d := range e.Dependents {
+		labels[i] = d.ResourceLabel
+	}
+	return fmt.Sprintf("this delete would cascade-delete %d dependent resource(s) %v; re-run with --on-dependents=cascade to proceed",
+		len(e.Dependents), labels)
+}
+
+// GeneratorDependent names a resource that binds a property to a generator
+// being deleted, along with the generator it binds. The resource is very often
+// in a different stack from the generator: that is what a generator is for.
+type GeneratorDependent struct {
+	GeneratorLabel string `json:"GeneratorLabel"`
+	GeneratorStack string `json:"GeneratorStack"`
+	ResourceLabel  string `json:"ResourceLabel"`
+	ResourceType   string `json:"ResourceType"`
+	Stack          string `json:"Stack"`
+}
+
+// FormaGeneratorHasDependentsError is returned when a command would delete a
+// generator that a live resource still binds a property to, but was not run
+// with on-dependents=cascade. A destroy of the generator's stack and a
+// reconcile that drops the generator's declaration are both deletes and both
+// refused on these terms.
+//
+// The default is to abort because the reference cannot survive the generator:
+// formae keeps a hash of a drawn value and never the value, so a resource left
+// bound to a deleted generator has no way back to a value on any later apply.
+type FormaGeneratorHasDependentsError struct {
+	Dependents []GeneratorDependent `json:"Dependents"`
+}
+
+func (e FormaGeneratorHasDependentsError) Error() string {
+	if len(e.Dependents) == 1 {
+		d := e.Dependents[0]
+		return fmt.Sprintf("deleting generator %q in stack %q would leave resource %q in stack %q bound to nothing; re-run with --on-dependents=cascade to proceed",
+			d.GeneratorLabel, d.GeneratorStack, d.ResourceLabel, d.Stack)
+	}
+	labels := make([]string, len(e.Dependents))
+	for i, d := range e.Dependents {
+		labels[i] = d.ResourceLabel
+	}
+	return fmt.Sprintf("this delete would leave %d resource(s) %v bound to a deleted generator; re-run with --on-dependents=cascade to proceed",
+		len(e.Dependents), labels)
+}
+
+type PluginNotFoundError struct {
+	Name string `json:"Name"`
+}
+
+func (e PluginNotFoundError) Error() string {
+	return fmt.Sprintf("plugin %q not found", e.Name)
+}
+
+type PluginDependencyConflictError struct {
+	Message string `json:"Message"`
+}
+
+func (e PluginDependencyConflictError) Error() string {
+	return fmt.Sprintf("plugin dependency conflict: %s", e.Message)
+}
+
+// DriftResolutionError is a machine-readable, fail-closed resolution diagnostic.
+type DriftResolutionError struct {
+	Code       string `json:"Code"`
+	Reason     string `json:"Reason"`
+	ResourceID string `json:"ResourceID,omitempty"`
+	CommandID  string `json:"CommandId,omitempty"`
+}
+
+func (e DriftResolutionError) Error() string { return e.Code + ": " + e.Reason }

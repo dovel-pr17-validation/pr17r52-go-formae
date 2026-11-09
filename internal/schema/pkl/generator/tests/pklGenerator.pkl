@@ -1,0 +1,355 @@
+/*
+ * © 2025 Platform Engineering Labs Inc.
+ *
+ * SPDX-License-Identifier: FSL-1.1-ALv2
+ */
+
+module pklGeneratorTest
+
+amends "pkl:test"
+import "pkl:json"
+import "../pklGenerator.pkl" as generator
+
+// Load test fixtures
+local sqsJson = new json.Parser {}.parse(read("../examples/json/sqs_queue.json"))
+local vpcJson = new json.Parser {}.parse(read("../examples/json/ec2_vpc.json"))
+local multiJson = new json.Parser {}.parse(read("../examples/json/multi_resource.json"))
+local zoneJson = new json.Parser {}.parse(read("../examples/json/dns_zone.json"))
+local computeServerJson = new json.Parser {}.parse(read("../examples/json/compute_server.json"))
+local appRunnerServiceJson = new json.Parser {}.parse(read("../examples/json/apprunner_service.json"))
+local crossStackRefJson = new json.Parser {}.parse(read("../examples/json/cross_stack_ref.json"))
+local hashedValueJson = new json.Parser {}.parse(read("../examples/json/hashed_value.json"))
+local secretJsonSelectorJson = new json.Parser {}.parse(read("../examples/json/secret_json_selector_ref.json"))
+
+facts {
+    ["SQS Queue - generates correct imports"] {
+        let (result = generator.generateFormaFile(sqsJson))
+        result.contains("@testprovider/sqs/queue.pkl") &&
+        result.contains("@testprovider/testprovider.pkl")
+    }
+
+    ["SQS Queue - generates forma block with stacks and targets"] {
+        let (result = generator.generateFormaFile(sqsJson))
+        result.contains("extends \"@formae/forma.pkl\"") &&
+        result.contains("import \"@formae/formae.pkl\"") &&
+        result.contains("formae.Stack") &&
+        result.contains("label = \"queue-stack\"") &&
+        result.contains("formae.Target") &&
+        result.contains("label = \"testprovider-target\"") &&
+        result.contains("namespace = \"TestProvider\"")
+    }
+
+    ["SQS Queue - generates resource declarations"] {
+        let (result = generator.generateFormaFile(sqsJson))
+        result.contains("queue.Queue") &&
+        result.contains("queueName = \"my-dlq\"") &&
+        result.contains("queueName = \"my-main-queue\"") &&
+        result.contains("visibilityTimeout = 60") &&
+        result.contains("delaySeconds = 5")
+    }
+
+    ["SQS Queue - generates tags correctly"] {
+        let (result = generator.generateFormaFile(sqsJson))
+        result.contains("key = \"Environment\"") &&
+        result.contains("value = \"test\"") &&
+        result.contains("key = \"Team\"") &&
+        result.contains("value = \"platform\"")
+    }
+
+    ["EC2 VPC - generates correct imports"] {
+        let (result = generator.generateFormaFile(vpcJson))
+        result.contains("@testprovider/ec2/vpc.pkl") &&
+        result.contains("@testprovider/testprovider.pkl")
+    }
+
+    ["EC2 VPC - generates resource with correct properties"] {
+        let (result = generator.generateFormaFile(vpcJson))
+        result.contains("vpc.VPC") &&
+        result.contains("cidrBlock = \"10.0.0.0/16\"") &&
+        result.contains("enableDnsHostnames = true") &&
+        result.contains("enableDnsSupport = true")
+    }
+
+    ["Multi resource - generates imports for all resource types"] {
+        let (result = generator.generateFormaFile(multiJson))
+        result.contains("@testprovider/ec2/vpc.pkl") &&
+        result.contains("@testprovider/ec2/subnet.pkl") &&
+        result.contains("@testprovider/ec2/securitygroup.pkl") &&
+        result.contains("@testprovider/sqs/queue.pkl") &&
+        result.contains("@testprovider/testprovider.pkl")
+    }
+
+    ["Multi resource - generates multiple stacks"] {
+        let (result = generator.generateFormaFile(multiJson))
+        result.contains("label = \"network-stack\"") &&
+        result.contains("label = \"app-stack\"")
+    }
+
+    ["Multi resource - generates resolvable references"] {
+        let (result = generator.generateFormaFile(multiJson))
+        // Subnet and SecurityGroup should reference VPC via resolvable
+        result.contains("vpc.VPCResolvable")
+    }
+
+    ["Multi resource - generates all resource types"] {
+        let (result = generator.generateFormaFile(multiJson))
+        result.contains("vpc.VPC") &&
+        result.contains("subnet.Subnet") &&
+        result.contains("securitygroup.SecurityGroup") &&
+        result.contains("queue.Queue")
+    }
+
+    // --- modulePathToAlias unit tests ---
+
+    ["modulePathToAlias - no collision returns simple name"] {
+        generator.modulePathToAlias("@aws/ec2/ec2.pkl", List("@aws/ec2/ec2.pkl", "@aws/sqs/queue.pkl")) == "ec2" &&
+        generator.modulePathToAlias("@aws/sqs/queue.pkl", List("@aws/ec2/ec2.pkl", "@aws/sqs/queue.pkl")) == "queue"
+    }
+
+    ["modulePathToAlias - collision disambiguates with parent segment"] {
+        let (allPaths = List("@aws/ecs/service.pkl", "@gcp/cloudrun/service.pkl"))
+        generator.modulePathToAlias("@aws/ecs/service.pkl", allPaths) == "ecs_service" &&
+        generator.modulePathToAlias("@gcp/cloudrun/service.pkl", allPaths) == "cloudrun_service"
+    }
+
+    ["modulePathToAlias - collision with @-prefixed parent strips @"] {
+        let (allPaths = List("@aws/types.pkl", "@gcp/types.pkl"))
+        generator.modulePathToAlias("@aws/types.pkl", allPaths) == "aws_types" &&
+        generator.modulePathToAlias("@gcp/types.pkl", allPaths) == "gcp_types"
+    }
+
+    ["modulePathToAlias - dashes converted to underscores"] {
+        generator.modulePathToAlias("@cloudflare-dns/cloudflare-dns.pkl", List("@cloudflare-dns/cloudflare-dns.pkl")) == "cloudflare_dns"
+    }
+
+    ["modulePathToAlias - single path never collides"] {
+        generator.modulePathToAlias("@aws/ec2/ec2.pkl", List("@aws/ec2/ec2.pkl")) == "ec2"
+    }
+
+    // Version-style parent dirs (e.g. `v1.34`) get sanitized to valid
+    // Pkl identifiers and placed AFTER the basename so the meaningful
+    // symbol leads — alias = `<baseName>_<sanitizedVersion>`. This avoids
+    // the historical bug where `v1.34_k8s` was emitted as the alias and
+    // rejected by the Pkl parser due to the `.` in the identifier.
+    ["modulePathToAlias - version parent placed after baseName, sanitized"] {
+        let (allPaths = List("@k8s/k8s.pkl", "@k8s/v1.34/k8s.pkl"))
+        generator.modulePathToAlias("@k8s/v1.34/k8s.pkl", allPaths) == "k8s_v1_34" &&
+        // Package-root file: parent (`@k8s` → `k8s`) collapses with baseName
+        // (`k8s`) — emit just `k8s` instead of the ugly `k8s_k8s` duplicate.
+        generator.modulePathToAlias("@k8s/k8s.pkl", allPaths) == "k8s"
+    }
+
+    ["modulePathToAlias - multiple version dirs each get filename_version"] {
+        let (allPaths = List("@k8s/v1.34/k8s.pkl", "@k8s/v1.35/k8s.pkl"))
+        generator.modulePathToAlias("@k8s/v1.34/k8s.pkl", allPaths) == "k8s_v1_34" &&
+        generator.modulePathToAlias("@k8s/v1.35/k8s.pkl", allPaths) == "k8s_v1_35"
+    }
+
+    // importExists protects against bogus namespace-base imports. The
+    // fixture packages ship `@fakeaws/fakeaws.pkl` and
+    // `@testprovider/testprovider.pkl`, so both should resolve to true.
+    // A made-up path or an unknown package should resolve to false so
+    // the synthesized namespace-base import is filtered out of allImports
+    // and doesn't fight a real per-version import for the same alias.
+    ["importExists - existing root module returns true"] {
+        generator.importExists("@fakeaws/fakeaws.pkl") &&
+        generator.importExists("@testprovider/testprovider.pkl")
+    }
+
+    ["importExists - missing module returns false"] {
+        !generator.importExists("@fakeaws/does-not-exist.pkl") &&
+        !generator.importExists("@testprovider/missing.pkl")
+    }
+
+    ["importExists - unknown package returns false"] {
+        !generator.importExists("@unknownpkg/anything.pkl")
+    }
+
+    ["importExists - malformed path returns false"] {
+        !generator.importExists("nopackage")
+    }
+
+    // --- importFormatting unit tests ---
+
+    ["importFormatting - generates collision-aware aliases"] {
+        let (imports = List("@aws/ecs/service.pkl", "@gcp/cloudrun/service.pkl"))
+        let (result = generator.importFormatting(imports, imports))
+        result.contains("import \"@aws/ecs/service.pkl\" as ecs_service") &&
+        result.contains("import \"@gcp/cloudrun/service.pkl\" as cloudrun_service")
+    }
+
+    ["importFormatting - no collision uses simple alias"] {
+        let (imports = List("@aws/ec2/ec2.pkl", "@aws/sqs/queue.pkl"))
+        let (result = generator.importFormatting(imports, imports))
+        result.contains("import \"@aws/ec2/ec2.pkl\" as ec2") &&
+        result.contains("import \"@aws/sqs/queue.pkl\" as queue")
+    }
+
+    ["importFormatting - cross-group collision detected via allImports"] {
+        // dependencyImports rendered separately but allImports includes both groups
+        let (mainImports = List("@aws/ecs/service.pkl"))
+        let (depImports = List("@gcp/cloudrun/service.pkl"))
+        let (allImports = mainImports + depImports)
+        let (mainResult = generator.importFormatting(mainImports, allImports))
+        let (depResult = generator.importFormatting(depImports, allImports))
+        mainResult.contains("as ecs_service") &&
+        depResult.contains("as cloudrun_service")
+    }
+
+    // --- Zone SubResource integration tests ---
+
+    ["Zone - generates correct imports"] {
+        let (result = generator.generateFormaFile(zoneJson))
+        result.contains("@testprovider/dns/zone.pkl") &&
+        result.contains("@testprovider/testprovider.pkl")
+    }
+
+    ["Zone - generates resource with SubResource property"] {
+        let (result = generator.generateFormaFile(zoneJson))
+        // The ZoneConfig SubResource should be rendered inline
+        result.contains("zone.Zone") &&
+        result.contains("ZoneConfig") &&
+        result.contains("comment = \"Primary hosted zone\"")
+    }
+
+    ["Zone - generates forma block with stack and target"] {
+        let (result = generator.generateFormaFile(zoneJson))
+        result.contains("label = \"dns-stack\"") &&
+        result.contains("label = \"testprovider-target\"") &&
+        result.contains("namespace = \"TestProvider\"")
+    }
+
+    // --- Cross-module SubResource import tests ---
+    // Server uses NetworkConfig from @testprovider/shared/networkconfig.pkl (a different module).
+    // Without the SubResource import fix, this import would be missing and pkl eval would fail.
+
+    ["Compute Server - generates cross-module SubResource dependency import"] {
+        let (result = generator.generateFormaFile(computeServerJson))
+        // The resource import is @testprovider/compute/server.pkl
+        result.contains("@testprovider/compute/server.pkl") &&
+        // The SubResource import must also appear (from a DIFFERENT module)
+        result.contains("@testprovider/shared/networkconfig.pkl")
+    }
+
+    ["Compute Server - generates resource with cross-module SubResource"] {
+        let (result = generator.generateFormaFile(computeServerJson))
+        result.contains("server.Server") &&
+        result.contains("networkconfig.NetworkConfig") &&
+        result.contains("subnetId = \"subnet-abc123\"")
+    }
+
+    // --- Plain shared type (not SubResource) import tests ---
+    // Service uses DeploymentConfig from @testprovider/shared/deploymentconfig.pkl.
+    // DeploymentConfig is a plain class, not a SubResource. The generalized
+    // import logic should emit the correct import without any special-case branch.
+
+    ["AppRunner Service - generates plain shared type dependency import"] {
+        let (result = generator.generateFormaFile(appRunnerServiceJson))
+        result.contains("@testprovider/apprunner/service.pkl") &&
+        result.contains("@testprovider/shared/deploymentconfig.pkl")
+    }
+
+    ["AppRunner Service - generates resource with plain shared type"] {
+        let (result = generator.generateFormaFile(appRunnerServiceJson))
+        result.contains("service.Service") &&
+        result.contains("deploymentconfig.DeploymentConfig") &&
+        result.contains("environment = \"production\"") &&
+        result.contains("version = \"1.2.3\"") &&
+        result.contains("replicas = 3")
+    }
+
+    ["AppRunner Service - generates Tag import via generalized path"] {
+        let (result = generator.generateFormaFile(appRunnerServiceJson))
+        // Tag is now imported directly from types.pkl (where it's defined)
+        // rather than re-exported via testprovider.pkl
+        result.contains("@testprovider/types.pkl")
+    }
+
+    ["AppRunner Service - generates forma block"] {
+        let (result = generator.generateFormaFile(appRunnerServiceJson))
+        result.contains("label = \"app-stack\"") &&
+        result.contains("label = \"testprovider-target\"") &&
+        result.contains("namespace = \"TestProvider\"")
+    }
+
+    // --- Cross-stack resolvable reference tests ---
+    // When a resolvable references a resource in a different stack, the stack
+    // property inside the Resolvable block must be a String (Resolvable.stack
+    // is String?). The generated code should use .res.label to convert the
+    // StackResolvable into a String, not just .res which would leave a
+    // StackResolvable where a String is expected.
+
+    ["Cross-stack ref - resolvable stack uses .res.label not .res"] {
+        let (result = generator.generateFormaFile(crossStackRefJson))
+        result.contains("infraStack.res.label")
+    }
+
+    ["Selector ref - renders the sub-key selector through the secret-value accessor"] {
+        let (result = generator.generateFormaFile(secretJsonSelectorJson))
+        // The selector names one member of the secret document. It must survive
+        // regeneration, and it must hang off secretValue: json() is defined on the
+        // secret-value resolvable, not on the accessor the property mapping picks.
+        result.contains(".secretValue.json(\"password\")")
+    }
+
+    ["Cross-stack ref - generates resolvable with VPCResolvable type"] {
+        let (result = generator.generateFormaFile(crossStackRefJson))
+        result.contains("vpc.VPCResolvable")
+    }
+
+    ["Cross-stack ref - generates both stacks"] {
+        let (result = generator.generateFormaFile(crossStackRefJson))
+        result.contains("label = \"infra-stack\"") &&
+        result.contains("label = \"app-stack\"")
+    }
+
+    // --- Hashed opaque value round-trip tests ---
+    // A stored $hashed:true opaque field must emit .hashed in the fluent
+    // chain and carry the sentinel inline comment. A non-hashed opaque or
+    // a clear field must emit neither.
+
+    ["Hashed value - emits .hashed in fluent chain"] {
+        let (result = generator.generateFormaFile(hashedValueJson))
+        result.contains(".hashed")
+    }
+
+    ["Hashed value - emits sentinel inline comment for hashed field"] {
+        let (result = generator.generateFormaFile(hashedValueJson))
+        result.contains("// hashed secret value — cannot be applied as-is; re-supply the plaintext to set it")
+    }
+
+    ["Hashed value - comment appears on line with hashed field only"] {
+        let (result = generator.generateFormaFile(hashedValueJson))
+        // The hashed resource emits .hashed with the comment.
+        result.contains("a3f5b2c8d9e1f04712345678abcdef0123456789abcdef0123456789abcdef01") &&
+        result.contains("// hashed secret value — cannot be applied as-is; re-supply the plaintext to set it")
+    }
+
+    ["Non-hashed opaque - no .hashed and no sentinel comment"] {
+        let (result = generator.generateFormaFile(hashedValueJson))
+        // The non-hashed opaque resource renders as .opaque without .hashed.
+        result.contains("b4e6c3d7e8f2a15823456789bcdef01234567890bcdef01234567890bcdef012") &&
+        // opaque without hashed means the value line must not carry the sentinel on the same line;
+        // count by verifying the comment appears exactly once (only for the hashed resource).
+        result.split("// hashed secret value").length == 2
+    }
+
+    ["Clear value - no .hashed and no sentinel comment"] {
+        let (result = generator.generateFormaFile(hashedValueJson))
+        result.contains("name = \"example.com\"") &&
+        // Exactly one occurrence of the sentinel (for the single hashed resource).
+        result.split("// hashed secret value").length == 2
+    }
+
+    ["Strict boolean - absent $hashed means no .hashed emitted"] {
+        // zone-opaque-nohash has $visibility=Opaque but no $hashed key.
+        // Its rendered output must contain .opaque but not .opaque.hashed for that value.
+        let (result = generator.generateFormaFile(hashedValueJson))
+        let (nohashValue = "b4e6c3d7e8f2a15823456789bcdef01234567890bcdef01234567890bcdef012")
+        // The rendered form is: formae.value("<hex>").opaque — check by wrapping in quotes.
+        let (hasOpaqueLine = result.contains("formae.value(\"" + nohashValue + "\").opaque"))
+        let (hasHashedLine = result.contains("formae.value(\"" + nohashValue + "\").opaque.hashed"))
+        // Must render .opaque but not extend it with .hashed.
+        hasOpaqueLine && !hasHashedLine
+    }
+}

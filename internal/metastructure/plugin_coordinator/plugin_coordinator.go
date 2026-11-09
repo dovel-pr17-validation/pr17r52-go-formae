@@ -1,0 +1,599 @@
+// © 2025 Platform Engineering Labs Inc.
+//
+// SPDX-License-Identifier: FSL-1.1-ALv2
+
+package plugin_coordinator
+
+import (
+	"context"
+	"crypto/sha256"
+	"encoding/json"
+	"fmt"
+	"slices"
+	"strings"
+	"time"
+
+	"ergo.services/ergo/act"
+	"ergo.services/ergo/gen"
+
+	"github.com/platform-engineering-labs/formae/internal/metastructure/actornames"
+	"github.com/platform-engineering-labs/formae/internal/metastructure/canonicalize"
+	"github.com/platform-engineering-labs/formae/internal/metastructure/changeset"
+	"github.com/platform-engineering-labs/formae/internal/metastructure/messages"
+	"github.com/platform-engineering-labs/formae/pkg/credential"
+	"github.com/platform-engineering-labs/formae/pkg/model"
+	"github.com/platform-engineering-labs/formae/pkg/plugin"
+	"github.com/platform-engineering-labs/formae/pkg/plugin/resource"
+)
+
+// PluginCoordinator maintains a registry of all available resource plugins (local and remote).
+// Plugins announce themselves to the coordinator on startup.
+// It is the single source of truth for "where is plugin X" - supporting both local and remote plugins.
+// It also handles spawning PluginOperator actors for resource operations.
+type PluginCoordinator struct {
+	act.Actor
+
+	plugins                   map[string]*RegisteredPlugin // namespace → plugin info (remote)
+	registeredLocalNamespaces map[string]bool              // namespaces registered with RateLimiter (local)
+	testPlugin                plugin.FullResourcePlugin    // test-only: directly injected plugin (e.g. FakeAWS) for workflow tests
+	retryConfig               model.RetryConfig
+	resourcePluginConfigs     map[string]model.ResourcePluginUserConfig // keyed by plugin name (lowercase)
+
+	// oidcCredentialBrokers pairs an oidc-credential broker to every
+	// namespace it serves, keyed by strings.ToUpper(namespace).
+	oidcCredentialBrokers map[string]*RegisteredOidcBroker
+	oidcLaunches          map[string]messages.RegisterOidcCredentialLaunch
+}
+
+// RegisteredOidcBroker is the oidc-credential broker paired to a namespace:
+// the process a PluginOperator for that namespace should call into for
+// identity tokens.
+type RegisteredOidcBroker struct {
+	BindingID    string
+	Name         string
+	NodeName     gen.Atom
+	SpawnToken   string
+	RegisteredAt time.Time
+}
+
+// RegisteredPlugin contains information about a registered plugin
+type RegisteredPlugin struct {
+	Name                 string
+	Namespace            string
+	Version              string
+	NodeName             gen.Atom // Ergo node where plugin runs (for remote spawn)
+	MaxRequestsPerSecond int
+	RegisteredAt         time.Time
+
+	// Cached capabilities from announcement
+	SupportedResources []plugin.ResourceDescriptor
+	ResourceSchemas    map[string]model.Schema
+	MatchFilters       []model.MatchFilter
+	LabelConfig        model.LabelConfig
+
+	// Per-plugin config (merged from user config)
+	ResourceTypesToDiscover []string
+	RetryConfig             *model.RetryConfig
+}
+
+// findPluginByNamespace performs a case-insensitive lookup for a plugin by namespace.
+// We use case-insensitive matching because different parts of the system may use different
+// casing conventions for namespaces. For example, the PKL Target schema normalizes namespace
+// to uppercase (via toUpperCase()), while plugins may register with mixed case (e.g., "Azure"
+// vs "AZURE"). This ensures seamless plugin discovery regardless of casing.
+// Note: If we ever need to support plugins with the same name but different casing (unlikely),
+// we would need to revisit this approach.
+func (c *PluginCoordinator) findPluginByNamespace(namespace string) (*RegisteredPlugin, bool) {
+	for ns, plugin := range c.plugins {
+		if strings.EqualFold(ns, namespace) {
+			return plugin, true
+		}
+	}
+	return nil, false
+}
+
+// oidcBrokerFor returns the oidc-credential broker registered for namespace,
+// if any. Lookup is case-insensitive: entries are keyed by
+// strings.ToUpper(namespace).
+func (c *PluginCoordinator) oidcBrokerFor(namespace string) (*RegisteredOidcBroker, bool) {
+	b, ok := c.oidcCredentialBrokers[strings.ToUpper(namespace)]
+	return b, ok
+}
+
+// findTestPlugin returns the test plugin if it matches the given namespace (case-insensitive).
+func (c *PluginCoordinator) findTestPlugin(namespace string) plugin.FullResourcePlugin {
+	if c.testPlugin != nil && strings.EqualFold(c.testPlugin.Namespace(), namespace) {
+		return c.testPlugin
+	}
+
+	return nil
+}
+
+// mergePluginConfig overlays user config on top of plugin-announced defaults.
+// Returns a zero-value RegisteredPlugin and false if the plugin is disabled.
+// Config is looked up by plugin name (from manifest), not namespace.
+func (c *PluginCoordinator) mergePluginConfig(name, namespace string, announced RegisteredPlugin) (RegisteredPlugin, bool) {
+	userCfg, hasUserConfig := c.resourcePluginConfigs[strings.ToLower(name)]
+
+	if hasUserConfig && !userCfg.Enabled {
+		c.Log().Info("Plugin disabled by config, skipping registration: name=%s namespace=%s", name, namespace)
+		return RegisteredPlugin{}, false
+	}
+
+	merged := announced
+
+	if hasUserConfig {
+		if userCfg.RateLimit != nil {
+			merged.MaxRequestsPerSecond = userCfg.RateLimit.MaxRequestsPerSecondForNamespace
+		}
+		if userCfg.LabelConfig != nil {
+			merged.LabelConfig = *userCfg.LabelConfig
+		}
+		if userCfg.DiscoveryFilters != nil {
+			// Additive. The plugin's own filters encode rules its author put
+			// there for a reason, so user config adds to them rather than
+			// replacing them.
+			merged.MatchFilters = slices.Concat(announced.MatchFilters, userCfg.DiscoveryFilters)
+		}
+		if len(userCfg.ResourceTypesToDiscover) > 0 {
+			merged.ResourceTypesToDiscover = userCfg.ResourceTypesToDiscover
+		}
+		if userCfg.Retry != nil {
+			merged.RetryConfig = userCfg.Retry
+		}
+	}
+
+	return merged, true
+}
+
+// resolveRetryConfig returns per-plugin RetryConfig if set, otherwise the global fallback.
+func (c *PluginCoordinator) resolveRetryConfig(namespace string) model.RetryConfig {
+	if p, ok := c.findPluginByNamespace(namespace); ok && p.RetryConfig != nil {
+		return *p.RetryConfig
+	}
+	return c.retryConfig
+}
+
+// NewPluginCoordinator creates a new PluginCoordinator actor
+func NewPluginCoordinator() gen.ProcessBehavior {
+	return &PluginCoordinator{}
+}
+
+func (c *PluginCoordinator) Init(args ...any) error {
+	c.plugins = make(map[string]*RegisteredPlugin)
+	c.registeredLocalNamespaces = make(map[string]bool)
+	c.oidcCredentialBrokers = make(map[string]*RegisteredOidcBroker)
+	c.oidcLaunches = make(map[string]messages.RegisterOidcCredentialLaunch)
+
+	// Test-only: check for directly injected test plugin (e.g. FakeAWS for workflow tests)
+	if tp, ok := c.Env("TestResourcePlugin"); ok {
+		c.testPlugin = tp.(plugin.FullResourcePlugin)
+	}
+
+	// Register test plugin namespace with RateLimiter at startup
+	// This is needed because ChangesetExecutor requests tokens before SpawnPluginOperator
+	if c.testPlugin != nil {
+		namespace := c.testPlugin.Namespace()
+		maxRPS := c.testPlugin.RateLimit().MaxRequestsPerSecondForNamespace
+		err := c.Send(actornames.RateLimiter, changeset.RegisterNamespace{
+			Namespace:            namespace,
+			MaxRequestsPerSecond: maxRPS,
+		})
+		if err != nil {
+			c.Log().Error("Failed to register test plugin namespace %s with RateLimiter: %v", namespace, err)
+		} else {
+			c.registeredLocalNamespaces[namespace] = true
+			c.Log().Debug("Registered test plugin namespace %s with RateLimiter (maxRPS=%d)", namespace, maxRPS)
+		}
+	}
+
+	retryCfg, ok := c.Env("RetryConfig")
+	if !ok {
+		c.Log().Error("ResourceUpdater: missing 'RetryConfig' environment variable")
+		return fmt.Errorf("resourceUpdater: missing 'RetryConfig' environment variable")
+	}
+	c.retryConfig = retryCfg.(model.RetryConfig)
+
+	if rpcs, ok := c.Env("ResourcePluginConfigs"); ok {
+		configs := rpcs.([]model.ResourcePluginUserConfig)
+		c.resourcePluginConfigs = make(map[string]model.ResourcePluginUserConfig, len(configs))
+		for _, cfg := range configs {
+			c.resourcePluginConfigs[strings.ToLower(cfg.Type)] = cfg
+		}
+	} else {
+		c.resourcePluginConfigs = make(map[string]model.ResourcePluginUserConfig)
+	}
+
+	c.Log().Debug("PluginCoordinator started")
+	return nil
+}
+
+// HandleCall answers every request with a typed result carrying its own
+// success/failure status. Returning an error here would terminate the
+// coordinator without a reply, dropping every registered plugin with the
+// actor and starving the requests queued in its mailbox — so a namespace no
+// plugin serves is answered, not crashed on. An unknown request type is a
+// protocol bug and keeps the terminating error return.
+func (c *PluginCoordinator) HandleCall(from gen.PID, ref gen.Ref, request any) (any, error) {
+	switch req := request.(type) {
+	case messages.GetPluginNode:
+		plugin, ok := c.findPluginByNamespace(req.Namespace)
+		if !ok {
+			c.Log().Error("PluginCoordinator: plugin not found: %s", req.Namespace)
+			return messages.PluginNode{Error: fmt.Sprintf("plugin not found: %s", req.Namespace)}, nil
+		}
+		return messages.PluginNode{NodeName: plugin.NodeName}, nil
+
+	case messages.SpawnPluginOperator:
+		result := c.spawnPluginOperator(req)
+		return result, nil
+
+	case messages.GetPluginInfo:
+		return c.getPluginInfo(req), nil
+
+	case messages.GetRegisteredPlugins:
+		return c.getRegisteredPlugins(), nil
+
+	default:
+		c.Log().Error("PluginCoordinator: unknown request type %T", request)
+		return nil, fmt.Errorf("unknown request: %T", request)
+	}
+}
+
+func (c *PluginCoordinator) HandleMessage(from gen.PID, message any) error {
+	switch msg := message.(type) {
+	case messages.PluginAnnouncement:
+		caps := msg.Capabilities
+
+		c.Log().Debug("Received capabilities for namespace %s: %d resources, %d schemas", msg.Namespace, len(caps.SupportedResources), len(caps.ResourceSchemas))
+
+		announced := RegisteredPlugin{
+			Name:                 msg.Name,
+			Namespace:            msg.Namespace,
+			Version:              msg.Version,
+			NodeName:             from.Node,
+			MaxRequestsPerSecond: msg.MaxRequestsPerSecond,
+			RegisteredAt:         time.Now(),
+			SupportedResources:   caps.SupportedResources,
+			ResourceSchemas:      caps.ResourceSchemas,
+			MatchFilters:         caps.MatchFilters,
+			LabelConfig:          caps.LabelConfig,
+		}
+
+		merged, enabled := c.mergePluginConfig(msg.Name, msg.Namespace, announced)
+		if !enabled {
+			return nil
+		}
+
+		// Reject this plugin if any schema declares an unknown FieldHint.Format
+		// (typo/unsupported). Log and skip — a non-nil HandleMessage return would
+		// terminate the coordinator actor, taking down every registered plugin.
+		for resourceType, schema := range merged.ResourceSchemas {
+			if err := canonicalize.ValidateSchemaFormats(resourceType, schema); err != nil {
+				c.Log().Error("Rejecting plugin %s registration: invalid schema format for namespace %s: %v", msg.Name, msg.Namespace, err)
+				return nil
+			}
+		}
+
+		c.plugins[msg.Namespace] = &merged
+		c.Log().Info("Plugin registered: namespace=%s node=%s rateLimit=%d resources=%d",
+			msg.Namespace, msg.NodeName, merged.MaxRequestsPerSecond, len(caps.SupportedResources))
+
+		// Register the namespace with RateLimiter
+		if err := c.Send(actornames.RateLimiter, changeset.RegisterNamespace{
+			Namespace:            msg.Namespace,
+			MaxRequestsPerSecond: merged.MaxRequestsPerSecond,
+		}); err != nil {
+			c.Log().Error("Failed to register namespace %s with RateLimiter: %v", msg.Namespace, err)
+		}
+
+	case messages.UnregisterPlugin:
+		if _, ok := c.plugins[msg.Namespace]; ok {
+			delete(c.plugins, msg.Namespace)
+			c.Log().Debug("Plugin unregistered: namespace=%s reason=%s", msg.Namespace, msg.Reason)
+		}
+
+	case messages.RegisterOidcCredentialLaunch:
+		supervisor, err := c.Node().ProcessPID("PluginProcessSupervisor")
+		if err != nil || from != supervisor || msg.SpawnToken == "" || msg.Name == "" || msg.Version == "" || msg.NodeName == "" || msg.ConfigIdentity == "" {
+			c.Log().Error("Rejected untrusted or incomplete oidc-credential launch registration")
+			break
+		}
+		for token, launch := range c.oidcLaunches {
+			if launch.Name == msg.Name {
+				delete(c.oidcLaunches, token)
+			}
+		}
+		c.oidcLaunches[msg.SpawnToken] = msg
+
+	case messages.OidcCredentialPluginAnnouncement:
+		c.handleOidcCredentialAnnouncement(from, msg)
+
+	case messages.UnregisterOidcCredentialPlugin:
+		c.handleUnregisterOidcCredentialPlugin(msg)
+
+	default:
+		c.Log().Debug("Received unknown message type: %T", message)
+	}
+	return nil
+}
+
+// handleOidcCredentialAnnouncement pairs a broker to every namespace it
+// announces. Namespaces are uppercased on ingest. A namespace already served
+// by the same broker Name is superseded (last announcement wins, regardless
+// of token - this covers a broker restarting with a fresh spawn token). A
+// namespace already served by a DIFFERENT Name is rejected: the first
+// registration stands.
+//
+// The announcement is authoritative for its own broker's namespace set: any
+// existing entry for msg.Name whose namespace is absent from this
+// announcement is pruned. Without this, a broker that restarts serving fewer
+// namespaces than before (manifest shrunk) would leave the dropped
+// namespace's entry orphaned under its old spawn token forever - the
+// supervisor's unregister-before-respawn ordinarily clears it first, but a
+// failed unregister Send (logged, not fatal) would otherwise strand it.
+func (c *PluginCoordinator) handleOidcCredentialAnnouncement(from gen.PID, msg messages.OidcCredentialPluginAnnouncement) {
+	announced := make(map[string]bool, len(msg.Namespaces))
+
+	for _, namespace := range msg.Namespaces {
+		key := strings.ToUpper(namespace)
+		announced[key] = true
+
+		if existing, ok := c.oidcCredentialBrokers[key]; ok && existing.Name != msg.Name {
+			c.Log().Error("Oidc credential broker rejected: namespace=%s already served by name=%s, rejecting name=%s node=%s",
+				key, existing.Name, msg.Name, from.Node)
+			continue
+		}
+
+		bindingID := ""
+		if launch, ok := c.oidcLaunches[msg.SpawnToken]; ok && launch.Name == msg.Name && launch.NodeName == from.Node && slices.Contains(launch.Namespaces, key) {
+			// Length-delimited JSON avoids ambiguities between identity fields.
+			identity, _ := json.Marshal([]string{key, launch.Name, launch.Version, launch.ConfigIdentity})
+			bindingID = fmt.Sprintf("%x", sha256.Sum256(identity))
+		}
+		c.oidcCredentialBrokers[key] = &RegisteredOidcBroker{
+			BindingID:    bindingID,
+			Name:         msg.Name,
+			NodeName:     from.Node,
+			SpawnToken:   msg.SpawnToken,
+			RegisteredAt: time.Now(),
+		}
+		c.Log().Info("Oidc credential broker registered: namespace=%s node=%s name=%s", key, from.Node, msg.Name)
+	}
+
+	for key, broker := range c.oidcCredentialBrokers {
+		if broker.Name == msg.Name && !announced[key] {
+			delete(c.oidcCredentialBrokers, key)
+			c.Log().Debug("Oidc credential broker pruned: namespace=%s name=%s no longer announced", key, msg.Name)
+		}
+	}
+}
+
+// handleUnregisterOidcCredentialPlugin removes every namespace entry whose
+// stored SpawnToken equals msg.SpawnToken. A stale token (superseded by a
+// later announcement) matches nothing and is a no-op.
+func (c *PluginCoordinator) handleUnregisterOidcCredentialPlugin(msg messages.UnregisterOidcCredentialPlugin) {
+	delete(c.oidcLaunches, msg.SpawnToken)
+	for namespace, broker := range c.oidcCredentialBrokers {
+		if broker.SpawnToken == msg.SpawnToken {
+			delete(c.oidcCredentialBrokers, namespace)
+			c.Log().Debug("Oidc credential broker unregistered: namespace=%s name=%s reason=%s", namespace, msg.Name, msg.Reason)
+		}
+	}
+}
+
+// spawnPluginOperator spawns a PluginOperator for the given resource operation.
+// It first tries to spawn remotely on a registered plugin node (distributed mode),
+// then falls back to local spawning if a local plugin is available.
+func (c *PluginCoordinator) spawnPluginOperator(req messages.SpawnPluginOperator) messages.SpawnPluginOperatorResult {
+	// Generate a registered name for the operator
+	registerName := actornames.PluginOperator(
+		model.FormaeURI(req.ResourceURI),
+		req.Operation,
+		req.OperationID,
+	)
+
+	// Resolve the retry config once and hand the same value to the operator and
+	// back to the requester, so the cadence the operator polls on and the
+	// cadence the requester sizes its watchdog from cannot diverge.
+	retryConfig := c.resolveRetryConfig(req.Namespace)
+
+	// 1. Check if plugin is registered (distributed mode)
+	if registeredPlugin, ok := c.findPluginByNamespace(req.Namespace); ok {
+		pid, err := c.remoteSpawn(registeredPlugin.NodeName, registerName, req.RequestedBy, retryConfig, req.Namespace)
+		if err != nil {
+			c.Log().Error("Failed to remote spawn PluginOperator for namespace %s on node %s: %v", req.Namespace, registeredPlugin.NodeName, err)
+			return messages.SpawnPluginOperatorResult{Error: err.Error()}
+		}
+		c.Log().Debug("Remote spawned PluginOperator for namespace %s on node %s: pid=%s", req.Namespace, registeredPlugin.NodeName, pid)
+		return messages.SpawnPluginOperatorResult{PID: pid, RetryConfig: &retryConfig}
+	}
+
+	// 2. Fallback: Check test plugin / legacy PluginManager
+	if localPlugin := c.findTestPlugin(req.Namespace); localPlugin != nil {
+		// Register namespace with RateLimiter if not already registered
+		if !c.registeredLocalNamespaces[req.Namespace] {
+			maxRPS := localPlugin.RateLimit().MaxRequestsPerSecondForNamespace
+			err := c.Send(actornames.RateLimiter, changeset.RegisterNamespace{
+				Namespace:            req.Namespace,
+				MaxRequestsPerSecond: maxRPS,
+			})
+			if err != nil {
+				c.Log().Error("Failed to register namespace %s with RateLimiter: %v", req.Namespace, err)
+				// Don't fail the spawn - rate limiting is not critical
+			} else {
+				c.registeredLocalNamespaces[req.Namespace] = true
+				c.Log().Debug("Registered local plugin namespace %s with RateLimiter (maxRPS=%d)", req.Namespace, maxRPS)
+			}
+		}
+
+		pid, err := c.localSpawn(localPlugin, registerName, req.RequestedBy, retryConfig, req.Namespace)
+		if err != nil {
+			c.Log().Error("Failed to local spawn PluginOperator for namespace %s: %v", req.Namespace, err)
+			return messages.SpawnPluginOperatorResult{Error: err.Error()}
+		}
+		c.Log().Debug("Local spawned PluginOperator for namespace %s: pid=%s", req.Namespace, pid)
+		return messages.SpawnPluginOperatorResult{PID: pid, RetryConfig: &retryConfig}
+	}
+
+	// 3. Plugin not found
+	err := fmt.Errorf("plugin not found: %s", req.Namespace)
+	c.Log().Error("Plugin not found for spawn: namespace=%s", req.Namespace)
+	return messages.SpawnPluginOperatorResult{Error: err.Error()}
+}
+
+// pluginOperatorEnv is the environment every PluginOperator is spawned with,
+// local or remote: the retry config resolved for its namespace and the requesting
+// process. When an oidc-credential broker is registered for namespace, both
+// OidcCredentialBrokerNode and OidcCredentialBrokerName are added; when none
+// is, neither is - the operator either gets a complete pairing or none.
+func (c *PluginCoordinator) pluginOperatorEnv(retryConfig model.RetryConfig, requestedBy gen.PID, namespace string) map[gen.Env]any {
+	env := map[gen.Env]any{
+		gen.Env("RetryConfig"): retryConfig,
+		gen.Env("RequestedBy"): requestedBy,
+	}
+
+	if broker, ok := c.oidcBrokerFor(namespace); ok {
+		env[gen.Env("OidcCredentialBrokerNode")] = string(broker.NodeName)
+		env[gen.Env("OidcCredentialBrokerName")] = credential.ServerActorName
+		if broker.BindingID != "" {
+			// Only old-SDK EDF types cross the process boundary. The SDK
+			// assembles its operation info privately from these values.
+			env["OidcOperationBindingID"] = broker.BindingID
+			env["OidcOperationPollInterval"] = retryConfig.StatusCheckInterval
+			env["OidcOperationCallTimeout"] = plugin.OperationCallTimeout
+			env["OidcOperationRetryDelay"] = retryConfig.RetryDelay
+			env["OidcOperationThrottleMaxDelay"] = resource.DefaultMaxBackoff
+		}
+	}
+
+	return env
+}
+
+// remoteSpawn spawns a PluginOperator on a remote plugin node with the retry
+// config resolved for its namespace.
+func (c *PluginCoordinator) remoteSpawn(nodeName gen.Atom, registerName gen.Atom, requestedBy gen.PID, retryConfig model.RetryConfig, namespace string) (gen.PID, error) {
+	// Get connection to remote node
+	remoteNode, err := c.Node().Network().GetNode(nodeName)
+	if err != nil {
+		return gen.PID{}, fmt.Errorf("failed to get remote node %s: %w", nodeName, err)
+	}
+
+	// Remote spawn with registration
+	// The remote node's environment already has Plugin, Context, and OTelConfig set
+	// (configured in pkg/plugin/run.go)
+	opts := gen.ProcessOptions{Env: c.pluginOperatorEnv(retryConfig, requestedBy, namespace)}
+	start := time.Now()
+	pid, err := remoteNode.SpawnRegister(registerName, plugin.PluginOperatorFactoryName, opts)
+	elapsed := time.Since(start)
+	if err != nil {
+		return gen.PID{}, fmt.Errorf("failed to remote spawn on %s (took %s): %w", nodeName, elapsed, err)
+	}
+
+	return pid, nil
+}
+
+// localSpawn spawns a PluginOperator locally with the given plugin and the
+// retry config resolved for its namespace.
+func (c *PluginCoordinator) localSpawn(localPlugin plugin.FullResourcePlugin, registerName gen.Atom, requestedBy gen.PID, retryConfig model.RetryConfig, namespace string) (gen.PID, error) {
+	// Get context from environment
+	ctx := context.Background()
+	if envCtx, ok := c.Env("Context"); ok {
+		ctx = envCtx.(context.Context)
+	}
+
+	// Spawn locally with plugin passed via Env
+	env := c.pluginOperatorEnv(retryConfig, requestedBy, namespace)
+	env[gen.Env("Plugin")] = localPlugin
+	env[gen.Env("Context")] = ctx
+	opts := gen.ProcessOptions{Env: env}
+
+	pid, err := c.SpawnRegister(registerName, plugin.NewPluginOperator, opts)
+	if err != nil {
+		return gen.PID{}, fmt.Errorf("failed to local spawn: %w", err)
+	}
+
+	return pid, nil
+}
+
+// getPluginInfo retrieves plugin information for the given namespace.
+// It first checks registered external plugins, then falls back to local plugins.
+// Filters are cached from the initial plugin announcement (no refresh needed since filters are static).
+func (c *PluginCoordinator) getPluginInfo(req messages.GetPluginInfo) messages.PluginInfoResponse {
+	// 1. Check external plugins first
+	if registered, ok := c.findPluginByNamespace(req.Namespace); ok {
+		return messages.PluginInfoResponse{
+			Found:                   true,
+			Namespace:               req.Namespace,
+			SupportedResources:      registered.SupportedResources,
+			ResourceSchemas:         registered.ResourceSchemas,
+			MatchFilters:            registered.MatchFilters,
+			LabelConfig:             registered.LabelConfig,
+			ResourceTypesToDiscover: registered.ResourceTypesToDiscover,
+		}
+	}
+
+	// 2. Fall back to test plugin / legacy PluginManager
+	localPlugin := c.findTestPlugin(req.Namespace)
+	if localPlugin == nil {
+		return messages.PluginInfoResponse{
+			Found: false,
+			Error: fmt.Sprintf("plugin not found: %s", req.Namespace),
+		}
+	}
+
+	// Build schema map from local plugin
+	schemas := make(map[string]model.Schema)
+	for _, rd := range localPlugin.SupportedResources() {
+		schema, err := localPlugin.SchemaForResourceType(rd.Type)
+		if err == nil {
+			schemas[rd.Type] = schema
+		}
+	}
+
+	resp := messages.PluginInfoResponse{
+		Found:              true,
+		Namespace:          req.Namespace,
+		SupportedResources: localPlugin.SupportedResources(),
+		ResourceSchemas:    schemas,
+		MatchFilters:       localPlugin.DiscoveryFilters(),
+		LabelConfig:        localPlugin.LabelConfig(),
+	}
+
+	// Overlay user config for local/test plugins (lookup by name, not namespace)
+	if userCfg, ok := c.resourcePluginConfigs[strings.ToLower(localPlugin.Name())]; ok {
+		if userCfg.LabelConfig != nil {
+			resp.LabelConfig = *userCfg.LabelConfig
+		}
+		if userCfg.DiscoveryFilters != nil {
+			resp.MatchFilters = slices.Concat(resp.MatchFilters, userCfg.DiscoveryFilters)
+		}
+		if len(userCfg.ResourceTypesToDiscover) > 0 {
+			resp.ResourceTypesToDiscover = userCfg.ResourceTypesToDiscover
+		}
+	}
+
+	return resp
+}
+
+// getRegisteredPlugins returns a list of all registered plugins
+func (c *PluginCoordinator) getRegisteredPlugins() messages.GetRegisteredPluginsResult {
+	plugins := make([]messages.RegisteredPluginInfo, 0, len(c.plugins))
+
+	for _, registered := range c.plugins {
+		plugins = append(plugins, messages.RegisteredPluginInfo{
+			Name:                    registered.Name,
+			Namespace:               registered.Namespace,
+			Version:                 registered.Version,
+			NodeName:                string(registered.NodeName),
+			MaxRequestsPerSecond:    registered.MaxRequestsPerSecond,
+			ResourceCount:           len(registered.SupportedResources),
+			ResourceTypesToDiscover: registered.ResourceTypesToDiscover,
+			RetryConfig:             registered.RetryConfig,
+			LabelConfig:             registered.LabelConfig,
+			DiscoveryFilters:        registered.MatchFilters,
+		})
+	}
+
+	return messages.GetRegisteredPluginsResult{Plugins: plugins}
+}

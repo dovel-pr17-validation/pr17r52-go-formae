@@ -1,0 +1,1058 @@
+// © 2025 Platform Engineering Labs Inc.
+//
+// SPDX-License-Identifier: FSL-1.1-ALv2
+
+package api
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"log"
+	"log/slog"
+	"net/http"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/labstack/echo/v4"
+	"github.com/labstack/echo/v4/middleware"
+	"github.com/segmentio/ksuid"
+	echoSwagger "github.com/swaggo/echo-swagger"
+
+	_ "github.com/platform-engineering-labs/formae/docs"
+	"github.com/platform-engineering-labs/formae/internal/auth"
+	"github.com/platform-engineering-labs/formae/internal/datastore"
+	"github.com/platform-engineering-labs/formae/internal/logging"
+	"github.com/platform-engineering-labs/formae/internal/metastructure"
+	"github.com/platform-engineering-labs/formae/internal/metastructure/config"
+	"github.com/platform-engineering-labs/formae/internal/metastructure/plugin_manager"
+	"github.com/platform-engineering-labs/formae/internal/metastructure/querier"
+	"github.com/platform-engineering-labs/formae/internal/network"
+	apimodel "github.com/platform-engineering-labs/formae/pkg/api/model"
+	pkgmodel "github.com/platform-engineering-labs/formae/pkg/model"
+)
+
+const (
+	BasePath                            = "/api/v1"
+	CommandsRoute                       = BasePath + "/commands"
+	CommandStatusRoute                  = BasePath + "/commands/:id/status"
+	CommandDesiredDeltaRoute            = BasePath + "/commands/:id/desired-delta"
+	ListCommandStatusRoute              = BasePath + "/commands/status"
+	CancelCommandsRoute                 = BasePath + "/commands/cancel"
+	ListResourcesRoute                  = BasePath + "/resources"
+	ListResourceSummariesRoute          = BasePath + "/resources/summary"
+	GetResourceByKsuidRoute             = BasePath + "/resources/by-ksuid/:ksuid"
+	ListTargetsRoute                    = BasePath + "/targets"
+	ListStacksRoute                     = BasePath + "/stacks"
+	ListPoliciesRoute                   = BasePath + "/policies"
+	ListGeneratorsRoute                 = BasePath + "/generators"
+	StackDriftRoute                     = BasePath + "/stacks/:stack/drift"
+	StackChangesSinceLastReconcileRoute = BasePath + "/stacks/:stack/changes-since-last-reconcile"
+	StackReconcileRoute                 = BasePath + "/stacks/:stack/reconcile"
+	StatsRoute                          = BasePath + "/stats"
+
+	AdminBasePath = BasePath + "/admin"
+	SyncRoute     = AdminBasePath + "/synchronize"
+	DiscoverRoute = AdminBasePath + "/discover"
+	CheckTTLRoute = AdminBasePath + "/check-ttl"
+	ReapRoute     = AdminBasePath + "/reap"
+
+	PluginsRoute         = BasePath + "/plugins"
+	PluginRoute          = BasePath + "/plugins/:name"
+	PluginInstallRoute   = BasePath + "/plugins/install"
+	PluginUninstallRoute = BasePath + "/plugins/uninstall"
+	PluginUpdateRoute    = BasePath + "/plugins/update"
+
+	HealthRoute  = BasePath + "/health"
+	MetricsRoute = "/metrics"
+	APIDocsRoute = "/swagger/*"
+)
+
+type Server struct {
+	echo           *echo.Echo
+	metastructure  metastructure.MetastructureAPI
+	pluginManager  *plugin_manager.PluginManager // nil if not configured
+	pluginDirs     []string                      // for filesystem-only installed-plugin discovery
+	ctx            context.Context
+	authHandle     *auth.AuthPluginHandle
+	serverConfig   *pkgmodel.ServerConfig
+	networkConfig  *pkgmodel.NetworkConfig
+	metricsHandler http.Handler
+}
+
+// SetPluginManager configures the optional plugin manager for the server.
+// When set, the orbital-backed plugin endpoints (search, info, install,
+// uninstall, update) become active; otherwise they return 503 Service
+// Unavailable. The installed-plugin listing path does not need a plugin
+// manager — it serves from the registered-plugin set plus filesystem
+// discovery via SetPluginDirs.
+func (s *Server) SetPluginManager(pm *plugin_manager.PluginManager) {
+	s.pluginManager = pm
+}
+
+// SetPluginDirs configures the directories scanned to attach LocalPath
+// to plugins surfaced by the installed-plugin listing endpoint. Must
+// match the dirs the agent passes to PluginProcessSupervisor so the
+// listing reflects the same on-disk set the agent is actually running.
+func (s *Server) SetPluginDirs(dirs []string) {
+	s.pluginDirs = dirs
+}
+
+func NewServer(ctx context.Context, metastructure metastructure.MetastructureAPI, authHandle *auth.AuthPluginHandle, serverConfig *pkgmodel.ServerConfig, networkConfig *pkgmodel.NetworkConfig, metricsHandler http.Handler) *Server {
+	server := &Server{
+		metastructure:  metastructure,
+		ctx:            ctx,
+		authHandle:     authHandle,
+		serverConfig:   serverConfig,
+		networkConfig:  networkConfig,
+		metricsHandler: metricsHandler,
+	}
+
+	server.echo = server.configureEcho()
+
+	return server
+}
+
+func (s *Server) configureAuth() {
+	if s.authHandle != nil {
+		s.echo.Use(auth.NewAuthMiddleware(s.authHandle, auth.NewAuthCache()))
+	}
+}
+
+// subjectFromContext reads the verified subject and its display-name hint off
+// the echo request context, where the auth middleware puts them on every
+// allowed request. Neither key is set when no auth plugin is configured
+// (classic mode), so the type assertions fall through to "" rather than
+// failing the request.
+func subjectFromContext(c echo.Context) (subject string, subjectName string) {
+	subject, _ = c.Get(auth.ContextKeySubject).(string)
+	subjectName, _ = c.Get(auth.ContextKeySubjectName).(string)
+	return subject, subjectName
+}
+
+// configureNetwork sets up the network listener by loading the appropriate network plugin based on the configuration.
+func (s *Server) configureNetwork() (string, error) {
+	if s.networkConfig != nil {
+		netPlugin, err := network.DefaultRegistry.Get(s.networkConfig.Type)
+		if err != nil {
+			return "", err
+		}
+
+		configJSON, err := s.networkConfig.PluginConfigJSON()
+		if err != nil {
+			return "", err
+		}
+
+		s.echo.Listener, err = netPlugin.Listen(configJSON, s.serverConfig.Port)
+		if err != nil {
+			return "", err
+		}
+
+		return "", nil
+	}
+
+	return fmt.Sprintf(":%d", s.serverConfig.Port), nil
+}
+
+// Start launches the server in a separate goroutine
+func (s *Server) Start() {
+	go func() {
+		s.configureAuth()
+
+		listen, err := s.configureNetwork()
+		if err != nil {
+			s.echo.Logger.Fatal(err)
+			return
+		}
+
+		// TLS may only be enabled with no custom listener
+		if listen != "" && s.serverConfig.TLSCert != "" && s.serverConfig.TLSKey != "" {
+			if err := s.echo.StartTLS(listen, s.serverConfig.TLSCert, s.serverConfig.TLSKey); err != nil && !errors.Is(err, http.ErrServerClosed) {
+				s.echo.Logger.Error(err)
+			}
+		} else {
+			if err := s.echo.Start(listen); err != nil && !errors.Is(err, http.ErrServerClosed) {
+				s.echo.Logger.Error(err)
+			}
+		}
+	}()
+	<-s.ctx.Done()
+	s.Stop(false)
+}
+
+// Handler returns the underlying HTTP handler (the echo instance) so test helpers
+// can wrap it in an httptest.Server without starting a real listener.
+func (s *Server) Handler() http.Handler {
+	return s.echo
+}
+
+// Stop gracefully shuts down the server, waiting for ongoing requests to complete
+func (s *Server) Stop(_ bool) {
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
+	defer cancel()
+	slog.Info("API server received shutdown")
+	if err := s.echo.Shutdown(shutdownCtx); err != nil {
+		slog.Info("API server error when shutting down", "error", err)
+	}
+	slog.Info("API Server successfully shutdown")
+}
+
+// @title Formae REST API
+// @version 1.0
+// @description This API allows you to programatically interact with Formae without the CLI.
+// @host localhost:8080
+// @BasePath /api/v1
+func (s *Server) configureEcho() *echo.Echo {
+	e := echo.New()
+	e.HideBanner = true
+	e.HidePort = true
+
+	e.Logger = logging.NewEchoLogger()
+	e.StdLogger = log.Default()
+
+	// Recover middleware to catch panics and log them
+	e.Use(middleware.RecoverWithConfig(middleware.RecoverConfig{
+		LogErrorFunc: func(c echo.Context, err error, stack []byte) error {
+			slog.Error("Recovered from panic",
+				"error", err,
+				"method", c.Request().Method,
+				"path", c.Request().URL.Path,
+				"stack", string(stack))
+			return err
+		},
+	}))
+
+	// Forma command endpoints
+	e.POST(CommandsRoute, s.SubmitFormaCommand)
+	e.GET(CommandStatusRoute, s.CommandStatus)
+	e.GET(CommandDesiredDeltaRoute, s.CommandDesiredDelta)
+	e.GET(ListCommandStatusRoute, s.ListCommandStatus)
+	e.POST(CancelCommandsRoute, s.CancelCommands)
+
+	// Resource extraction endpoints
+	e.GET(ListResourcesRoute, s.ListResources)
+	e.GET(ListResourceSummariesRoute, s.ListResourceSummaries)
+	e.GET(GetResourceByKsuidRoute, s.GetResourceByKsuid)
+
+	// Target listing endpoint
+	e.GET(ListTargetsRoute, s.ListTargets)
+	e.GET(ListStacksRoute, s.ListStacks)
+	e.GET(ListPoliciesRoute, s.ListPolicies)
+	e.GET(ListGeneratorsRoute, s.ListGenerators)
+	e.GET(StackDriftRoute, s.ListDrift)
+	e.GET(StackChangesSinceLastReconcileRoute, s.ListDrift)
+	e.POST(StackReconcileRoute, s.ForceReconcile)
+
+	// Usage stats endpoint
+	e.GET(StatsRoute, s.Stats)
+
+	// Health endpoint
+	e.GET(HealthRoute, s.Health)
+
+	// Admin endpoints
+	e.POST(SyncRoute, s.ForceSync)
+	e.POST(DiscoverRoute, s.ForceDiscover)
+	e.POST(CheckTTLRoute, s.ForceCheckTTL)
+	e.POST(ReapRoute, s.ForceReap)
+
+	// Plugin management endpoints
+	e.GET(PluginsRoute, s.listPluginsHandler)
+	e.POST(PluginInstallRoute, s.installPluginsHandler)
+	e.POST(PluginUninstallRoute, s.uninstallPluginsHandler)
+	e.POST(PluginUpdateRoute, s.updatePluginsHandler)
+	e.GET(PluginRoute, s.getPluginHandler)
+
+	// Prometheus metrics endpoint (if enabled)
+	if s.metricsHandler != nil {
+		e.GET(MetricsRoute, echo.WrapHandler(s.metricsHandler))
+	}
+
+	// API docs endpoint
+	e.GET(APIDocsRoute, echoSwagger.WrapHandler)
+
+	return e
+}
+
+// @Summary Submit a Forma command
+// @Description Submits a Forma command to the agent. The command is executed asynchronously.
+// @Tags commands
+// @Accept multipart/form-data
+// @Produce json
+// @Param Client-ID header string true "Unique identifier for the client."
+// @Param command formData string true "The command to execute, either apply or destroy."
+// @Param message formData string false "Optional human-readable reason for the command."
+// @Param mode formData string false "Only applies to the apply command. The desired command mode, either reconcile or patch."
+// @Param simulate formData boolean false "If true, simulates command execution without actual changes to the infrastructure (defaults to false)."
+// @Param force formData boolean false "Only applies to the apply command in reconcile mode. If true, any changes made to the infrastructure since the last reconcile, either by patches or outside of Formae, will be overwritten."
+// @Param resolution formData string false "JSON drift-resolution controls for soft reconcile: ObservationID, Decisions [{ResourceID, Action (absorb or revert)}], ReviewID, IdempotencyKey. Simulate the final choices first; real submission requires its ReviewID and a stable IdempotencyKey. Mutually exclusive with force. Requires shared-drift-resolution capability."
+// @Param query formData string false "Only applies to destroy commands. A query string to select the resources to be destroyed."
+// @Param on-dependents formData string false "Only applies to destroy commands. Behavior when a delete would cascade onto dependent targets: abort (default) or cascade."
+// @Param file formData file false "A valid Forma file."
+// @Success 200 {object} apimodel.SubmitCommandResponse "OK: No changes required, or simulation result returned."
+// @Success 202 {object} apimodel.SubmitCommandResponse "Accepted: The command is validated, stored, and queued for execution."
+// @Header 202 {string} string Location "The URL to poll for the command's execution status (e.g., /api/v1/commands/{command_id}/status)."
+// @Failure 409 {object} apimodel.ErrorResponse[apimodel.DriftResolutionError] "Conflict: drift resolution rejected; inspect data.Code and data.Reason before retrying."
+// @Failure 500 {string} string "Internal Server Error."
+// @Router /commands [post]
+func (s *Server) SubmitFormaCommand(c echo.Context) error {
+	// Form data relevant to all commands
+	clientID := c.Request().Header.Get("Client-ID")
+	if clientID == "" {
+		return echo.NewHTTPError(http.StatusBadRequest, "Client-ID header is required")
+	}
+	subject, subjectName := subjectFromContext(c)
+	command := c.FormValue("command")
+	if command == "" {
+		return echo.NewHTTPError(http.StatusBadRequest, "command is required")
+	}
+	simulate := getOptionalBool(c, "simulate", false)
+
+	var response *apimodel.SubmitCommandResponse
+
+	switch command {
+	case "apply":
+		mode := pkgmodel.FormaApplyMode(c.FormValue("mode"))
+		force := getOptionalBool(c, "force", false)
+		if !hasFormaFile(c) {
+			return echo.NewHTTPError(http.StatusBadRequest, "file form field is required for apply command")
+		}
+		forma, err := getForma(c)
+		if err != nil {
+			return echo.NewHTTPError(http.StatusInternalServerError, err.Error())
+		}
+
+		var resolution *pkgmodel.DriftResolution
+		if raw := c.FormValue("resolution"); raw != "" {
+			if len(raw) > 64*1024 {
+				return echo.NewHTTPError(http.StatusBadRequest, "resolution exceeds 64 KiB")
+			}
+			decoder := json.NewDecoder(strings.NewReader(raw))
+			decoder.DisallowUnknownFields()
+			if err := decoder.Decode(&resolution); err != nil || resolution == nil {
+				return echo.NewHTTPError(http.StatusBadRequest, "invalid resolution controls")
+			}
+			var extra any
+			if err := decoder.Decode(&extra); err != io.EOF {
+				return echo.NewHTTPError(http.StatusBadRequest, "invalid trailing resolution controls")
+			}
+		}
+		response, err = s.metastructure.ApplyForma(forma, &config.FormaCommandConfig{
+			Resolution: resolution,
+			Message:    c.FormValue("message"),
+			Mode:       mode,
+			Simulate:   simulate,
+			Force:      force,
+		}, clientID, subject, subjectName)
+		if err != nil {
+			return mapError(c, err)
+		}
+	case "destroy":
+		var err error
+		// on-dependents governs whether a destroy that cascades onto dependent
+		// targets aborts (default) or proceeds. Empty is treated as "abort" by the
+		// metastructure.
+		onDependents := c.FormValue("on-dependents")
+		query := c.FormValue("query")
+		if query != "" {
+			// If query is provided, use it
+			response, err = s.metastructure.DestroyByQuery(query, &config.FormaCommandConfig{Simulate: simulate, OnDependents: onDependents}, clientID, subject, subjectName)
+		} else {
+			// Otherwise, expect a Forma file
+			if !hasFormaFile(c) {
+				return echo.NewHTTPError(http.StatusBadRequest, "either query form field or file form field is required for destroy command")
+			}
+			forma, getFormaErr := getForma(c)
+			if getFormaErr != nil {
+				return echo.NewHTTPError(http.StatusInternalServerError, getFormaErr.Error())
+			}
+			response, err = s.metastructure.DestroyForma(forma, &config.FormaCommandConfig{Simulate: simulate, OnDependents: onDependents}, clientID, subject, subjectName)
+		}
+		if err != nil {
+			return mapError(c, err)
+		}
+	default:
+		return fmt.Errorf("unsupported command: %s", command)
+	}
+
+	// Return 202 Accepted only when a command was actually queued for async
+	// execution. Return 200 OK for simulations and no-op commands where no
+	// work was started.
+	if response.Simulation.ChangesRequired && !simulate {
+		location := strings.Replace(CommandStatusRoute, ":id", response.CommandID, 1)
+		c.Response().Header().Set("Location", location)
+		return c.JSON(http.StatusAccepted, response)
+	}
+
+	return c.JSON(http.StatusOK, response)
+}
+
+// @Summary Get the status of a Forma command
+// @Description Retrieves the status of a previously submitted Forma command using its ID.
+// @Tags commands
+// @Produce json
+// @Param Client-ID header string true "Unique identifier for the client."
+// @Param id path string true "The ID of the command."
+// @Success 200 {object} apimodel.ListCommandStatusResponse "OK: The command's execution status."
+// @Failure 400 {string} string "Bad Request: Missing or invalid parameters."
+// @Failure 500 {string} string "Internal Server Error."
+// @Router /command/{id}/status [get]
+func (s *Server) CommandStatus(c echo.Context) error {
+	clientID := c.Request().Header.Get("Client-ID")
+	if clientID == "" {
+		return echo.NewHTTPError(http.StatusBadRequest, "Client-ID header is required")
+	}
+	id := c.Param("id")
+	if id == "" {
+		return echo.NewHTTPError(http.StatusBadRequest, "id is required")
+	}
+	query := fmt.Sprintf("id:%s", id)
+
+	return s.getCommandStatus(c, clientID, query, 1, apimodel.CommandScopeAgent)
+}
+
+// @Summary Get the status of multiple Forma commands
+// @Description Retrieves the statuses of multiple Forma commands based on a query string.
+// @Tags commands
+// @Produce json
+// @Param Client-ID header string true "Unique identifier for the client."
+// @Param query query string false "The query string to select the commands. If empty, the scope parameter decides what is returned."
+// @Param scope query string false "How an empty query is answered: 'client' (default) returns the calling client's most recent command; 'agent' returns every client's commands, newest first. Ignored when query is set." Enums(client, agent)
+// @Param max_results query string false "The maximum number of command statuses to return (default is 10, capped at 200)."
+// @Success 200 {object} apimodel.ListCommandStatusResponse "OK: The commands' execution statuses."
+// @Failure 400 {string} string "Bad Request: Missing or invalid parameters."
+// @Failure 404 {string} string "Not Found: No commands matched."
+// @Failure 500 {string} string "Internal Server Error."
+// @Router /commands/status [get]
+func (s *Server) ListCommandStatus(c echo.Context) error {
+	clientID := c.Request().Header.Get("Client-ID")
+	if clientID == "" {
+		return echo.NewHTTPError(http.StatusBadRequest, "Client-ID header is required")
+	}
+	maxResults := c.QueryParam("max_results")
+	query := c.QueryParam("query")
+	if maxResults == "" {
+		maxResults = "10"
+	}
+	n, err := strconv.Atoi(maxResults)
+	if err != nil {
+		return echo.NewHTTPError(http.StatusBadRequest, "N must be an integer")
+	}
+	if n > datastore.MaxFormaCommandsQueryLimit {
+		n = datastore.MaxFormaCommandsQueryLimit
+	}
+
+	// An absent or unrecognized scope keeps the historical empty-query
+	// behavior (the calling client's most recent command), so callers written
+	// against the older API are unaffected.
+	scope := apimodel.CommandScopeClient
+	if apimodel.CommandScope(c.QueryParam("scope")) == apimodel.CommandScopeAgent {
+		scope = apimodel.CommandScopeAgent
+	}
+
+	return s.getCommandStatus(c, clientID, query, n, scope)
+}
+
+// @Summary List resources
+// @Description Extracts and lists resources based on a provided query string.
+// @Tags resources
+// @Produce json
+// @Param Client-ID header string true "Unique identifier for the client."
+// @Param query query string true "The query string to select the resources."
+// @Param state query string false "Extraction state. desired requires desired-stack-extraction capability and complete stack selectors; returns accepted declarations including complete empty stacks. Defaults to actual inventory." Enums(actual, desired)
+// @Success 200 {object} pkgmodel.Forma ": OK: The extracted resources."
+// @Failure 400 {string} string "Bad Request: Invalid query."
+// @Failure 404 {string} string "Not Found: No resources found matching the query."
+// @Failure 406 {string} string "Not Acceptable: The request is not supported."
+// @Failure 500 {string} string "Internal Server Error."
+// @Router /resources [get]
+func (s *Server) ListResources(c echo.Context) error {
+	query := c.QueryParam("query")
+	state := c.QueryParam("state")
+	if state != "" && state != "actual" && state != "desired" {
+		return mapError(c, apimodel.InvalidQueryError{Reason: "unknown extraction state"})
+	}
+	if state == "desired" {
+		extractor, ok := s.metastructure.(interface {
+			ExtractDesiredStacks(string) (*pkgmodel.Forma, error)
+		})
+		if !ok {
+			return c.JSON(http.StatusNotAcceptable, map[string]string{"error": "desired stack extraction is unsupported"})
+		}
+		forma, err := extractor.ExtractDesiredStacks(query)
+		if err != nil {
+			return mapError(c, err)
+		}
+		return c.JSON(http.StatusOK, forma)
+	}
+	resources, err := s.metastructure.ExtractResources(query)
+	if err != nil {
+		return mapError(c, err)
+	}
+	if resources == nil || len(resources.Resources) == 0 {
+		return c.JSON(http.StatusNotFound, map[string]string{
+			"error": fmt.Sprintf("Resources cannot be extracted: %v", err),
+		})
+	}
+
+	return c.JSON(http.StatusOK, resources)
+}
+
+// @Summary List resource summaries
+// @Description Lists lightweight resource summaries (label, stack, type, native ID, ksuid) based on an optional query string.
+// @Tags resources
+// @Produce json
+// @Param query query string false "The query string to filter resources."
+// @Success 200 {array} pkgmodel.ResourceSummary "OK: The resource summaries."
+// @Failure 400 {string} string "Bad Request: Invalid query."
+// @Failure 500 {string} string "Internal Server Error."
+// @Router /resources/summary [get]
+func (s *Server) ListResourceSummaries(c echo.Context) error {
+	query := c.QueryParam("query")
+	summaries, err := s.metastructure.ListResourceSummaries(query)
+	if err != nil {
+		return mapError(c, err)
+	}
+	if summaries == nil {
+		summaries = []pkgmodel.ResourceSummary{}
+	}
+	return c.JSON(http.StatusOK, summaries)
+}
+
+// @Summary Get a resource by ksuid
+// @Description Retrieves a single resource by its ksuid identifier.
+// @Tags resources
+// @Produce json
+// @Param ksuid path string true "The ksuid of the resource."
+// @Success 200 {object} pkgmodel.Resource "OK: The resource."
+// @Failure 400 {string} string "Bad Request: Malformed ksuid."
+// @Failure 404 {string} string "Not Found: No resource found for the given ksuid."
+// @Failure 500 {string} string "Internal Server Error."
+// @Router /resources/by-ksuid/{ksuid} [get]
+func (s *Server) GetResourceByKsuid(c echo.Context) error {
+	id := c.Param("ksuid")
+	if _, err := ksuid.Parse(id); err != nil {
+		return echo.NewHTTPError(http.StatusBadRequest, fmt.Sprintf("invalid ksuid: %s", id))
+	}
+	resource, err := s.metastructure.ExtractResourceByKsuid(id)
+	if err != nil {
+		return mapError(c, err)
+	}
+	if resource == nil {
+		return c.JSON(http.StatusNotFound, map[string]string{
+			"error": fmt.Sprintf("no resource found for ksuid: %s", id),
+		})
+	}
+	return c.JSON(http.StatusOK, resource)
+}
+
+// @Summary List targets
+// @Description Retrieves targets based on query parameters
+// @Tags targets
+// @Produce json
+// @Param query query string false "Query string to filter targets (e.g., 'namespace:aws discoverable:true')"
+// @Success 200 {array} pkgmodel.Target "OK: List of targets."
+// @Failure 404 {string} string "Not Found: No targets found."
+// @Failure 500 {string} string "Internal Server Error."
+// @Router /targets [get]
+func (s *Server) ListTargets(c echo.Context) error {
+	query := c.QueryParam("query")
+	targets, err := s.metastructure.ExtractTargets(query)
+	if err != nil {
+		return mapError(c, err)
+	}
+	if len(targets) == 0 {
+		return c.JSON(http.StatusNotFound, map[string]string{
+			"error": "No targets found",
+		})
+	}
+
+	return c.JSON(http.StatusOK, targets)
+}
+
+// @Summary List stacks
+// @Description Retrieves all stack metadata
+// @Tags stacks
+// @Produce json
+// @Success 200 {array} pkgmodel.Stack "OK: List of stacks."
+// @Failure 404 {string} string "Not Found: No stacks found."
+// @Failure 500 {string} string "Internal Server Error."
+// @Router /stacks [get]
+func (s *Server) ListStacks(c echo.Context) error {
+	stacks, err := s.metastructure.ExtractStacks()
+	if err != nil {
+		return mapError(c, err)
+	}
+	if len(stacks) == 0 {
+		return c.JSON(http.StatusNotFound, map[string]string{
+			"error": "No stacks found",
+		})
+	}
+
+	return c.JSON(http.StatusOK, stacks)
+}
+
+// @Summary List generators
+// @Description Retrieves all live generators with their cadence, the instant of their last committed rotation, and the resources bound to them
+// @Tags generators
+// @Produce json
+// @Success 200 {array} apimodel.GeneratorInventoryItem "OK: List of generators."
+// @Failure 404 {string} string "Not Found: No generators found."
+// @Failure 500 {string} string "Internal Server Error."
+// @Router /generators [get]
+func (s *Server) ListGenerators(c echo.Context) error {
+	generators, err := s.metastructure.ExtractGenerators()
+	if err != nil {
+		return mapError(c, err)
+	}
+	if len(generators) == 0 {
+		return c.JSON(http.StatusNotFound, map[string]string{
+			"error": "No generators found",
+		})
+	}
+
+	return c.JSON(http.StatusOK, generators)
+}
+
+// @Summary List standalone policies
+// @Description Retrieves all standalone policies with their attached stacks
+// @Tags policies
+// @Produce json
+// @Success 200 {array} apimodel.PolicyInventoryItem "OK: List of standalone policies."
+// @Failure 404 {string} string "Not Found: No policies found."
+// @Failure 500 {string} string "Internal Server Error."
+// @Router /policies [get]
+func (s *Server) ListPolicies(c echo.Context) error {
+	policies, err := s.metastructure.ExtractPolicies()
+	if err != nil {
+		return mapError(c, err)
+	}
+	if len(policies) == 0 {
+		return c.JSON(http.StatusNotFound, map[string]string{
+			"error": "No policies found",
+		})
+	}
+
+	return c.JSON(http.StatusOK, policies)
+}
+
+// @Summary List drift for a stack
+// @Description Retrieves resource modifications (drift) detected since the last reconcile for a given stack.
+// @Tags stacks
+// @Produce json
+// @Param stack path string true "The stack label to check for drift."
+// @Success 200 {object} apimodel.ModifiedStack "OK: Drift report for the stack."
+// @Failure 500 {string} string "Internal Server Error."
+// @Router /stacks/{stack}/drift [get]
+// @Router /stacks/{stack}/changes-since-last-reconcile [get]
+func (s *Server) ListDrift(c echo.Context) error {
+	stack := c.Param("stack")
+	drift, err := s.metastructure.ListDrift(stack)
+	if err != nil {
+		return mapError(c, err)
+	}
+
+	return c.JSON(http.StatusOK, drift)
+}
+
+// @Summary Force stack reconcile
+// @Description Triggers a one-shot reconcile for a specific stack. This creates and executes a
+// @Description reconcile command that reverts any out-of-band changes to managed resources on the
+// @Description stack back to their last-known desired state. The reconcile is equivalent to
+// @Description re-applying the last reconcile snapshot. The command executes asynchronously —
+// @Description use the returned command_id to poll for completion via GET /commands/:id/status.
+// @Description
+// @Description Side effects: This endpoint creates real infrastructure changes. Any resources that
+// @Description have been modified outside of formae since the last reconcile will be reverted to
+// @Description their managed state. This is a destructive operation for out-of-band changes.
+// @Tags stacks
+// @Produce json
+// @Param stack path string true "The stack label to reconcile."
+// @Success 202 {object} apimodel.ForceReconcileResponse "Accepted: Reconcile command created and executing."
+// @Success 200 {object} apimodel.ForceReconcileResponse "OK: No drift detected, nothing to reconcile."
+// @Failure 403 {object} apimodel.ReconcilePolicyRequiredError "Forbidden: Stack does not have an auto-reconcile policy."
+// @Failure 409 {object} apimodel.ForceReconcileResponse "Conflict: Stack has active commands, reconcile skipped."
+// @Failure 500 {string} string "Internal Server Error."
+// @Router /stacks/{stack}/reconcile [post]
+func (s *Server) ForceReconcile(c echo.Context) error {
+	stackLabel := c.Param("stack")
+	subject, subjectName := subjectFromContext(c)
+	result, err := s.metastructure.ForceAutoReconcile(stackLabel, subject, subjectName)
+	if err != nil {
+		return mapError(c, err)
+	}
+	if result.CommandID != "" {
+		return c.JSON(http.StatusAccepted, result)
+	}
+	return c.JSON(http.StatusOK, result)
+}
+
+// @Summary Get usage statistics
+// @Description Retrieves usage statistics of the Formae agent.
+// @Tags stats
+// @Produce json
+// @Success 200 {object} apimodel.Stats": OK: The usage statistics."
+// @Failure 500 {string} string "Internal Server Error."
+// @Router /stats [get]
+func (s *Server) Stats(c echo.Context) error {
+	stats, err := s.metastructure.Stats()
+	if err != nil {
+		return echo.NewHTTPError(http.StatusInternalServerError, err)
+	}
+
+	return c.JSON(http.StatusOK, stats)
+}
+
+// @Summary Health Check
+// @Description A simple health check endpoint to verify that the API server is running.
+// @Tags health
+// @Success 200
+// @Router /health [get]
+func (s *Server) Health(c echo.Context) error {
+	return c.JSON(http.StatusOK, nil)
+}
+
+// @Summary Force resource synchronization
+// @Description Triggers an immediate synchronization of the resource state with the actual infrastructure.
+// @Tags admin
+// @Success 200
+// @Failure 500 {string} string "Internal Server Error."
+// @Router /admin/synchronize [post]
+func (s *Server) ForceSync(c echo.Context) error {
+	err := s.metastructure.ForceSync()
+	if err != nil {
+		return echo.NewHTTPError(http.StatusInternalServerError)
+	}
+
+	return c.JSON(http.StatusOK, "")
+}
+
+// @Summary Force resource discovery
+// @Description Initiates an immediate discovery process to identify resources in the infrastructure.
+// @Tags admin
+// @Success 200
+// @Failure 500 {string} string "Internal Server Error."
+// @Router /admin/discover [post]
+func (s *Server) ForceDiscover(c echo.Context) error {
+	if err := s.metastructure.ForceDiscovery(); err != nil {
+		return echo.NewHTTPError(http.StatusInternalServerError)
+	}
+	return c.JSON(http.StatusOK, "")
+}
+
+// @Summary Force TTL expiry check
+// @Description Triggers a one-shot TTL expiry check. Identifies stacks with expired TTL policies
+// @Description and initiates their destruction. Stacks with active commands are skipped.
+// @Description
+// @Description Side effects: This endpoint destroys infrastructure. Any stack whose TTL has expired
+// @Description will have all its resources destroyed. This is irreversible.
+// @Tags admin
+// @Produce json
+// @Success 200 {object} apimodel.ForceCheckTTLResponse "OK: TTL check complete."
+// @Failure 500 {string} string "Internal Server Error."
+// @Router /admin/check-ttl [post]
+func (s *Server) ForceCheckTTL(c echo.Context) error {
+	result, err := s.metastructure.ForceCheckTTL()
+	if err != nil {
+		return echo.NewHTTPError(http.StatusInternalServerError, err.Error())
+	}
+	return c.JSON(http.StatusOK, result)
+}
+
+// @Summary Force a target-reaper tick
+// @Description Triggers a single, immediate TargetReaper tick: advances the unreachability-accrual
+// @Description clock for every currently-unreachable target, detects reap candidates that have
+// @Description reached their reap-after duration, and reaps (tombstones) the eligible ones, subject
+// @Description to the per-tick rate cap.
+// @Tags admin
+// @Success 200
+// @Failure 500 {string} string "Internal Server Error."
+// @Router /admin/reap [post]
+func (s *Server) ForceReap(c echo.Context) error {
+	if err := s.metastructure.ForceReap(); err != nil {
+		return echo.NewHTTPError(http.StatusInternalServerError)
+	}
+	return c.JSON(http.StatusOK, "")
+}
+
+// getCommandStatus is a helper to retrieve command status and handle common error/status logic
+func (s *Server) getCommandStatus(c echo.Context, clientID, query string, n int, scope apimodel.CommandScope) error {
+	subject, _ := subjectFromContext(c)
+	caller := querier.Caller{ClientID: clientID, Subject: subject}
+	result, err := s.metastructure.ListFormaCommandStatus(query, caller, n, scope)
+	if err != nil {
+		return mapError(c, err)
+	}
+	if len(result.Commands) == 0 {
+		return echo.NewHTTPError(http.StatusNotFound)
+	}
+
+	return c.JSON(http.StatusOK, result)
+}
+
+// getOptionalBool retrieves a boolean form value, returning a default if not present or invalid
+func getOptionalBool(c echo.Context, key string, defaultValue bool) bool {
+	valStr := c.FormValue(key)
+
+	if valStr == "" {
+		return defaultValue
+	}
+
+	parsedVal, err := strconv.ParseBool(valStr)
+	if err != nil {
+		c.Logger().Warnf("Form field '%s' found with invalid boolean value '%s'. Defaulting to %t. Error: %v", key, valStr, defaultValue, err)
+		return defaultValue
+	}
+
+	return parsedVal
+}
+
+// getForma extracts and parses the Forma file from the multipart form data
+func getForma(c echo.Context) (*pkgmodel.Forma, error) {
+	fileHeader, err := c.FormFile("file")
+	if err != nil {
+		return nil, fmt.Errorf("file form field missing: %w", err)
+	}
+
+	src, err := fileHeader.Open()
+	if err != nil {
+		return nil, fmt.Errorf("failed to open file stream: %w", err)
+	}
+	defer func() {
+		_ = src.Close()
+	}()
+
+	var forma pkgmodel.Forma
+
+	decoder := json.NewDecoder(src)
+
+	if err := decoder.Decode(&forma); err != nil {
+		if err == io.EOF {
+			return nil, fmt.Errorf("file is empty")
+		}
+		// Catch JSON formatting errors
+		return nil, fmt.Errorf("invalid JSON format in file: %w", err)
+	}
+
+	return &forma, nil
+}
+
+// hasFormaFile checks if the request has a file form field named "file"
+func hasFormaFile(c echo.Context) bool {
+	_, err := c.FormFile("file")
+	return err == nil
+}
+
+// mapError maps metastructure errors to appropriate HTTP responses
+func mapError(c echo.Context, err error) error {
+	var resolutionErr apimodel.DriftResolutionError
+	if errors.As(err, &resolutionErr) {
+		status := http.StatusConflict
+		if resolutionErr.Code == "invalid-resolution" || resolutionErr.Code == "invalid-decisions" {
+			status = http.StatusBadRequest
+		}
+		return apiError(c, status, apimodel.DriftResolutionRejected, resolutionErr)
+	}
+	if errors.Is(err, datastore.ErrStaleAdmission) {
+		return apiError(c, http.StatusConflict, apimodel.DriftResolutionRejected, apimodel.DriftResolutionError{Code: "stale-review", Reason: "relevant state changed; obtain a new final review"})
+	}
+	if errors.Is(err, datastore.ErrAdmissionConflict) {
+		return apiError(c, http.StatusConflict, apimodel.DriftResolutionRejected, apimodel.DriftResolutionError{Code: "idempotency-conflict", Reason: err.Error()})
+	}
+	if errors.Is(err, datastore.ErrInvalidAdmission) {
+		return apiError(c, http.StatusBadRequest, apimodel.DriftResolutionRejected, apimodel.DriftResolutionError{Code: "invalid-resolution", Reason: err.Error()})
+	}
+	var recoveryErr metastructure.AdmittedCommandRecoveryError
+	if errors.As(err, &recoveryErr) {
+		return apiError(c, http.StatusConflict, apimodel.DriftResolutionRejected, apimodel.DriftResolutionError{Code: "recovery-required", Reason: recoveryErr.Cause.Error(), CommandID: recoveryErr.CommandID})
+	}
+
+	var reconcileRejectedResult apimodel.FormaReconcileRejectedError
+	if errors.As(err, &reconcileRejectedResult) {
+		return apiError(c, http.StatusConflict, apimodel.ReconcileRejected, reconcileRejectedResult)
+	}
+
+	var conflictingResourcesResult apimodel.FormaConflictingCommandsError
+	if errors.As(err, &conflictingResourcesResult) {
+		return apiError(c, http.StatusConflict, apimodel.ConflictingCommands, conflictingResourcesResult)
+	}
+
+	var cyclesDetectedResult apimodel.FormaCyclesDetectedError
+	if errors.As(err, &cyclesDetectedResult) {
+		return apiError(c, http.StatusBadRequest, apimodel.CyclesDetected, cyclesDetectedResult)
+	}
+
+	var rejectedResult apimodel.FormaPatchRejectedError
+	if errors.As(err, &rejectedResult) {
+		return apiError(c, http.StatusUnprocessableEntity, apimodel.PatchRejected, rejectedResult)
+	}
+
+	var emptyStackError apimodel.FormaEmptyStackRejectedError
+	if errors.As(err, &emptyStackError) {
+		return apiError(c, http.StatusUnprocessableEntity, apimodel.EmptyStackRejected, emptyStackError)
+	}
+
+	var resourceNotFoundError apimodel.FormaReferencedResourcesNotFoundError
+	if errors.As(err, &resourceNotFoundError) {
+		return apiError(c, http.StatusBadRequest, apimodel.ReferencedResourcesNotFound, resourceNotFoundError)
+	}
+
+	var generatorNotFoundError apimodel.FormaReferencedGeneratorsNotFoundError
+	if errors.As(err, &generatorNotFoundError) {
+		return apiError(c, http.StatusBadRequest, apimodel.ReferencedGeneratorsNotFound, generatorNotFoundError)
+	}
+
+	var unreachableDestinationsError apimodel.FormaGeneratorDestinationsUnreachableError
+	if errors.As(err, &unreachableDestinationsError) {
+		return apiError(c, http.StatusUnprocessableEntity, apimodel.GeneratorDestinationsUnreachable, unreachableDestinationsError)
+	}
+
+	var setOnceGeneratorFieldError apimodel.FormaGeneratorBoundToSetOnceFieldError
+	if errors.As(err, &setOnceGeneratorFieldError) {
+		return apiError(c, http.StatusUnprocessableEntity, apimodel.GeneratorBoundToSetOnceField, setOnceGeneratorFieldError)
+	}
+
+	var targetExistsError apimodel.TargetAlreadyExistsError
+	if errors.As(err, &targetExistsError) {
+		return apiError(c, http.StatusConflict, apimodel.TargetAlreadyExists, targetExistsError)
+	}
+
+	var nonPortableError apimodel.NonPortableResourcesError
+	if errors.As(err, &nonPortableError) {
+		return apiError(c, http.StatusConflict, apimodel.NonPortableResources, nonPortableError)
+	}
+
+	var targetReapedError apimodel.TargetReapedError
+	if errors.As(err, &targetReapedError) {
+		return apiError(c, http.StatusConflict, apimodel.TargetReaped, targetReapedError)
+	}
+
+	var targetHasDependentsError apimodel.FormaTargetHasDependentsError
+	if errors.As(err, &targetHasDependentsError) {
+		return apiError(c, http.StatusConflict, apimodel.TargetHasDependents, targetHasDependentsError)
+	}
+
+	var resourceHasDependentsError apimodel.FormaResourceHasDependentsError
+	if errors.As(err, &resourceHasDependentsError) {
+		return apiError(c, http.StatusConflict, apimodel.ResourceHasDependents, resourceHasDependentsError)
+	}
+
+	// Conflict, not 422: the client's destroy entry points decode only 400 and
+	// 409, so a 422 would reach the caller as an opaque error on the very path
+	// this refusal exists for.
+	var generatorHasDependentsError apimodel.FormaGeneratorHasDependentsError
+	if errors.As(err, &generatorHasDependentsError) {
+		return apiError(c, http.StatusConflict, apimodel.GeneratorHasDependents, generatorHasDependentsError)
+	}
+
+	var requiredFieldMissingError apimodel.RequiredFieldMissingOnCreateError
+	if errors.As(err, &requiredFieldMissingError) {
+		return apiError(c, http.StatusBadRequest, apimodel.RequiredFieldMissingOnCreate, requiredFieldMissingError)
+	}
+
+	var invalidQueryError apimodel.InvalidQueryError
+	if errors.As(err, &invalidQueryError) {
+		return apiError(c, http.StatusBadRequest, apimodel.InvalidQuery, invalidQueryError)
+	}
+
+	var stackReferenceNotFoundError apimodel.StackReferenceNotFoundError
+	if errors.As(err, &stackReferenceNotFoundError) {
+		return apiError(c, http.StatusBadRequest, apimodel.StackReferenceNotFound, stackReferenceNotFoundError)
+	}
+
+	var stackDeletedError apimodel.StackDeletedDuringApplyError
+	if errors.As(err, &stackDeletedError) {
+		return apiError(c, http.StatusConflict, apimodel.StackDeletedDuringApply, stackDeletedError)
+	}
+
+	var targetReferenceNotFoundError apimodel.TargetReferenceNotFoundError
+	if errors.As(err, &targetReferenceNotFoundError) {
+		return apiError(c, http.StatusBadRequest, apimodel.TargetReferenceNotFound, targetReferenceNotFoundError)
+	}
+
+	var reconcilePolicyError apimodel.ReconcilePolicyRequiredError
+	if errors.As(err, &reconcilePolicyError) {
+		return apiError(c, http.StatusForbidden, apimodel.ReconcilePolicyRequired, reconcilePolicyError)
+	}
+
+	if err != nil {
+		return echo.NewHTTPError(http.StatusInternalServerError, err.Error())
+	}
+
+	return nil
+}
+
+// @Summary Cancel commands
+// @Description Cancels commands that are currently in progress. Can cancel either the most recent command or commands matching a query.
+// @Tags commands
+// @Produce json
+// @Param Client-ID header string true "Unique identifier for the client."
+// @Param query query string false "Optional query string to select commands to cancel. If not provided, cancels the most recent command."
+// @Param force query boolean false "If true, abandon in-progress work and drive the command to a terminal 'Canceled' state immediately instead of waiting for in-progress resources to finish. Defaults to false."
+// @Success 202 {object} apimodel.CancelCommandResponse "Accepted: Commands are being canceled."
+// @Success 404 {string} string "Not Found: No in-progress commands found to cancel."
+// @Failure 400 {string} string "Bad Request: Invalid query or missing Client-ID."
+// @Failure 500 {string} string "Internal Server Error."
+// @Router /commands/cancel [post]
+func (s *Server) CancelCommands(c echo.Context) error {
+	clientID := c.Request().Header.Get("Client-ID")
+	if clientID == "" {
+		return echo.NewHTTPError(http.StatusBadRequest, "Client-ID header is required")
+	}
+
+	query := c.QueryParam("query")
+	force := c.QueryParam("force") == "true"
+
+	subject, _ := subjectFromContext(c)
+	caller := querier.Caller{ClientID: clientID, Subject: subject}
+	result, err := s.metastructure.CancelCommandsByQuery(query, force, caller)
+	if err != nil {
+		return mapError(c, err)
+	}
+
+	if result == nil || len(result.CommandIDs) == 0 {
+		return c.NoContent(http.StatusNotFound)
+	}
+
+	return c.JSON(http.StatusAccepted, result)
+}
+
+// apiError is a helper to wrap error data in ErrorResponse[T] and return as json
+func apiError[T any](c echo.Context, status int, errorType apimodel.APIError, data T) error {
+	return c.JSON(status, apimodel.ErrorResponse[T]{
+		ErrorType: errorType,
+		Data:      data,
+	})
+}
+
+// CommandDesiredDelta serves partial source guidance from recorded desired intent.
+// @Summary Get a command's desired source delta
+// @Description Returns partial recorded desired intent for source catch-up. This is not a complete reconcile declaration. Requires shared-drift-resolution capability.
+// @Tags commands
+// @Produce json
+// @Param Client-ID header string true "Unique identifier for the client."
+// @Param id path string true "Command ID returned by the accepted submission."
+// @Success 200 {object} apimodel.CommandDesiredDelta "Partial desired source guidance and command state."
+// @Failure 400 {string} string "Bad Request: missing Client-ID or invalid command."
+// @Failure 409 {object} apimodel.ErrorResponse[apimodel.DriftResolutionError] "Conflict: resolution receipt or terminal desired intent is unavailable; inspect data.Code and data.Reason."
+// @Failure 500 {string} string "Internal Server Error: command lookup or extraction failed."
+// @Failure 501 {string} string "Not Implemented: shared drift resolution unavailable."
+// @Router /commands/{id}/desired-delta [get]
+func (s *Server) CommandDesiredDelta(c echo.Context) error {
+	if c.Request().Header.Get("Client-ID") == "" {
+		return echo.NewHTTPError(http.StatusBadRequest, "Client-ID header is required")
+	}
+	reader, ok := s.metastructure.(interface {
+		ExtractCommandDesiredDelta(string) (*apimodel.CommandDesiredDelta, error)
+	})
+	if !ok {
+		return echo.NewHTTPError(http.StatusNotImplemented, "shared drift resolution unavailable")
+	}
+	delta, err := reader.ExtractCommandDesiredDelta(c.Param("id"))
+	if err != nil {
+		return mapError(c, err)
+	}
+	return c.JSON(http.StatusOK, delta)
+}

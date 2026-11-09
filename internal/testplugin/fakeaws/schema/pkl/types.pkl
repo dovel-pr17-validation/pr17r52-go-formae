@@ -1,0 +1,19 @@
+/*
+ * © 2025 Platform Engineering Labs Inc.
+ *
+ * SPDX-License-Identifier: FSL-1.1-ALv2
+ */
+
+/*
+ * FakeAWS types - minimal copy of AWS types for testing.
+ */
+module fakeaws.types
+
+/// FakeAWS Tag - matches CloudFormation tag schema.
+open class Tag {
+    hidden key: String
+    hidden value: Any
+
+    fixed Key: String = key
+    fixed Value: Any = value
+}

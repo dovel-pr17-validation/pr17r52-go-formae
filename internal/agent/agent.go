@@ -1,0 +1,390 @@
+// © 2025 Platform Engineering Labs Inc.
+//
+// SPDX-License-Identifier: FSL-1.1-ALv2
+
+package agent
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"log/slog"
+	"os"
+	"os/signal"
+	"syscall"
+	"time"
+
+	"github.com/platform-engineering-labs/formae"
+	"github.com/platform-engineering-labs/formae/internal/api"
+	"github.com/platform-engineering-labs/formae/internal/auth"
+	_ "github.com/platform-engineering-labs/formae/internal/datastore/all"
+	"github.com/platform-engineering-labs/formae/internal/imconc"
+	"github.com/platform-engineering-labs/formae/internal/logging"
+	"github.com/platform-engineering-labs/formae/internal/metastructure"
+	"github.com/platform-engineering-labs/formae/internal/network"
+	_ "github.com/platform-engineering-labs/formae/internal/network/all"
+	_ "github.com/platform-engineering-labs/formae/internal/schema/all"
+	"github.com/platform-engineering-labs/formae/internal/util"
+	pkgauth "github.com/platform-engineering-labs/formae/pkg/auth"
+	"github.com/platform-engineering-labs/formae/pkg/credential"
+	pkgmodel "github.com/platform-engineering-labs/formae/pkg/model"
+	"github.com/platform-engineering-labs/formae/pkg/plugin"
+	plugindiscovery "github.com/platform-engineering-labs/formae/pkg/plugin/discovery"
+	"github.com/tidwall/gjson"
+)
+
+// getPidFile returns the PID file path, configurable via FORMAE_PID_FILE env var.
+// This allows running multiple agents concurrently (e.g., in parallel tests).
+func getPidFile() string {
+	if path := os.Getenv("FORMAE_PID_FILE"); path != "" {
+		return path
+	}
+	return "/tmp/formae.pid"
+}
+
+type Agent struct {
+	ctx    context.Context
+	cancel context.CancelFunc
+	done   chan struct{}
+	cfg    *pkgmodel.Config
+	id     string
+}
+
+func New(cfg *pkgmodel.Config, id string) *Agent {
+	ctx, cancel := context.WithCancel(context.Background())
+	return &Agent{
+		ctx:    ctx,
+		cancel: cancel,
+		done:   make(chan struct{}),
+		cfg:    cfg,
+		id:     id,
+	}
+}
+
+func (a *Agent) Start() error {
+	// Check if already running
+	if _, err := os.Stat(getPidFile()); err == nil {
+		if err := removeStalePidFile(); err != nil {
+			return err
+		}
+	}
+
+	// Set up signal handling
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, syscall.SIGTERM, syscall.SIGINT)
+
+	// Write PID
+	pid := os.Getpid()
+	if err := os.WriteFile(getPidFile(), []byte(fmt.Sprintf("%d", pid)), 0600); err != nil {
+		return fmt.Errorf("failed to write pid file: %w", err)
+	}
+
+	imwg := imconc.NewConcGroup()
+	go func() {
+		// Important: Setup all OTel providers before db connections are created -
+		// otelsql captures the tracer provider at driver registration time.
+		otelLogHandler, metricsHandler, shutdownOTel := api.SetupOTelProviders(&a.cfg.Agent.OTel)
+		defer func() {
+			shutdownOTel()
+			a.cleanup()
+			close(a.done)
+		}()
+
+		// Setup logging with OTel handler
+		logging.SetupBackendLogging(&a.cfg.Agent.Logging, otelLogHandler)
+
+		devPluginDir := util.ExpandHomePath(a.cfg.PluginDir)
+
+		binPath, err := os.Executable()
+		if err != nil {
+			slog.Error("Failed to determine binary path", "error", err)
+			return
+		}
+		systemPluginDir := plugindiscovery.SystemPluginDir(binPath)
+
+		resourceInfos := plugindiscovery.DiscoverPluginsMulti(
+			[]string{devPluginDir, systemPluginDir}, plugindiscovery.Resource,
+		)
+		resourceInfos = plugindiscovery.FilterCompatiblePlugins(
+			resourceInfos, formae.Version, plugin.MinFormaeVersion, plugin.SDKVersion,
+		)
+		externalResourcePlugins := make([]plugin.ResourcePluginInfo, len(resourceInfos))
+		for i, p := range resourceInfos {
+			externalResourcePlugins[i] = p.ToResourcePluginInfo()
+		}
+
+		// Credential brokers are gated against the credential SDK's own
+		// compatibility floor, not the resource SDK's: they link pkg/credential.
+		brokerInfos := plugindiscovery.DiscoverPluginsMulti(
+			[]string{devPluginDir, systemPluginDir}, plugindiscovery.OidcCredential,
+		)
+		brokerInfos = plugindiscovery.FilterCompatiblePlugins(
+			brokerInfos, formae.Version, credential.MinFormaeVersion, credential.SDKVersion,
+		)
+		oidcCredentialPlugins := make([]plugin.OidcCredentialPluginInfo, len(brokerInfos))
+		for i, p := range brokerInfos {
+			oidcCredentialPlugins[i] = p.ToOidcCredentialPluginInfo()
+		}
+
+		// Create auth plugin handle if auth is configured and a matching
+		// external auth plugin binary was discovered.
+		// If auth is explicitly configured but cannot be loaded, the agent
+		// refuses to start — running without auth when auth was requested
+		// is a security misconfiguration.
+		var authHandle *auth.AuthPluginHandle
+		if a.cfg.Agent.Auth != nil {
+			authType := gjson.GetBytes(a.cfg.Agent.Auth, "type").String()
+			if authType == "" {
+				slog.Error("Agent auth config missing 'type' field — refusing to start without auth")
+				return
+			}
+			authPlugins := plugindiscovery.DiscoverPluginsMulti(
+				[]string{devPluginDir, systemPluginDir}, plugindiscovery.Auth,
+			)
+			// For auth plugins, check compatibility separately so we can give a
+			// specific error message (not just "not installed").
+			var matchedPlugin *plugindiscovery.PluginInfo
+			for i, p := range authPlugins {
+				if p.Name == authType {
+					matchedPlugin = &authPlugins[i]
+					break
+				}
+			}
+			if matchedPlugin == nil {
+				slog.Error("Auth plugin not installed — refusing to start without auth", "type", authType)
+				return
+			}
+			compatibleAuth := plugindiscovery.FilterCompatiblePlugins(
+				[]plugindiscovery.PluginInfo{*matchedPlugin}, formae.Version, pkgauth.MinFormaeVersion, pkgauth.SDKVersion,
+			)
+			if len(compatibleAuth) == 0 {
+				slog.Error("Auth plugin installed but incompatible — refusing to start",
+					"type", authType,
+					"version", matchedPlugin.Version,
+					"pluginMinFormaeVersion", matchedPlugin.MinFormaeVersion,
+					"agentMinFormaeVersion", pkgauth.MinFormaeVersion,
+					"upgradeSDK", pkgauth.SDKVersion)
+				return
+			}
+			authHandle = auth.NewAuthPluginHandle(matchedPlugin.Name, matchedPlugin.BinaryPath, a.cfg.Agent.Auth)
+			slog.Info("Auth plugin configured", "name", matchedPlugin.Name, "version", matchedPlugin.Version, "path", matchedPlugin.BinaryPath)
+		}
+
+		slog.Info("Starting agent", "id", a.id)
+
+		ms, err := metastructure.NewMetastructure(a.ctx, a.cfg, externalResourcePlugins, oidcCredentialPlugins, a.id)
+		if err != nil {
+			slog.Error("Failed to create ms", "error", err)
+			return
+		}
+
+		// Pass auth handle to metastructure for supervisor injection
+		if authHandle != nil {
+			ms.AuthPluginHandle = authHandle
+		}
+
+		// An abnormal stop of the orchestrator application means every actor
+		// is gone while this process and its HTTP surface keep running and
+		// look healthy. Exit instead: the process supervisor (ECS, systemd)
+		// restarts the agent, and startup re-runs incomplete commands.
+		ms.OnApplicationStopped = func(reason error) {
+			slog.Error("Metastructure stopped; shutting down so the process supervisor restarts the agent", "reason", reason)
+			a.cancel()
+		}
+
+		imwg.Add(ms)
+
+		if err := ms.Start(); err != nil {
+			slog.Error("Failed to start metastructure", "error", err)
+			return
+		}
+
+		// Append this process start to the agent's own boot history. Deliberately
+		// after ms.Start(): the SQLite backend runs on a single connection
+		// (SetMaxOpenConns(1)), so a stalled boot write issued beforehand would
+		// hold the only connection while startup's own database work queued behind
+		// it. Best-effort, cancellable and off the startup goroutine; see
+		// recordBoot.
+		recordBoot(ms.Datastore, formae.Version)
+
+		// Start Ergo actor metrics collection (only if OTel is enabled)
+		if a.cfg.Agent.OTel.Enabled {
+			if err := api.StartErgoMetrics(ms.Node); err != nil {
+				slog.Error("Failed to start Ergo metrics", "error", err)
+				// Non-fatal - continue without Ergo metrics
+			}
+
+			// Start Formae stats metrics collection
+			if err := api.StartFormaeMetrics(ms); err != nil {
+				slog.Error("Failed to start Formae metrics", "error", err)
+				// Non-fatal - continue without Formae metrics
+			}
+		}
+
+		slog.Info("Agent started")
+
+		apiServer := api.NewServer(a.ctx, ms, authHandle, &a.cfg.Agent.Server, a.cfg.Network, metricsHandler)
+		// Plugin install/uninstall/update run locally on the CLI host
+		// (see internal/cli/plugin), so the agent does not construct an
+		// orbital-backed PluginManager. The installed-plugin listing
+		// endpoint serves from the in-process registry and a filesystem
+		// scan of these dirs — no orbital tree, no sudo re-exec.
+		apiServer.SetPluginDirs([]string{devPluginDir, systemPluginDir})
+
+		imwg.Add(apiServer)
+		imwg.Go(func() {
+			apiServer.Start()
+		})
+
+		// Egress starts after the inbound listener is on its way up, and a
+		// failure here is non-fatal: the API listener is how the CLI and MCP
+		// reach the agent, so an egress misconfiguration must not take it down.
+		egress, err := network.StartEgressProxy(a.ctx, a.cfg.Network)
+		if err != nil {
+			slog.Error("Failed to start network egress proxy", "error", err)
+		} else if egress != nil {
+			imwg.Add(egress)
+			imwg.Go(egress.Serve)
+		}
+
+		// Handle signals and shutdown
+		go func() {
+			select {
+			case sig := <-sigChan:
+				slog.Info("Received signal", "signal", sig)
+				a.cancel()
+			case <-a.ctx.Done():
+				slog.Info("Context canceled")
+			}
+		}()
+		<-a.ctx.Done()
+
+		// Ensure app doesn't hang indefinitely on shutdown
+		shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer shutdownCancel()
+
+		slog.Info("Stopping metastructure")
+		ms.Stop(false)
+
+		done := make(chan struct{})
+		go func() {
+			imwg.Wait()
+			close(done)
+		}()
+
+		// Wait for either completion or timeout
+		select {
+		case <-done:
+			slog.Info("Components stopped gracefully")
+		case <-shutdownCtx.Done():
+			slog.Warn("Shutdown timed out, forcing stop")
+			imwg.Stop(true)
+		}
+	}()
+
+	return nil
+}
+
+func (a *Agent) Stop() error {
+	// Try to read PID file
+	pidBytes, err := os.ReadFile(getPidFile())
+	if err != nil {
+		if os.IsNotExist(err) {
+			return fmt.Errorf("agent is not running (no PID file found)")
+		}
+		return fmt.Errorf("failed to read pid file: %w", err)
+	}
+
+	// Parse PID
+	var pid int
+	if _, err := fmt.Sscanf(string(pidBytes), "%d", &pid); err != nil {
+		return fmt.Errorf("invalid pid file content: %w", err)
+	}
+
+	// Check if we are the process
+	if pid == os.Getpid() {
+		if a.cancel != nil {
+			a.cancel()
+		}
+		<-a.done
+		return nil
+	}
+
+	// We are not the process, try to stop it
+	process, err := os.FindProcess(pid)
+	if err != nil {
+		return fmt.Errorf("failed to find process: %w", err)
+	}
+
+	// First, try SIGTERM
+	if err := process.Signal(syscall.SIGTERM); err != nil {
+		if err.Error() == "os: process already finished" {
+			a.cleanup()
+			return fmt.Errorf("agent is not running (stale PID file)")
+		}
+		return fmt.Errorf("failed to send signal to process: %w", err)
+	}
+
+	if waitForPidFileRemoval(10 * time.Second) {
+		return nil
+	}
+
+	// If SIGTERM didn't work, try SIGKILL as a last resort
+	slog.Warn("SIGTERM timeout, attempting SIGKILL")
+	if err := process.Signal(syscall.SIGKILL); err != nil {
+		return fmt.Errorf("failed to SIGKILL process: %w", err)
+	}
+
+	// Clean up the PID file since SIGKILL won't trigger normal cleanup
+	a.cleanup()
+	return nil
+}
+
+func (a *Agent) Wait() {
+	<-a.done
+}
+
+func (a *Agent) cleanup() {
+	slog.Info("Cleaning up")
+	removePidFile()
+}
+
+func removePidFile() {
+	if err := os.Remove(getPidFile()); err != nil && !os.IsNotExist(err) {
+		slog.Error("Failed to remove pid file", "error", err)
+	}
+}
+
+func removeStalePidFile() error {
+	pidBytes, err := os.ReadFile(getPidFile())
+	if err != nil {
+		return fmt.Errorf("agent appears to be already running (PID file exists but unreadable): %w", err)
+	}
+
+	var pid int
+	if _, err := fmt.Sscanf(string(pidBytes), "%d", &pid); err != nil {
+		slog.Warn("Removing corrupt PID file", "error", err)
+		removePidFile()
+		return nil
+	}
+
+	process, err := os.FindProcess(pid)
+	if err != nil || errors.Is(process.Signal(syscall.Signal(0)), os.ErrProcessDone) {
+		slog.Warn("Removing stale PID file", "pid", pid)
+		removePidFile()
+		return nil
+	}
+
+	return fmt.Errorf("agent is already running (PID %d)", pid)
+}
+
+func waitForPidFileRemoval(timeout time.Duration) bool {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if _, err := os.Stat(getPidFile()); os.IsNotExist(err) {
+			return true
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	return false
+}

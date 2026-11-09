@@ -1,0 +1,362 @@
+// © 2025 Platform Engineering Labs Inc.
+//
+// SPDX-License-Identifier: FSL-1.1-ALv2
+
+package extract
+
+import (
+	"errors"
+	"fmt"
+	"os"
+	"strings"
+
+	"github.com/charmbracelet/huh"
+	"github.com/charmbracelet/lipgloss"
+
+	"github.com/platform-engineering-labs/formae/internal/cli/app"
+	"github.com/platform-engineering-labs/formae/internal/cli/cmd"
+	"github.com/platform-engineering-labs/formae/internal/cli/config"
+	"github.com/platform-engineering-labs/formae/internal/cli/nag"
+	"github.com/platform-engineering-labs/formae/internal/cli/tui"
+	"github.com/platform-engineering-labs/formae/internal/cli/tui/components"
+	"github.com/platform-engineering-labs/formae/internal/cli/tui/errfmt"
+	"github.com/platform-engineering-labs/formae/internal/cli/tui/theme"
+	"github.com/platform-engineering-labs/formae/internal/logging"
+	"github.com/platform-engineering-labs/formae/internal/schema"
+	apimodel "github.com/platform-engineering-labs/formae/pkg/api/model"
+	pkgmodel "github.com/platform-engineering-labs/formae/pkg/model"
+	"github.com/spf13/cobra"
+)
+
+// Package-level seams — replaced in tests to avoid TTY / network calls.
+var (
+	isInteractive = tui.IsInteractive
+	runConfirm    = components.RunConfirm
+	promptPath    = defaultPromptPath
+
+	extractDesiredFn = func(a *app.App, query string) (*pkgmodel.Forma, error) { return a.ExtractDesiredStacks(query) }
+	extractDeltaFn   = func(a *app.App, id string) (*apimodel.CommandDesiredDelta, error) {
+		return a.ExtractCommandDesiredDelta(id)
+	}
+	extractFn = func(a *app.App, query string) (*pkgmodel.Forma, []string, error) {
+		return a.ExtractResources(query, false)
+	}
+	generateFn = func(a *app.App, forma *pkgmodel.Forma, targetPath, outputSchema string, schemaLocation schema.SchemaLocation) (schema.GenerateSourcesResult, error) {
+		return a.GenerateSourceCode(forma, targetPath, outputSchema, schemaLocation)
+	}
+)
+
+// defaultPromptPath shows a huh text-input pre-filled with defaultVal and
+// returns the user's chosen path. Called only when interactive && no path given.
+func defaultPromptPath(th *theme.Theme, defaultVal string) (string, error) {
+	result := defaultVal
+	input := huh.NewInput().
+		Title("Extract to:").
+		Value(&result)
+	form := components.NewThemedForm(th, huh.NewGroup(input))
+	if err := form.Run(); err != nil {
+		return "", err
+	}
+	return result, nil
+}
+
+type ExtractOptions struct {
+	Desired        bool
+	CommandID      string
+	FromJSON       string
+	bundle         *RenderBundle
+	TargetPath     string
+	Query          string
+	Yes            bool
+	OutputSchema   string
+	SchemaLocation schema.SchemaLocation
+	// pathExplicit tracks whether the target path was explicitly provided
+	// (positional arg present), so we know when to show the path prompt.
+	pathExplicit bool
+}
+
+func ExtractCmd() *cobra.Command {
+	command := &cobra.Command{
+		Use:   "extract",
+		Short: "Extract resources to a file",
+		PreRun: func(cmd *cobra.Command, args []string) {
+			if offline, _ := cmd.Flags().GetString("from-json"); offline != "" {
+				return
+			}
+			logging.SetupClientLogging(fmt.Sprintf("%s/log/client.log", config.Config.DataDirectory()))
+		},
+		RunE: func(command *cobra.Command, args []string) error {
+			opts := &ExtractOptions{}
+			opts.TargetPath = command.Flags().Arg(0)
+			opts.pathExplicit = opts.TargetPath != ""
+			opts.Query, _ = command.Flags().GetString("query")
+			opts.Desired, _ = command.Flags().GetBool("desired")
+			opts.CommandID, _ = command.Flags().GetString("command")
+			opts.FromJSON, _ = command.Flags().GetString("from-json")
+			opts.Yes, _ = command.Flags().GetBool("yes")
+			opts.OutputSchema, _ = command.Flags().GetString("output-schema")
+			schemaLocation, _ := command.Flags().GetString("schema-location")
+			loc, err := parseSchemaLocation(schemaLocation)
+			if err != nil {
+				return err
+			}
+			opts.SchemaLocation = loc
+
+			if opts.FromJSON != "" {
+				reader := command.InOrStdin()
+				if opts.FromJSON != "-" {
+					file, err := os.Open(opts.FromJSON)
+					if err != nil {
+						return err
+					}
+					defer func() { _ = file.Close() }()
+					reader = file
+				}
+				bundle, err := readRenderBundle(reader)
+				if err != nil {
+					return err
+				}
+				opts.bundle = bundle
+				return runExtract(&app.App{Config: &pkgmodel.Config{}}, opts)
+			}
+			configFile, _ := command.Flags().GetString("config")
+			a, err := cmd.AppFromContext(command.Context(), configFile, "", command)
+			if err != nil {
+				return err
+			}
+
+			return runExtract(a, opts)
+		},
+		Annotations: map[string]string{
+			"type": "Forma",
+			"examples": "formae extract --query 'type:AWS::S3::Bucket' ./buckets.pkl" +
+				" | formae extract --query 'type:GCP::Compute::* managed:false' ./gcp-unmanaged.pkl" +
+				" | formae extract --query 'stack:prod target:eu target:us' ./prod.pkl",
+			"args": "[<target file>]",
+		},
+		SilenceErrors: true,
+	}
+
+	command.SetUsageTemplate(cmd.SimpleCmdUsageTemplate)
+
+	command.Flags().Bool("desired", false, "Extract complete desired stacks, including empty stacks, policies and generators; query must contain only literal stack selectors")
+	command.Flags().String("command", "", "Extract a recorded command’s desired delta for source editing; never apply this partial snippet as a full reconcile")
+	command.Flags().String("from-json", "", "Render an already retrieved {Forma, Plugins} JSON bundle from a file or stdin (-), without reading agent/profile/auth configuration")
+	command.Flags().String("query", " ", "Query that allows to find resources by their attributes. Use * as a wildcard anywhere (e.g. foo*, *foo, *foo*, foo*bar). ? and regex are not yet supported.")
+	command.Flags().Bool("yes", false, "Overwrite existing files without prompting")
+	command.Flags().String("output-schema", "pkl", "Output schema ('pkl', or 'json' with --desired)")
+	command.Flags().String("schema-location", "remote", "How plugin PKL schemas are referenced in the generated PklProject. 'remote' (default) emits package:// URIs that PKL fetches from the hub. 'local' emits local file imports against the agent's on-disk PklProject paths; requires CLI and agent to share a filesystem.")
+	cmd.AddConfigFlags(command)
+
+	return command
+}
+
+// parseSchemaLocation maps the --schema-location flag value to the
+// internal SchemaLocation enum. Returns a clear error for unsupported
+// values rather than silently accepting them.
+func parseSchemaLocation(s string) (schema.SchemaLocation, error) {
+	switch s {
+	case "", "remote":
+		return schema.SchemaLocationRemote, nil
+	case "local":
+		return schema.SchemaLocationLocal, nil
+	default:
+		return "", cmd.FlagErrorf("invalid --schema-location %q; must be one of 'remote' or 'local'", s)
+	}
+}
+
+// runExtract is the entry point called by the Cobra command.
+// It validates options, shows the path prompt when appropriate, then
+// delegates to runExtractCore.
+func runExtract(a *app.App, opts *ExtractOptions) error {
+	th := a.Theme()
+
+	// Path prompt: shown when interactive && !--yes && no explicit path given.
+	if !opts.pathExplicit && !opts.Yes {
+		if !isInteractive() {
+			return fmt.Errorf("interactive input requires a TTY — pass the target file as an argument")
+		}
+		defaultPath := "./extracted.pkl"
+		if opts.OutputSchema == "json" {
+			defaultPath = "./extracted.json"
+		}
+		chosen, err := promptPath(th, defaultPath)
+		if err != nil {
+			return err
+		}
+		opts.TargetPath = chosen
+		opts.pathExplicit = true
+	}
+
+	if opts.TargetPath != "" && opts.OutputSchema == "pkl" && !strings.HasSuffix(opts.TargetPath, ".pkl") {
+		opts.TargetPath += ".pkl"
+	}
+	if opts.TargetPath != "" && opts.OutputSchema == "json" && !strings.HasSuffix(opts.TargetPath, ".json") {
+		opts.TargetPath += ".json"
+	}
+	if err := validateExtractOptions(opts); err != nil {
+		return err
+	}
+
+	if opts.bundle == nil {
+		a.PrintBanner()
+	}
+
+	return runExtractCore(a, opts)
+}
+
+// runExtractCore is the testable core of the extract flow.
+// It assumes validateExtractOptions has already passed and the target path is set.
+func runExtractCore(a *app.App, opts *ExtractOptions) error {
+	th := a.Theme()
+
+	// Validate output schema when the app is available.
+	if a != nil && !a.IsSupportedOutputSchema(opts.OutputSchema) {
+		return fmt.Errorf("unsupported output schema '%s', supported schemas are: %v", opts.OutputSchema, a.SupportedOutputSchemas())
+	}
+
+	var forma *pkgmodel.Forma
+	var nags []string
+	var err error
+	var delta *apimodel.CommandDesiredDelta
+	switch {
+	case opts.bundle != nil:
+		forma = opts.bundle.Forma
+	case opts.CommandID != "":
+		delta, err = extractDeltaFn(a, opts.CommandID)
+		if err == nil {
+			forma = delta.Forma
+			for _, r := range delta.DeletedResources {
+				fmt.Printf("Remove declaration: stack=%q type=%q label=%q\n", r.Stack, r.Type, r.Label)
+			}
+			fmt.Println("Partial source-edit snippet from recorded command " + delta.CommandID + ". Merge values and removals into your complete declaration; do not apply this snippet as a full reconcile.")
+		}
+	case opts.Desired:
+		forma, err = extractDesiredFn(a, opts.Query)
+	default:
+		forma, nags, err = extractFn(a, opts.Query)
+	}
+	if err != nil {
+		msg, renderErr := errfmt.Render(err)
+		if renderErr != nil {
+			return fmt.Errorf("error rendering error message: %v", renderErr)
+		}
+		return fmt.Errorf("%s", msg)
+	}
+
+	if forma == nil || (len(forma.Resources) == 0 && forma.Extraction == nil && len(forma.Stacks) == 0) {
+		fmt.Println("No resources found")
+		return nil
+	}
+
+	// Check whether the target file already exists.
+	_, statErr := os.Stat(opts.TargetPath)
+	fileExists := statErr == nil
+
+	if fileExists && !opts.Yes {
+		// D8: overwrite confirm requires a TTY.
+		if !isInteractive() {
+			return fmt.Errorf("interactive input requires a TTY — pass --yes to overwrite '%s' non-interactively", opts.TargetPath)
+		}
+		ok, err := runConfirm(th, fmt.Sprintf("File '%s' already exists. Overwrite?", opts.TargetPath), "")
+		if err != nil {
+			return err
+		}
+		if !ok {
+			fmt.Println("Operation cancelled")
+			return nil
+		}
+	} else if statErr != nil && !os.IsNotExist(statErr) {
+		return fmt.Errorf("error checking target path: %v", statErr)
+	}
+
+	var res schema.GenerateSourcesResult
+	if opts.bundle != nil {
+		res, err = renderOffline(opts.bundle, opts)
+	} else {
+		res, err = generateFn(a, forma, opts.TargetPath, opts.OutputSchema, opts.SchemaLocation)
+	}
+	if opts.bundle == nil && errors.Is(err, schema.ErrFailedToGenerateSources) {
+		logFilePath := fmt.Sprintf("%s/log/client.log", config.Config.DataDirectory())
+		return fmt.Errorf("something went wrong during the extraction. This is our fault. Please contact us and send over the error logs from '%s'", logFilePath)
+	}
+	if err != nil {
+		return fmt.Errorf("error generating source code: %v", err)
+	}
+
+	warnStyle := lipgloss.NewStyle().Foreground(th.Palette.Warning)
+	if res.InitializedNewProject {
+		fmt.Println(warnStyle.Render(fmt.Sprintf("Initialized %s project at '%s'", opts.OutputSchema, res.ProjectPath)))
+	}
+	for _, warning := range res.Warnings {
+		fmt.Println(warnStyle.Render(warning))
+	}
+
+	if u := res.SchemaVersionUpgrade; u != nil {
+		fmt.Println(warnStyle.Render(schemaVersionNag(u)))
+	}
+
+	if res.HashedSecretCount > 0 {
+		fmt.Fprintf(os.Stderr, "warning: %d secret value(s) are stored hashed and cannot be re-applied without re-supplying the plaintext\n", res.HashedSecretCount)
+	}
+
+	// Build per-resource list from the forma that was extracted.
+	extracted := make([]extractedResource, 0, len(forma.Resources))
+	for _, r := range forma.Resources {
+		extracted = append(extracted, extractedResource{
+			Label: r.Label,
+			Type:  r.Type,
+			Stack: r.Stack,
+		})
+	}
+
+	// Themed summary (styled when stdout is a TTY).
+	if tui.IsTerminal(os.Stdout) {
+		fmt.Println(renderExtractSummary(th, res.TargetPath, extracted))
+	} else {
+		fmt.Printf("Extracted %d resource(s) to '%s'\n", len(extracted), res.TargetPath)
+	}
+
+	nag.MaybePrintNags(a.Theme(), nags)
+
+	return nil
+}
+
+// schemaVersionNag builds the message shown when the extract target's existing
+// PklProject pins a formae schema older than the required floor. Extracted files
+// use `extends "@formae/forma.pkl"`, which needs formae >= that version (see
+// requiredFormaeSchemaVersion); older ones can't evaluate the file. We only tell
+// the user — the PklProject is never rewritten for them.
+func schemaVersionNag(u *schema.SchemaVersionUpgrade) string {
+	return fmt.Sprintf(
+		"'%s/PklProject' is using formae version %s, however CLI is at version %s. Please update to %s or greater and run 'pkl project resolve', in order to ensure extracted file evaluates.",
+		u.ProjectDir, u.Current, u.Target, u.Target)
+}
+
+func validateExtractOptions(opts *ExtractOptions) error {
+	if opts.TargetPath == "" {
+		return cmd.FlagErrorf("target file is required")
+	}
+
+	info, err := os.Stat(opts.TargetPath)
+	if err == nil && info.IsDir() {
+		return cmd.FlagErrorf("target path '%s' is a directory, not a file", opts.TargetPath)
+	}
+	if opts.OutputSchema == "json" {
+		if !opts.Desired || opts.CommandID != "" || opts.FromJSON != "" || opts.bundle != nil {
+			return cmd.FlagErrorf("JSON output is only supported with --desired complete-state extraction")
+		}
+		if opts.SchemaLocation == schema.SchemaLocationLocal {
+			return cmd.FlagErrorf("--schema-location local is not supported for JSON output")
+		}
+	}
+
+	if (opts.FromJSON != "" && (opts.Desired || opts.CommandID != "" || strings.TrimSpace(opts.Query) != "")) || (opts.CommandID != "" && (opts.Desired || strings.TrimSpace(opts.Query) != "")) {
+		return cmd.FlagErrorf("--from-json, --command, and query-based extraction are mutually exclusive")
+	}
+	if strings.TrimSpace(opts.Query) == "" && opts.CommandID == "" && opts.FromJSON == "" {
+		return cmd.FlagErrorf("query is required")
+	}
+
+	return nil
+}

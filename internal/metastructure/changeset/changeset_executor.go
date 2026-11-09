@@ -1,0 +1,1172 @@
+// © 2025 Platform Engineering Labs Inc.
+//
+// SPDX-License-Identifier: FSL-1.1-ALv2
+
+package changeset
+
+import (
+	"fmt"
+	"time"
+
+	"ergo.services/actor/statemachine"
+	"ergo.services/ergo/gen"
+
+	"github.com/platform-engineering-labs/formae/internal/constants"
+	"github.com/platform-engineering-labs/formae/internal/metastructure/actornames"
+	"github.com/platform-engineering-labs/formae/internal/metastructure/forma_persister"
+	"github.com/platform-engineering-labs/formae/internal/metastructure/generator_update"
+	"github.com/platform-engineering-labs/formae/internal/metastructure/messages"
+	"github.com/platform-engineering-labs/formae/internal/metastructure/resolver"
+	"github.com/platform-engineering-labs/formae/internal/metastructure/resource_update"
+	"github.com/platform-engineering-labs/formae/internal/metastructure/target_update"
+	"github.com/platform-engineering-labs/formae/internal/metastructure/util"
+	pkgmodel "github.com/platform-engineering-labs/formae/pkg/model"
+)
+
+const (
+	StateNotStarted           = gen.Atom("not_started")
+	StateProcessing           = gen.Atom("processing")
+	StateFinishedSuccessfully = gen.Atom("finished_successfully")
+	StateFinishedWithError    = gen.Atom("finished_with_error")
+	StateCanceling            = gen.Atom("canceling")
+	StateCanceled             = gen.Atom("canceled")
+)
+
+// ChangesetExecutor is a state machine that processes a set of resource updates delivered by a forma. The changeset
+// organizes the updates into a datastructure called the DAG, which contains groups of updates that can be executed
+// in parallel. For each update, the executor will spawn a ResourceUpdater actor to handle the actual update and a
+// ResolveCache to cache resolvables during the lifetime of the changeset execution. The ResourceUpdater reports the
+// results back to the ChangesetExecutor, which updates the DAG and determines the next steps.
+// Note: multiple changeset executors can be running in parallel, as long as they don't touch the same resources.
+//
+// The state machine transitions are as follows:
+//
+//                     +-----------------------+
+//                     |      NotStarted       |
+//                     +-----------------------+
+//                                 |
+//                                 |
+//                                 |
+//                                 v
+//                     +-----------------------+
+//                     |     Initializing      |
+//                     +-----------------------+
+//                       |                   |
+//                       |                   |
+//                       |                   |
+//                       v                   v
+//    +----------------------+            +----------------------+
+//    | FinishedSuccessfully |            |  FinishedWithErrors  |
+//    +----------------------+            +----------------------+
+
+type ChangesetExecutor struct {
+	statemachine.StateMachine[ChangesetData]
+}
+
+func NewChangesetExecutor() gen.ProcessBehavior {
+	return &ChangesetExecutor{}
+}
+
+type Start struct {
+	Changeset        Changeset
+	NotifyOnComplete bool // If true, send ChangesetCompleted to the sender when done
+}
+
+type Resume struct{}
+
+type Cancel struct {
+	CommandID string
+	// Force abandons in-progress work and drives the command to a terminal
+	// Canceled state immediately, instead of waiting for in-progress resources
+	// to finish.
+	Force bool
+}
+
+// CancelResponse contains per-resource-update states at cancel time.
+type CancelResponse struct {
+	ResourceStates map[string]string // URI → state ("Canceled", "InProgress", "Success", "Failed")
+	// ForceCanceledInProgress lists the URIs of resource updates that were
+	// force-canceled while an operation was actually in progress (--force only).
+	// These are the resources whose cloud-side state may be orphaned.
+	ForceCanceledInProgress []string
+	// ErrorMessage is non-empty when a --force cancel failed to persist. It is
+	// carried in-band (rather than as a Go error from the call handler) so the
+	// executor stays alive and terminates no actors on a persist failure. The
+	// metastructure translates a non-empty ErrorMessage into a returned error.
+	ErrorMessage string
+}
+
+type ChangesetState string
+
+const (
+	ChangeSetStateFinishedSuccessfully ChangesetState = "FinishedSuccessfully"
+	ChangeSetStateFinishedWithErrors   ChangesetState = "FinishedWithErrors"
+	ChangeSetStateCanceled             ChangesetState = "Canceled"
+)
+
+type ChangesetData struct {
+	changeset                Changeset
+	requestedBy              gen.PID
+	notifyOnComplete         bool     // If true, send ChangesetCompleted to requestedBy when done
+	discoveryPaused          bool     // Tracks if this changeset paused Discovery
+	stacksWithDeletes        []string // Stacks that had delete operations, captured at start
+	syncExcludedResourceURIs []string // Resource URIs registered with Synchronizer, captured at start
+	// Whether any update in this changeset finished failed. It cannot be
+	// recovered from the DAG at completion: UpdateDAG removes failed nodes
+	// exactly as it removes successful ones, so the DAG is empty either way
+	// and an empty DAG says nothing about the outcome.
+	sawFailure bool
+}
+
+type RegisterEvents struct{}
+
+type ChangesetCompleted struct {
+	CommandID string
+	State     ChangesetState
+}
+
+func (s *ChangesetExecutor) Init(args ...any) (statemachine.StateMachineSpec[ChangesetData], error) {
+	data := ChangesetData{}
+
+	return statemachine.NewStateMachineSpec(StateNotStarted,
+		statemachine.WithData(data),
+		statemachine.WithStateEnterCallback(onStateChange),
+		statemachine.WithStateMessageHandler(StateNotStarted, start),
+		statemachine.WithStateCallHandler(StateNotStarted, cancelBeforeStart),
+		statemachine.WithStateMessageHandler(StateProcessing, resourceUpdateFinished),
+		statemachine.WithStateMessageHandler(StateProcessing, targetUpdateFinished),
+		statemachine.WithStateMessageHandler(StateProcessing, generatorUpdateFinished),
+		statemachine.WithStateMessageHandler(StateProcessing, resume),
+		statemachine.WithStateCallHandler(StateProcessing, cancel),
+		statemachine.WithStateCallHandler(StateCanceling, cancelWhileCanceling),
+		statemachine.WithStateMessageHandler(StateCanceling, resourceUpdateFinished),
+		statemachine.WithStateMessageHandler(StateCanceling, targetUpdateFinished),
+		statemachine.WithStateMessageHandler(StateCanceling, generatorUpdateFinished),
+		statemachine.WithStateMessageHandler(StateCanceling, resumeWhileCanceling), // Ignore a late rate-limit Resume timer
+		statemachine.WithStateMessageHandler(StateFinishedWithError, shutdown),
+		statemachine.WithStateMessageHandler(StateFinishedSuccessfully, shutdown),
+		statemachine.WithStateMessageHandler(StateCanceled, resourceUpdateFinished),  // Ignore late messages from ResourceUpdaters
+		statemachine.WithStateMessageHandler(StateCanceled, targetUpdateFinished),    // Ignore late messages from TargetUpdaters
+		statemachine.WithStateMessageHandler(StateCanceled, generatorUpdateFinished), // Ignore late messages from GeneratorUpdaters
+		statemachine.WithStateMessageHandler(StateCanceled, ignoreStartWhenCanceled), // Ignore a Start that lost the race to a cancel-before-start
+		statemachine.WithStateMessageHandler(StateCanceled, shutdown),
+	), nil
+}
+
+func onStateChange(oldState gen.Atom, newState gen.Atom, data ChangesetData, proc gen.Process) (gen.Atom, ChangesetData, error) {
+	// Cleanup empty stacks once execution is over, whether or not every update
+	// in it succeeded. Eligibility is about what the deletes actually did, not
+	// about the changeset's aggregate verdict: one delete can succeed and take
+	// the last resource out of a stack while an unrelated update fails, and
+	// that stack is just as empty either way. Gating this on success alone
+	// left the record behind. Safe to run on both, because the persister
+	// re-checks emptiness and the labels were captured at start.
+	if newState == StateFinishedSuccessfully || newState == StateFinishedWithError {
+		// Use the stacks captured at start, since the DAG is empty by now
+		proc.Log().Debug("Using pre-captured stacks for cleanup stacks=%v commandID=%s", data.stacksWithDeletes, data.changeset.CommandID)
+		if len(data.stacksWithDeletes) > 0 {
+			resourcePersisterPID := gen.ProcessID{Name: actornames.ResourcePersister, Node: proc.Node().Name()}
+			// Use Send instead of Call - we don't need the response (CleanupEmptyStacks returns nil),
+			// and Call can timeout in state enter callbacks due to Ergo framework limitations.
+			err := proc.Send(resourcePersisterPID, messages.CleanupEmptyStacks{
+				StackLabels: data.stacksWithDeletes,
+				CommandID:   data.changeset.CommandID,
+			})
+			if err != nil {
+				proc.Log().Error("Failed to send CleanupEmptyStacks message commandID=%s: %v", data.changeset.CommandID, err)
+			}
+		}
+	}
+
+	// Only shutdown when we reach a final state (not Canceling)
+	if newState == StateFinishedSuccessfully || newState == StateFinishedWithError || newState == StateCanceled {
+		// Resume Discovery if we paused it
+		if data.discoveryPaused {
+			discoveryPID := gen.ProcessID{Name: actornames.Discovery, Node: proc.Node().Name()}
+			err := proc.Send(discoveryPID, messages.ResumeDiscovery{})
+			if err != nil {
+				proc.Log().Error("Failed to resume Discovery commandID=%s: %v", data.changeset.CommandID, err)
+			} else {
+				proc.Log().Debug("Resumed Discovery after user changeset completed commandID=%s", data.changeset.CommandID)
+			}
+		}
+
+		// Unregister all resources from the Synchronizer so they can be
+		// included in future sync cycles. This is the counterpart to
+		// registerAllResourcesWithSynchronizer called in start().
+		if len(data.syncExcludedResourceURIs) > 0 {
+			unregisterAllResourcesFromSynchronizer(data.syncExcludedResourceURIs, proc)
+		}
+
+		// Send ourselves a shutdown message to terminate the process
+		proc.Log().Debug("ChangesetExecutor: sending shutdown message to self state=%s", newState)
+		if sendErr := proc.Send(proc.PID(), Shutdown{}); sendErr != nil {
+			proc.Log().Error("ChangesetExecutor: failed to send terminate message: %v", sendErr)
+		}
+
+		// Only send completion notification if the requester asked for it
+		if data.notifyOnComplete {
+			changesetState := ChangeSetStateFinishedSuccessfully
+			if newState == StateFinishedWithError {
+				changesetState = ChangeSetStateFinishedWithErrors
+			} else if newState == StateCanceled {
+				changesetState = ChangeSetStateCanceled
+			}
+			completed := ChangesetCompleted{
+				CommandID: data.changeset.CommandID,
+				State:     changesetState,
+			}
+			if sendErr := proc.Send(data.requestedBy, completed); sendErr != nil {
+				proc.Log().Debug("Failed to send ChangesetCompleted event to requester: %v", sendErr)
+			}
+		}
+	}
+	return newState, data, nil
+}
+
+func start(from gen.PID, state gen.Atom, data ChangesetData, message Start, proc gen.Process) (gen.Atom, ChangesetData, []statemachine.Action, error) {
+	data.requestedBy = from
+	data.changeset = message.Changeset
+	data.notifyOnComplete = message.NotifyOnComplete
+
+	// Capture stacks with delete operations NOW, before the DAG is modified during execution
+	data.stacksWithDeletes = collectStacksWithDeletes(data.changeset.DAG)
+
+	// Spawn the ResolveCache as a direct child of this ChangesetExecutor with
+	// LinkParent so that when the executor terminates (for any reason) the child
+	// receives an exit signal and terminates too. The link is unidirectional:
+	// a crashing ResolveCache sends no cascade back to kill the executor itself.
+	rcName := actornames.ResolveCache(data.changeset.CommandID)
+	_, err := proc.SpawnRegister(rcName, NewResolveCache, gen.ProcessOptions{LinkParent: true})
+	if err != nil && err != gen.ErrTaken {
+		proc.Log().Error("Failed to spawn resolve cache: %v", err)
+		return StateFinishedWithError, data, nil, nil
+	}
+
+	// We should never receive a changeset with no updates. If we do, we error.
+	if data.changeset.IsComplete() {
+		proc.Log().Error("No resource updates were found for commandID %s", data.changeset.CommandID)
+		return StateFinishedWithError, data, nil, nil
+	}
+
+	// Pause Discovery for user operations to prevent race conditions where Discovery
+	// might list resources that are being created/modified by this changeset
+	if changesetHasUserUpdates(data.changeset) {
+		discoveryPID := gen.ProcessID{Name: actornames.Discovery, Node: proc.Node().Name()}
+		_, err := proc.Call(discoveryPID, messages.PauseDiscovery{})
+		if err != nil {
+			proc.Log().Error("Failed to pause Discovery commandID=%s: %v", data.changeset.CommandID, err)
+			// Don't fail the operation - this is not critical enough to fail the user's operation
+		} else {
+			data.discoveryPaused = true
+			proc.Log().Debug("Paused Discovery for user changeset commandID=%s", data.changeset.CommandID)
+		}
+	}
+
+	// Register ALL non-sync resources with the Synchronizer upfront to prevent
+	// a race where a sync cycle could read (and persist) OOB changes for a
+	// resource before the ResourceUpdater's own sync-Read runs. Without this,
+	// the sync-Read would see no diff (sync already equalised DB and cloud)
+	// and the update would proceed when it should have been rejected.
+	//
+	// The gate is "does this changeset write" rather than "is this the user's
+	// changeset": the race is between a provider write and its persist, and it
+	// does not care who asked for the write. Gating it on user updates left an
+	// agent-initiated changeset registering nothing at all.
+	if changesetWritesResources(data.changeset) {
+		data.syncExcludedResourceURIs = registerAllResourcesWithSynchronizer(data.changeset.DAG, proc)
+	}
+
+	return resume(from, state, data, Resume{}, proc)
+}
+
+// registerAllResourcesWithSynchronizer sends RegisterInProgressResource for
+// every non-sync resource in the DAG. This must happen before any ResourceUpdater
+// starts so that a concurrent sync cycle cannot slip in and read a resource that
+// is about to be updated. Returns the list of registered URIs so they can be
+// unregistered when the changeset reaches a terminal state.
+func registerAllResourcesWithSynchronizer(dag *ExecutionDAG, proc gen.Process) []string {
+	synchronizerPID := gen.ProcessID{Name: actornames.Synchronizer, Node: proc.Node().Name()}
+	var registeredURIs []string
+	for _, node := range dag.Nodes {
+		ru, ok := node.Update.(*resource_update.ResourceUpdate)
+		if !ok {
+			continue
+		}
+		if ru.Source == resource_update.FormaCommandSourceSynchronize {
+			continue
+		}
+		uri := string(ru.URI())
+		err := proc.Send(synchronizerPID, messages.RegisterInProgressResource{
+			ResourceURI: uri,
+		})
+		if err != nil {
+			proc.Log().Error("Failed to register in-progress resource with synchronizer resourceURI=%v: %v",
+				ru.URI(), err)
+		}
+		registeredURIs = append(registeredURIs, uri)
+	}
+	return registeredURIs
+}
+
+// unregisterAllResourcesFromSynchronizer sends UnregisterInProgressResource for
+// every resource URI that was registered at changeset start. Uses the saved list
+// rather than the DAG because nodes are removed from the DAG as they complete.
+func unregisterAllResourcesFromSynchronizer(resourceURIs []string, proc gen.Process) {
+	synchronizerPID := gen.ProcessID{Name: actornames.Synchronizer, Node: proc.Node().Name()}
+	for _, uri := range resourceURIs {
+		err := proc.Send(synchronizerPID, messages.UnregisterInProgressResource{
+			ResourceURI: uri,
+		})
+		if err != nil {
+			proc.Log().Error("Failed to unregister in-progress resource from synchronizer resourceURI=%s: %v",
+				uri, err)
+		}
+	}
+}
+
+func resume(from gen.PID, state gen.Atom, data ChangesetData, message Resume, proc gen.Process) (gen.Atom, ChangesetData, []statemachine.Action, error) {
+	finished := true
+	availableUpdates := data.changeset.AvailableExecutableUpdates()
+
+	for namespace, updates := range availableUpdates {
+		tokens, err := proc.Call(actornames.RateLimiter, RequestTokens{Namespace: namespace, N: updates})
+		if err != nil {
+			proc.Log().Error("Failed to fetch tokens for namespace=%s: %v", namespace, err)
+			return StateFinishedWithError, data, nil, nil
+		}
+		n := tokens.(TokensGranted).N
+		if n < updates {
+			finished = false
+		}
+		updates := data.changeset.GetExecutableUpdates(namespace, n)
+		err = startUpdates(updates, data.changeset.CommandID, data.changeset.Mode, proc)
+		if err != nil {
+			proc.Log().Error("Failed to start executable updates for changeset commandID=%s: %v", data.changeset.CommandID, err)
+			return StateFinishedWithError, data, nil, nil
+		}
+	}
+
+	var actions []statemachine.Action
+	if !finished {
+		actions = append(actions,
+			statemachine.GenericTimeout{
+				Name:     gen.Atom(fmt.Sprintf("changeset-executor-rate-limit-%s", data.changeset.CommandID)),
+				Duration: 1 * time.Second,
+				Message:  Resume{},
+			})
+	}
+
+	return StateProcessing, data, actions, nil
+}
+
+// cancelBeforeStart handles a Cancel that arrives before the executor has
+// processed Start. The spawn and Start of an executor are two separate
+// messages, so a client cancel issued right after submit can land while the
+// executor is still in StateNotStarted, with no DAG to enumerate. We terminalize
+// the command's resources by ID via the persister, then transition to the
+// terminal StateCanceled. Persist-before-terminate: on a persister error we stay
+// in StateNotStarted and carry the error in-band, terminating no actors.
+func cancelBeforeStart(from gen.PID, state gen.Atom, data ChangesetData, message Cancel, proc gen.Process) (gen.Atom, ChangesetData, CancelResponse, []statemachine.Action, error) {
+	proc.Log().Debug("ChangesetExecutor received cancel before start commandID=%s force=%t", message.CommandID, message.Force)
+
+	_, err := messages.UnwrapCall(proc.Call(
+		gen.ProcessID{Node: proc.Node().Name(), Name: gen.Atom("FormaCommandPersister")},
+		forma_persister.MarkCommandResourcesAsCanceled{CommandID: message.CommandID},
+	))
+	if err != nil {
+		proc.Log().Error("Failed to cancel command before start commandID=%s: %v", message.CommandID, err)
+		return state, data, CancelResponse{ErrorMessage: fmt.Sprintf("cancel-before-start persist failed: %v", err)}, nil, nil
+	}
+
+	return StateCanceled, data, CancelResponse{ResourceStates: map[string]string{}}, nil, nil
+}
+
+// ignoreStartWhenCanceled absorbs a Start that arrives after the command was
+// already canceled before it started (see cancelBeforeStart). The command is
+// terminal; running the changeset now would resurrect canceled work, so we
+// ignore it and stay in StateCanceled.
+func ignoreStartWhenCanceled(from gen.PID, state gen.Atom, data ChangesetData, message Start, proc gen.Process) (gen.Atom, ChangesetData, []statemachine.Action, error) {
+	proc.Log().Debug("ChangesetExecutor ignoring Start received after cancel commandID=%s", message.Changeset.CommandID)
+	return StateCanceled, data, nil, nil
+}
+
+// resumeWhileCanceling absorbs a Resume that arrives after the executor has
+// already moved into StateCanceling. Resume is delivered by a self-rescheduling
+// GenericTimeout (the rate-limit backoff) that the framework does not cancel on
+// a state transition; a timer legitimately scheduled during StateProcessing can
+// therefore fire once the executor is winding down a cancel. Starting new work
+// here would be wrong, so we ignore it and stay in StateCanceling. Mirrors the
+// "ignore late messages" handlers registered for StateCanceled.
+func resumeWhileCanceling(from gen.PID, state gen.Atom, data ChangesetData, message Resume, proc gen.Process) (gen.Atom, ChangesetData, []statemachine.Action, error) {
+	proc.Log().Debug("ChangesetExecutor ignoring Resume received while canceling commandID=%s", data.changeset.CommandID)
+	return StateCanceling, data, nil, nil
+}
+
+// updateFinishedEvent normalizes the incoming completion message from a
+// ResourceUpdater, TargetUpdater or GeneratorUpdater into a common shape for
+// handleUpdateFinished.
+type updateFinishedEvent struct {
+	nodeURI   pkgmodel.FormaeURI // URI to look up in the DAG
+	isSuccess bool
+	// failureReason is the operator-facing explanation the finished update
+	// reported, carried so the cascade can stamp it on the resource updates it
+	// fails. Those never run, so they have no plugin progress of their own to
+	// explain them. Empty on success and on failures that carry no reason.
+	failureReason string
+}
+
+func resourceUpdateFinished(from gen.PID, state gen.Atom, data ChangesetData, message resource_update.ResourceUpdateFinished, proc gen.Process) (gen.Atom, ChangesetData, []statemachine.Action, error) {
+	// Build the DAG key — resources use operation-qualified URIs
+	ru := findRunningUpdate[*resource_update.ResourceUpdate](data, message.Uri)
+
+	var dagKey pkgmodel.FormaeURI
+	if ru != nil {
+		dagKey = createOperationURI(ru.URI(), ru.Operation)
+	}
+
+	return handleUpdateFinished(from, state, data, updateFinishedEvent{
+		nodeURI:   dagKey,
+		isSuccess: message.State == resource_update.ResourceUpdateStateSuccess,
+	}, proc)
+}
+
+func targetUpdateFinished(from gen.PID, state gen.Atom, data ChangesetData, message target_update.TargetUpdateFinished, proc gen.Process) (gen.Atom, ChangesetData, []statemachine.Action, error) {
+	// Notify the FormaCommandPersister about the target update completion.
+	// This is done here (not in the TargetUpdater) to avoid an import cycle
+	// between target_update and messages packages.
+	//
+	// Resolve ops are synthetic: they are not stored in command.TargetUpdates,
+	// so MarkTargetUpdateAsComplete must not be called for them.
+	pinFailure := ""
+	node, exists := data.changeset.DAG.Nodes[message.NodeURI]
+	if exists && message.State == target_update.TargetUpdateStateSuccess && message.CommittedIncarnation != "" {
+		if tu, ok := node.Update.(*target_update.TargetUpdate); ok {
+			refs := []messages.TargetExecutionRef{}
+			for _, dependent := range data.changeset.DAG.Nodes {
+				if ru, ok := dependent.Update.(*resource_update.ResourceUpdate); ok && ru.ResourceTarget.Label == tu.Target.Label && dependsOnTransitively(dependent, node.URI) {
+					refs = append(refs, messages.TargetExecutionRef{KSUID: ru.DesiredState.Ksuid, Operation: ru.Operation})
+				}
+			}
+			_, err := messages.UnwrapCall(proc.Call(gen.ProcessID{Name: gen.Atom("FormaCommandPersister"), Node: proc.Node().Name()}, messages.PinTargetExecutionIdentity{CommandID: data.changeset.CommandID, TargetLabel: tu.Target.Label, Incarnation: message.CommittedIncarnation, Resources: refs}))
+			if err != nil {
+				message.State = target_update.TargetUpdateStateFailed
+				pinFailure = "target execution incarnation pin failed: " + err.Error()
+			}
+		}
+	}
+
+	if exists {
+		if tu, ok := node.Update.(*target_update.TargetUpdate); ok && tu.Operation != target_update.TargetOperationResolve {
+			_, err := messages.UnwrapCall(proc.Call(
+				gen.ProcessID{Name: gen.Atom("FormaCommandPersister"), Node: proc.Node().Name()},
+				messages.MarkTargetUpdateAsComplete{
+					FailureReason:   pinFailure,
+					CommandID:       data.changeset.CommandID,
+					TargetLabel:     tu.Target.Label,
+					TargetOperation: string(tu.Operation),
+					FinalState:      message.State,
+					ModifiedTs:      util.TimeNow(),
+				},
+			))
+			if err != nil {
+				proc.Log().Error("Failed to update target state in persister target=%s: %v", tu.Target.Label, err)
+			}
+		}
+	}
+
+	// After a target resolves successfully, propagate the resolved config to
+	// all downstream resource updates that reference this target. Without this,
+	// resource updaters would use the stale snapshot from generation time which
+	// still contains unresolved $ref objects.
+	//
+	// Fail closed if the resolved config cannot be converted to plugin format
+	// (e.g. it still carries a $hashed value that must never be sent to a
+	// provider). Propagating the unconverted document would leak $ref/$value
+	// metadata and secret material to the plugin, so instead the target finish
+	// is treated as a failure: the node is marked failed and the failure
+	// cascades to every dependent resource op, ensuring nothing malformed
+	// reaches a plugin. The conversion error is structural and carries no
+	// plaintext; message.ResolvedConfig is never logged.
+	if message.State == target_update.TargetUpdateStateSuccess && message.ResolvedConfig != nil {
+		if tu, ok := node.Update.(*target_update.TargetUpdate); ok {
+			// Convert the resolved config to plugin format: strip $ref/$value
+			// metadata so plugins receive plain values.
+			pluginConfig, err := resolver.ConvertToPluginFormat(message.ResolvedConfig)
+			if err != nil {
+				proc.Log().Error("Failed to convert target config to plugin format, failing dependent resource ops target=%s: %v", tu.Target.Label, err)
+				// Route through the failure branch of handleUpdateFinished so the
+				// node (still running here) is marked failed there and the failure
+				// cascades to dependent resource ops. Marking it failed now would
+				// make handleUpdateFinished treat it as already-completed and skip
+				// the cascade.
+				return handleUpdateFinished(from, state, data, updateFinishedEvent{
+					nodeURI:   message.NodeURI,
+					isSuccess: false,
+				}, proc)
+			}
+			data.changeset.DAG.propagateResolvedTargetConfig(tu.Target.Label, pluginConfig)
+		}
+	}
+
+	// Preserve the incarnation actually committed before dependent providers start.
+	if message.State == target_update.TargetUpdateStateSuccess && message.CommittedIncarnation != "" {
+		if _, ok := node.Update.(*target_update.TargetUpdate); ok {
+			data.changeset.DAG.propagateTargetIncarnation(node, message.CommittedIncarnation)
+		}
+	}
+
+	return handleUpdateFinished(from, state, data, updateFinishedEvent{
+		nodeURI:   message.NodeURI,
+		isSuccess: message.State == target_update.TargetUpdateStateSuccess,
+	}, proc)
+}
+
+// generatorUpdateFinished handles a completed draw. On success it delivers the
+// drawn value to every destination bound to the generator before the draw node
+// leaves the DAG and those destinations become schedulable.
+//
+// Nothing is persisted here, unlike the target path: a draw writes no row, and
+// the drawn value must not reach one. GeneratorUpdateFinished is its only
+// carrier, this handler its only reader, and the destinations' in-memory
+// DesiredState its only destination.
+//
+// Delivery failure is routed through handleUpdateFinished's failure branch
+// rather than reported as a success, exactly as the target path does on a
+// conversion error: a destination that never received its value would
+// otherwise dispatch its $gen envelope undrawn, and marking the node failed
+// here instead would make handleUpdateFinished treat it as already-completed
+// and skip the cascade. The error is structural and names identities only;
+// message.DrawnValue is never logged.
+//
+// On failure the draw's reason travels with the event, so the destinations the
+// cascade fails carry it. They never ran and have no plugin progress of their
+// own, so without it the apply reports them failed and says nothing about why.
+func generatorUpdateFinished(from gen.PID, state gen.Atom, data ChangesetData, message generator_update.GeneratorUpdateFinished, proc gen.Process) (gen.Atom, ChangesetData, []statemachine.Action, error) {
+	if message.State == generator_update.GeneratorUpdateStateSuccess {
+		node, exists := data.changeset.DAG.Nodes[message.NodeURI]
+		if exists {
+			if gu, ok := node.Update.(*generator_update.GeneratorUpdate); ok {
+				generatorKsuid := ""
+				if gu.Generator != nil {
+					generatorKsuid = gu.Generator.GetID()
+				}
+				if err := data.changeset.DAG.propagateDrawnGeneratorValue(generatorKsuid, message.DrawnValues, message.GenerationID, data.changeset.Mode); err != nil {
+					proc.Log().Error("Failed to deliver a drawn generator value, failing its destinations node=%s: %v",
+						message.NodeURI, err)
+					// The delivery error is structural — it names the
+					// generator, the destination and the output, never a
+					// value — and it travels as the failure reason so the
+					// refusal is visible on the command's failed resources,
+					// not only in this log line.
+					return handleUpdateFinished(from, state, data, updateFinishedEvent{
+						nodeURI:       message.NodeURI,
+						isSuccess:     false,
+						failureReason: err.Error(),
+					}, proc)
+				}
+			}
+		}
+	}
+
+	return handleUpdateFinished(from, state, data, updateFinishedEvent{
+		nodeURI:       message.NodeURI,
+		isSuccess:     message.State == generator_update.GeneratorUpdateStateSuccess,
+		failureReason: message.ErrorMessage,
+	}, proc)
+}
+
+// findRunningUpdate searches the DAG for a running update matching messageURI and returns
+// it cast to T, or nil if not found.
+func findRunningUpdate[T Update](data ChangesetData, messageURI pkgmodel.FormaeURI) T {
+	var zero T
+	for _, node := range data.changeset.DAG.Nodes {
+		if node.Update.NodeURI() == messageURI && node.Update.IsRunning() {
+			if typed, ok := node.Update.(T); ok {
+				return typed
+			}
+		}
+	}
+	return zero
+}
+
+func handleUpdateFinished(from gen.PID, state gen.Atom, data ChangesetData, event updateFinishedEvent, proc gen.Process) (gen.Atom, ChangesetData, []statemachine.Action, error) {
+	// If we're in canceled state, ignore late messages
+	if state == StateCanceled {
+		proc.Log().Debug("Ignoring update finished in canceled state nodeURI=%v", event.nodeURI)
+		return state, data, nil, nil
+	}
+
+	// If we're in canceling state, update the node and check if all in-progress are done
+	if state == StateCanceling {
+		for _, node := range data.changeset.DAG.Nodes {
+			if node.Update.NodeURI() == event.nodeURI && node.Update.IsRunning() {
+				if event.isSuccess {
+					// Mark via the Update interface — no type-specific knowledge needed
+					// (success isn't on the interface, but we can leave it running;
+					// the canceling path only needs to drain, not report)
+				} else {
+					node.Update.MarkFailed()
+				}
+				proc.Log().Debug("In-progress update finished during cancellation nodeURI=%v success=%v",
+					event.nodeURI, event.isSuccess)
+				break
+			}
+		}
+
+		inProgressCount := 0
+		for _, node := range data.changeset.DAG.Nodes {
+			if node.IsRunning() {
+				inProgressCount++
+			}
+		}
+
+		if inProgressCount == 0 {
+			proc.Log().Debug("All in-progress updates completed, transitioning to Canceled commandID=%s",
+				data.changeset.CommandID)
+			return StateCanceled, data, nil, nil
+		}
+
+		proc.Log().Debug("Still waiting for in-progress updates during cancellation commandID=%s remainingCount=%d",
+			data.changeset.CommandID, inProgressCount)
+		return state, data, nil, nil
+	}
+
+	// Find the finished node in the DAG
+	node, exists := data.changeset.DAG.Nodes[event.nodeURI]
+	if !exists || !node.Update.IsRunning() {
+		proc.Log().Debug("Update finished but not found in active DAG (likely already completed) nodeURI=%v", event.nodeURI)
+		return state, data, nil, nil
+	}
+
+	// Update the state on the underlying Update
+	if event.isSuccess {
+		// Success is tracked by the specific Update type; we set it via type switch
+		// because the Update interface only has MarkFailed/MarkInProgress.
+		switch u := node.Update.(type) {
+		case *resource_update.ResourceUpdate:
+			u.State = resource_update.ResourceUpdateStateSuccess
+		case *target_update.TargetUpdate:
+			u.State = target_update.TargetUpdateStateSuccess
+		case *generator_update.GeneratorUpdate:
+			u.State = generator_update.GeneratorUpdateStateSuccess
+		}
+	} else {
+		node.Update.MarkFailed()
+		data.sawFailure = true
+	}
+
+	// Update DAG and get any cascading failures
+	cascadingFailures, err := data.changeset.UpdateDAG(event.nodeURI, node.Update)
+	if err != nil {
+		proc.Log().Error("Failed to update DAG nodeURI=%v: %v", event.nodeURI, err)
+		return StateFinishedWithError, data, nil, nil
+	}
+
+	// Persist cascading failures via FormaCommandPersister.
+	if len(cascadingFailures) > 0 {
+		var failedResources []forma_persister.ResourceUpdateRef
+		var failedTargets []forma_persister.TargetUpdateRef
+		for _, failedUpdate := range cascadingFailures {
+			// Skip the original failure — its updater actor already persisted it.
+			// Compare by identity: NodeURI() is the bare resource URI while
+			// event.nodeURI is the operation-qualified DAG key, so they never
+			// match and the original would otherwise be re-marked as a cascade.
+			if failedUpdate == node.Update {
+				continue
+			}
+			switch u := failedUpdate.(type) {
+			case *resource_update.ResourceUpdate:
+				proc.Log().Debug("Resource marked as failed due to cascade uri=%v operation=%s originalFailure=%v",
+					u.URI(), u.Operation, event.nodeURI)
+				failedResources = append(failedResources, forma_persister.ResourceUpdateRef{
+					URI:       u.URI(),
+					Operation: u.Operation,
+				})
+			case *target_update.TargetUpdate:
+				proc.Log().Debug("Target marked as failed due to cascade label=%s operation=%s originalFailure=%v",
+					u.Target.Label, u.Operation, event.nodeURI)
+				failedTargets = append(failedTargets, forma_persister.TargetUpdateRef{
+					Label:     u.Target.Label,
+					Operation: u.Operation,
+				})
+			}
+		}
+		if len(failedResources) > 0 {
+			proc.Log().Warning("Cascading failures detected: %d for command %s", len(failedResources), data.changeset.CommandID)
+		}
+
+		persisterPID := gen.ProcessID{Node: proc.Node().Name(), Name: gen.Atom("FormaCommandPersister")}
+		now := util.TimeNow()
+
+		if len(failedResources) > 0 {
+			_, err = messages.UnwrapCall(proc.Call(persisterPID, forma_persister.MarkResourcesAsFailed{
+				CommandID:          data.changeset.CommandID,
+				Resources:          failedResources,
+				ResourceModifiedTs: now,
+				FailureReason:      event.failureReason,
+			}))
+			if err != nil {
+				proc.Log().Error("Failed to mark resources as failed in persister commandID=%s: %v", data.changeset.CommandID, err)
+			}
+		}
+
+		if len(failedTargets) > 0 {
+			_, err = messages.UnwrapCall(proc.Call(persisterPID, forma_persister.MarkTargetsAsFailed{
+				CommandID:        data.changeset.CommandID,
+				Targets:          failedTargets,
+				TargetModifiedTs: now,
+			}))
+			if err != nil {
+				proc.Log().Error("Failed to mark targets as failed in persister commandID=%s: %v", data.changeset.CommandID, err)
+			}
+		}
+	}
+
+	if data.changeset.IsComplete() {
+		// The requester is told nothing else about the outcome, and some of
+		// them retry on it. The generator rotator clears its backoff on a
+		// success and derives its cadence from the command's own state, so a
+		// changeset that failed but reported success leaves it with no
+		// backoff and no advanced cadence — it rotates again on the next
+		// sweep, and every sweep after that.
+		if data.sawFailure {
+			proc.Log().Debug("Changeset execution finished with failures for command commandID=%s", data.changeset.CommandID)
+			return StateFinishedWithError, data, nil, nil
+		}
+		proc.Log().Debug("Changeset execution finished for command commandID=%s", data.changeset.CommandID)
+		return StateFinishedSuccessfully, data, nil, nil
+	}
+
+	return resume(from, state, data, Resume{}, proc)
+}
+
+func startUpdates(updates []Update, commandID string, mode pkgmodel.FormaApplyMode, proc gen.Process) error {
+	for _, update := range updates {
+		switch u := update.(type) {
+		case *resource_update.ResourceUpdate:
+			if err := startResourceUpdate(u, commandID, mode, proc); err != nil {
+				return err
+			}
+		case *target_update.TargetUpdate:
+			if err := startTargetUpdate(u, commandID, proc); err != nil {
+				return err
+			}
+		case *generator_update.GeneratorUpdate:
+			if err := startGeneratorUpdate(u, commandID, proc); err != nil {
+				return err
+			}
+		default:
+			// GetExecutableUpdates has already marked this update in progress,
+			// so dropping it here would leave a node nothing ever finishes and
+			// every dependent blocked behind it — the changeset would never
+			// reach a terminal state. Fail the changeset instead: an update
+			// kind the executor cannot start is a wiring error, and a
+			// diagnosable failure beats a hang.
+			return fmt.Errorf("changeset contains an update this executor cannot start: %s", update.NodeURI())
+		}
+	}
+
+	return nil
+}
+
+func startResourceUpdate(ru *resource_update.ResourceUpdate, commandID string, mode pkgmodel.FormaApplyMode, proc gen.Process) error {
+	proc.Log().Debug("Starting resource updater uri=%v operation=%s", ru.URI(), ru.Operation)
+
+	// Sync exclusion is handled in bulk by registerAllResourcesWithSynchronizer
+	// at changeset start and unregisterAllResourcesFromSynchronizer at changeset
+	// end. This guarantees atomic protection for the entire stack — all resources
+	// in the changeset are excluded from sync for the full duration, with a clean
+	// unregister when the changeset reaches a terminal state.
+
+	// Spawn the ResourceUpdater as a direct child of this ChangesetExecutor with
+	// LinkParent so that when the executor terminates (for any reason) the child
+	// receives an exit signal and terminates too. The link is unidirectional:
+	// a crashing RU sends a message back to the executor (ResourceUpdateFinished)
+	// but does NOT cascade back to kill the executor itself.
+	name := actornames.ResourceUpdater(ru.URI(), string(ru.Operation), commandID)
+	_, err := proc.SpawnRegister(name, resource_update.NewResourceUpdater, gen.ProcessOptions{LinkParent: true}, proc.PID())
+	if err != nil && err != gen.ErrTaken {
+		proc.Log().Error("Failed to spawn resource updater: %v", err)
+		return err
+	}
+
+	err = proc.Send(gen.ProcessID{Name: name, Node: proc.Node().Name()},
+		resource_update.StartResourceUpdate{
+			ResourceUpdate: *ru,
+			CommandID:      commandID,
+			Mode:           mode,
+		})
+	if err != nil {
+		proc.Log().Error("Failed to send start message to resource updater: %v", err)
+		return err
+	}
+
+	return nil
+}
+
+func startTargetUpdate(tu *target_update.TargetUpdate, commandID string, proc gen.Process) error {
+	label := tu.Target.Label
+	operation := string(tu.Operation)
+
+	proc.Log().Debug("Starting target updater label=%s operation=%s", label, operation)
+
+	// Spawn the TargetUpdater as a direct child of this ChangesetExecutor with
+	// LinkParent so that when the executor terminates (for any reason) the child
+	// receives an exit signal and terminates too. The link is unidirectional:
+	// a crashing TU sends a message back to the executor (TargetUpdateFinished)
+	// but does NOT cascade back to kill the executor itself.
+	name := actornames.TargetUpdater(label, operation, commandID)
+	_, err := proc.SpawnRegister(name, target_update.NewTargetUpdater, gen.ProcessOptions{LinkParent: true}, proc.PID())
+	if err != nil && err != gen.ErrTaken {
+		proc.Log().Error("Failed to spawn target updater: %v", err)
+		return err
+	}
+
+	err = proc.Send(gen.ProcessID{Name: name, Node: proc.Node().Name()},
+		target_update.StartTargetUpdate{
+			TargetUpdate: *tu,
+			CommandID:    commandID,
+		})
+	if err != nil {
+		proc.Log().Error("Failed to send start message to target updater: %v", err)
+		return err
+	}
+
+	return nil
+}
+
+// startGeneratorUpdate spawns a GeneratorUpdater and hands it the draw.
+//
+// The actor is named by the draw's node URI rather than the generator's label:
+// a label is unique only within its stack, and one command may draw for the
+// same label in two stacks (see actornames.GeneratorUpdater).
+//
+// No apply mode is passed, unlike startResourceUpdate: a draw calls no
+// provider and derives no patch, so nothing about it depends on the mode. The
+// mode matters where the drawn value LANDS, which is the destination's patch
+// regeneration in propagateDrawnGeneratorValue.
+func startGeneratorUpdate(gu *generator_update.GeneratorUpdate, commandID string, proc gen.Process) error {
+	proc.Log().Debug("Starting generator updater node=%s", gu.NodeURI())
+
+	// Spawn the GeneratorUpdater as a direct child of this ChangesetExecutor
+	// with LinkParent, for the same reason the other two updaters are: when
+	// the executor terminates the child receives an exit signal and terminates
+	// too, and the link is unidirectional so a crashing updater does not kill
+	// the executor.
+	name := actornames.GeneratorUpdater(gu.NodeURI(), commandID)
+	_, err := proc.SpawnRegister(name, generator_update.NewGeneratorUpdater, gen.ProcessOptions{LinkParent: true}, proc.PID())
+	if err != nil && err != gen.ErrTaken {
+		proc.Log().Error("Failed to spawn generator updater: %v", err)
+		return err
+	}
+
+	err = proc.Send(gen.ProcessID{Name: name, Node: proc.Node().Name()},
+		generator_update.StartGeneratorUpdate{
+			GeneratorUpdate: *gu,
+			CommandID:       commandID,
+		})
+	if err != nil {
+		proc.Log().Error("Failed to send start message to generator updater: %v", err)
+		return err
+	}
+
+	return nil
+}
+
+func cancel(from gen.PID, state gen.Atom, data ChangesetData, message Cancel, proc gen.Process) (gen.Atom, ChangesetData, CancelResponse, []statemachine.Action, error) {
+	proc.Log().Debug("ChangesetExecutor received cancel request commandID=%s force=%t", message.CommandID, message.Force)
+
+	if message.Force {
+		return forceCancel(state, data, message, proc)
+	}
+
+	// Collect resources by state
+	var resourcesToCancel []forma_persister.ResourceUpdateRef
+	var inProgressCount int
+	resourceStates := make(map[string]string)
+
+	for _, node := range data.changeset.DAG.Nodes {
+		ru, ok := node.Update.(*resource_update.ResourceUpdate)
+		if !ok {
+			continue
+		}
+		uri := string(ru.URI())
+		switch ru.State {
+		case resource_update.ResourceUpdateStateNotStarted:
+			resourceStates[uri] = "Canceled"
+			resourcesToCancel = append(resourcesToCancel, forma_persister.ResourceUpdateRef{
+				URI:       ru.URI(),
+				Operation: ru.Operation,
+			})
+		case resource_update.ResourceUpdateStateInProgress:
+			resourceStates[uri] = "InProgress"
+			inProgressCount++
+		case resource_update.ResourceUpdateStateSuccess:
+			resourceStates[uri] = "Success"
+		case resource_update.ResourceUpdateStateFailed:
+			resourceStates[uri] = "Failed"
+		case resource_update.ResourceUpdateStateCanceled:
+			resourceStates[uri] = "Canceled"
+		default:
+			resourceStates[uri] = string(ru.State)
+		}
+	}
+
+	// Mark NotStarted resources as canceled
+	if len(resourcesToCancel) > 0 {
+		_, err := messages.UnwrapCall(proc.Call(
+			gen.ProcessID{Node: proc.Node().Name(), Name: gen.Atom("FormaCommandPersister")},
+			forma_persister.MarkResourcesAsCanceled{
+				CommandID: data.changeset.CommandID,
+				Resources: resourcesToCancel,
+			},
+		))
+		if err != nil {
+			proc.Log().Error("Failed to mark resources as canceled commandID=%s: %v", data.changeset.CommandID, err)
+		}
+
+		proc.Log().Debug("Marked NotStarted resources as canceled commandID=%s canceledCount=%d",
+			message.CommandID, len(resourcesToCancel))
+	}
+
+	cancelResp := CancelResponse{ResourceStates: resourceStates}
+
+	// Determine next state
+	var nextState gen.Atom
+	if inProgressCount > 0 {
+		proc.Log().Debug("Command is canceling, waiting for in-progress resources to complete commandID=%s inProgressCount=%d",
+			message.CommandID, inProgressCount)
+		nextState = StateCanceling
+	} else {
+		proc.Log().Debug("Command canceled immediately (no in-progress resources) commandID=%s",
+			message.CommandID)
+		nextState = StateCanceled
+	}
+
+	return nextState, data, cancelResp, nil, nil
+}
+
+// forceCancel implements the --force escape hatch. It terminalizes ALL still-in-flight
+// resource and target updates (NotStarted + InProgress) to Canceled in a single durable
+// persister turn (BulkForceCancel) BEFORE terminating any actors.
+//
+// Persist-before-terminate is load-bearing: if the persister call fails we return the
+// error to the caller and terminate NO actors, so we never leave the durable DB state
+// non-terminal while the in-process actor tree has already been torn down (that would
+// re-introduce the split-brain class). On success the command's derived state is already
+// terminal Canceled; we then transition to StateCanceled, whose state-enter callback sends
+// Shutdown to self and lets Ticket A's LinkParent cascade best-effort terminate the
+// children (and, through them, the remote plugin operators).
+func forceCancel(state gen.Atom, data ChangesetData, message Cancel, proc gen.Process) (gen.Atom, ChangesetData, CancelResponse, []statemachine.Action, error) {
+	var resourcesToCancel []forma_persister.ResourceUpdateRef
+	var targetsToCancel []forma_persister.TargetUpdateRef
+	resourceStates := make(map[string]string)
+
+	for _, node := range data.changeset.DAG.Nodes {
+		switch u := node.Update.(type) {
+		case *resource_update.ResourceUpdate:
+			uri := string(u.URI())
+			switch u.State {
+			case resource_update.ResourceUpdateStateNotStarted, resource_update.ResourceUpdateStateInProgress:
+				// All still-in-flight work is force-canceled.
+				resourceStates[uri] = "Canceled"
+				resourcesToCancel = append(resourcesToCancel, forma_persister.ResourceUpdateRef{
+					URI:       u.URI(),
+					Operation: u.Operation,
+				})
+			case resource_update.ResourceUpdateStateSuccess:
+				resourceStates[uri] = "Success"
+			case resource_update.ResourceUpdateStateFailed:
+				resourceStates[uri] = "Failed"
+			case resource_update.ResourceUpdateStateCanceled:
+				resourceStates[uri] = "Canceled"
+			default:
+				resourceStates[uri] = string(u.State)
+			}
+		case *target_update.TargetUpdate:
+			// Targets carry no per-URI display state today, but in-flight ones must be
+			// terminalized so recovery's "all updates terminal" criterion converges.
+			// The persister's in-memory target fence drops any that are already terminal.
+			switch u.State {
+			case target_update.TargetUpdateStateNotStarted, target_update.TargetUpdateStateInProgress:
+				targetsToCancel = append(targetsToCancel, forma_persister.TargetUpdateRef{
+					Label:     u.Target.Label,
+					Operation: u.Operation,
+				})
+			}
+		}
+	}
+
+	// Persist FIRST. BulkForceCancel terminalizes all in-flight resource and target
+	// updates and recomputes the command's derived state to terminal Canceled at commit.
+	result, err := messages.UnwrapCall(proc.Call(
+		gen.ProcessID{Node: proc.Node().Name(), Name: gen.Atom("FormaCommandPersister")},
+		forma_persister.BulkForceCancel{
+			CommandID: data.changeset.CommandID,
+			Resources: resourcesToCancel,
+			Targets:   targetsToCancel,
+		},
+	))
+	if err != nil {
+		// Persist-before-terminate: on persister error, terminate NO actors and stay
+		// in the current state. The durable DB state is still non-terminal; the user
+		// retries (or the agent-restart escape hatch remains). We carry the error in
+		// the CancelResponse (NOT as a Go error from this handler) because returning a
+		// non-nil error from a state call handler terminates the executor — exactly the
+		// teardown we must avoid here.
+		proc.Log().Error("BulkForceCancel failed, terminating no actors commandID=%s: %v", data.changeset.CommandID, err)
+		return state, data, CancelResponse{ErrorMessage: fmt.Sprintf("force-cancel persist failed: %v", err)}, nil, nil
+	}
+
+	resp, ok := result.(forma_persister.BulkForceCancelResponse)
+	if !ok {
+		proc.Log().Error("BulkForceCancel returned unexpected response type commandID=%s type=%T", data.changeset.CommandID, result)
+		return state, data, CancelResponse{ErrorMessage: fmt.Sprintf("force-cancel: unexpected persister response type %T", result)}, nil, nil
+	}
+
+	// The persister reports a persistence failure in-band (so it stays alive). Treat it
+	// exactly like a Call error: terminate no actors, stay in the current state, surface
+	// the error to the caller.
+	if resp.ErrorMessage != "" {
+		proc.Log().Error("BulkForceCancel reported persist failure, terminating no actors commandID=%s: %s", data.changeset.CommandID, resp.ErrorMessage)
+		return state, data, CancelResponse{ErrorMessage: resp.ErrorMessage}, nil, nil
+	}
+
+	// The resources that were force-canceled mid-operation (had an InProgress op) are
+	// the ones whose cloud-side state may now be orphaned.
+	var forceCanceledInProgress []string
+	for _, ref := range resp.ForceCanceledInProgress {
+		forceCanceledInProgress = append(forceCanceledInProgress, string(ref.URI))
+	}
+
+	proc.Log().Debug("Force-canceled command commandID=%s canceledCount=%d forceCanceledInProgress=%d targets=%d",
+		message.CommandID, len(resourcesToCancel), len(forceCanceledInProgress), len(targetsToCancel))
+
+	cancelResp := CancelResponse{
+		ResourceStates:          resourceStates,
+		ForceCanceledInProgress: forceCanceledInProgress,
+	}
+
+	// Durable terminal Canceled reached. Transition to StateCanceled; the state-enter
+	// callback tears down children (best-effort cascade) via Shutdown.
+	return StateCanceled, data, cancelResp, nil, nil
+}
+
+// cancelWhileCanceling handles a cancel request that arrives while the executor is
+// already in the waiting StateCanceling (a previously-issued non-force cancel is still
+// waiting for in-progress resources). A --force request here escalates: it terminalizes
+// the still-in-flight work immediately. A non-force request is an idempotent no-op — we
+// stay in StateCanceling and keep waiting.
+func cancelWhileCanceling(from gen.PID, state gen.Atom, data ChangesetData, message Cancel, proc gen.Process) (gen.Atom, ChangesetData, CancelResponse, []statemachine.Action, error) {
+	proc.Log().Debug("ChangesetExecutor received cancel request while canceling commandID=%s force=%t", message.CommandID, message.Force)
+
+	if message.Force {
+		return forceCancel(state, data, message, proc)
+	}
+
+	// Non-force cancel while already canceling: report current per-resource states and
+	// keep waiting. We do not re-issue MarkResourcesAsCanceled (the NotStarted resources
+	// were already terminalized when the first cancel ran).
+	resourceStates := make(map[string]string)
+	for _, node := range data.changeset.DAG.Nodes {
+		ru, ok := node.Update.(*resource_update.ResourceUpdate)
+		if !ok {
+			continue
+		}
+		uri := string(ru.URI())
+		switch ru.State {
+		case resource_update.ResourceUpdateStateInProgress:
+			resourceStates[uri] = "InProgress"
+		case resource_update.ResourceUpdateStateSuccess:
+			resourceStates[uri] = "Success"
+		case resource_update.ResourceUpdateStateFailed:
+			resourceStates[uri] = "Failed"
+		default:
+			resourceStates[uri] = "Canceled"
+		}
+	}
+
+	return StateCanceling, data, CancelResponse{ResourceStates: resourceStates}, nil, nil
+}
+
+func shutdown(from gen.PID, state gen.Atom, data ChangesetData, shutdown Shutdown, proc gen.Process) (gen.Atom, ChangesetData, []statemachine.Action, error) {
+	return state, data, nil, gen.TerminateReasonNormal
+}
+
+// changesetHasUserUpdates checks if the changeset contains any updates from user operations.
+// Returns true if at least one update has Source == FormaCommandSourceUser.
+// changesetWritesResources reports whether the changeset will write any
+// resource through a provider.
+//
+// Sync and discovery only read, and excluding a resource from sync on behalf
+// of a sync changeset would be circular. Every other source writes, so every
+// other source needs its resources held out of a concurrent sync cycle for the
+// duration.
+//
+// The case that made this necessary is a generator rotation. A rotation runs
+// in reconcile mode, so it re-baselines the drift window each time it
+// succeeds. A sync landing between a rotation's provider write and its own
+// persist records the just-written value as out-of-band drift, in patch mode,
+// which does not re-baseline. From then on the drift window is permanently
+// non-empty, so refuseRotationOnDrift refuses every later rotation, and since
+// the rotation is itself the reconcile that would have cleared the window
+// nothing recovers it. The credential silently stops rotating.
+func changesetWritesResources(changeset Changeset) bool {
+	for _, node := range changeset.DAG.Nodes {
+		ru, ok := node.Update.(*resource_update.ResourceUpdate)
+		if !ok {
+			continue
+		}
+		if ru.Source == resource_update.FormaCommandSourceSynchronize ||
+			ru.Source == resource_update.FormaCommandSourceDiscovery {
+			continue
+		}
+		return true
+	}
+	return false
+}
+
+func changesetHasUserUpdates(changeset Changeset) bool {
+	for _, node := range changeset.DAG.Nodes {
+		if ru, ok := node.Update.(*resource_update.ResourceUpdate); ok {
+			if ru.Source == resource_update.FormaCommandSourceUser {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// collectStacksWithDeletes returns a list of unique stack labels that had delete operations
+// in the DAG, excluding unmanaged stacks and stacks with admitted creation
+// intent. A replacement may delete the last resource before its create fails;
+// retaining that stack preserves the incarnation needed for recovery. This is
+// independent of asynchronous terminal-command persistence and does not publish
+// failed/canceled patch intent as desired state.
+func collectStacksWithDeletes(dag *ExecutionDAG) []string {
+	stackSet := make(map[string]struct{})
+	stacksWithCreates := make(map[string]bool)
+	for _, node := range dag.Nodes {
+		if ru, ok := node.Update.(*resource_update.ResourceUpdate); ok {
+			if ru.Operation == resource_update.OperationCreate || ru.Operation == resource_update.OperationReplace {
+				stacksWithCreates[ru.StackLabel] = true
+			}
+			if ru.Operation == resource_update.OperationDelete || ru.Operation == resource_update.OperationReplace {
+				stackLabel := ru.StackLabel
+				if stackLabel != "" && stackLabel != constants.UnmanagedStack {
+					stackSet[stackLabel] = struct{}{}
+				}
+			}
+		}
+	}
+
+	stacks := make([]string, 0, len(stackSet))
+	for stack := range stackSet {
+		if stacksWithCreates[stack] {
+			continue
+		}
+		stacks = append(stacks, stack)
+	}
+	return stacks
+}

@@ -1,0 +1,3168 @@
+// © 2025 Platform Engineering Labs Inc.
+//
+// SPDX-License-Identifier: FSL-1.1-ALv2
+
+//go:build unit
+
+package resource_persister
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"testing"
+	"time"
+
+	"ergo.services/ergo/gen"
+	"ergo.services/ergo/testing/unit"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+
+	"github.com/platform-engineering-labs/formae/internal/datastore"
+	dssqlite "github.com/platform-engineering-labs/formae/internal/datastore/sqlite"
+	"github.com/platform-engineering-labs/formae/internal/metastructure/forma_command"
+	"github.com/platform-engineering-labs/formae/internal/metastructure/generator_update"
+	"github.com/platform-engineering-labs/formae/internal/metastructure/messages"
+	"github.com/platform-engineering-labs/formae/internal/metastructure/policy_update"
+	"github.com/platform-engineering-labs/formae/internal/metastructure/resource_update"
+	"github.com/platform-engineering-labs/formae/internal/metastructure/target_update"
+	"github.com/platform-engineering-labs/formae/internal/metastructure/util"
+	pkgmodel "github.com/platform-engineering-labs/formae/pkg/model"
+	"github.com/platform-engineering-labs/formae/pkg/plugin"
+	"github.com/platform-engineering-labs/formae/pkg/plugin/resource"
+)
+
+func TestResourcePersister_StoresResourceUpdate(t *testing.T) {
+	persister, sender, ds, err := newResourcePersisterForTest(t)
+	assert.NoError(t, err)
+
+	resourceUpdate := resource_update.ResourceUpdate{
+		DesiredState: pkgmodel.Resource{
+			Label:      "test-resource",
+			Type:       "FakeAWS::S3::Bucket",
+			Properties: json.RawMessage(`{"foo":"bar"}`),
+			Stack:      "test-stack",
+			Ksuid:      util.NewID(),
+		},
+		ResourceTarget: pkgmodel.Target{
+			Label:     "test-target",
+			Namespace: "aws",
+		},
+		State:      resource_update.ResourceUpdateStateSuccess,
+		StackLabel: "test-stack",
+		ProgressResult: []plugin.TrackedProgress{
+			{
+				ProgressResult: resource.ProgressResult{
+					Operation:          resource.OperationCreate,
+					OperationStatus:    resource.OperationStatusSuccess,
+					RequestID:          "test-request-id",
+					NativeID:           "test-native-id",
+					ResourceProperties: json.RawMessage(`{"foo":"bar"}`),
+				},
+				ResourceType: "FakeAWS::S3::Bucket",
+				StartTs:      util.TimeNow(),
+				ModifiedTs:   util.TimeNow(),
+				Attempts:     1,
+			},
+		},
+	}
+
+	// Send PersistResourceUpdate message to the actor
+	result := persister.Call(sender, resource_update.PersistResourceUpdate{
+		CommandID:         "test-command-id",
+		ResourceOperation: resource_update.OperationCreate,
+		PluginOperation:   resource.OperationCreate,
+		ResourceUpdate:    resourceUpdate,
+	})
+
+	assert.NoError(t, result.Error)
+	hashRes, ok := result.Response.(resource_update.PersistResourceUpdateResult)
+	var hash string
+	if ok {
+		hash = hashRes.Version
+	}
+	assert.True(t, ok)
+	assert.NotEmpty(t, hash)
+
+	// Verify the resource was stored in the datastore
+	loadedResources, err := ds.LoadResourcesByStack("test-stack")
+	assert.NoError(t, err)
+	assert.NotNil(t, loadedResources)
+	assert.Equal(t, 1, len(loadedResources))
+	assert.Equal(t, "test-resource", loadedResources[0].Label)
+}
+
+func TestResourcePersister_LoadsResource(t *testing.T) {
+	persister, sender, ds, err := newResourcePersisterForTest(t)
+	assert.NoError(t, err)
+
+	// First, store a resource
+	target := pkgmodel.Target{
+		Label:     "test-target",
+		Namespace: "aws",
+	}
+	_, err = ds.CreateTarget(&target)
+	assert.NoError(t, err)
+
+	resourceKsuid := util.NewID()
+	resourceURI := pkgmodel.NewFormaeURI(resourceKsuid, "")
+
+	resourceUpdate := resource_update.ResourceUpdate{
+		DesiredState: pkgmodel.Resource{
+			Label:      "test-resource",
+			Type:       "FakeAWS::S3::Bucket",
+			Properties: json.RawMessage(`{"foo":"bar"}`),
+			Stack:      "test-stack",
+			Target:     "test-target",
+			Ksuid:      resourceKsuid,
+		},
+		ResourceTarget: target,
+		State:          resource_update.ResourceUpdateStateSuccess,
+		StackLabel:     "test-stack",
+		ProgressResult: []plugin.TrackedProgress{
+			{
+				ProgressResult: resource.ProgressResult{
+					Operation:          resource.OperationCreate,
+					OperationStatus:    resource.OperationStatusSuccess,
+					RequestID:          "test-request-id",
+					NativeID:           "test-native-id",
+					ResourceProperties: json.RawMessage(`{"foo":"bar"}`),
+				},
+				ResourceType: "FakeAWS::S3::Bucket",
+				StartTs:      util.TimeNow(),
+				ModifiedTs:   util.TimeNow(),
+				Attempts:     1,
+			},
+		},
+	}
+
+	storeResult := persister.Call(sender, resource_update.PersistResourceUpdate{
+		CommandID:         "test-command-id",
+		ResourceOperation: resource_update.OperationCreate,
+		PluginOperation:   resource.OperationCreate,
+		ResourceUpdate:    resourceUpdate,
+	})
+	assert.NoError(t, storeResult.Error)
+
+	// Now load the resource via the actor
+	loadResult := persister.Call(sender, messages.LoadResource{
+		ResourceURI: resourceURI,
+	})
+
+	assert.NoError(t, loadResult.Error)
+	loaded, ok := loadResult.Response.(messages.LoadResourceResult)
+	assert.True(t, ok)
+	assert.Equal(t, "test-resource", loaded.Resource.Label)
+	assert.Equal(t, "test-target", loaded.Target.Label)
+}
+
+func TestResourcePersister_Create(t *testing.T) {
+	persister, sender, ds, err := newResourcePersisterForTest(t)
+	assert.NoError(t, err)
+
+	resourceUpdate := resource_update.ResourceUpdate{
+		DesiredState: pkgmodel.Resource{
+			Label:      "test-resource",
+			Type:       "FakeAWS::S3::Bucket",
+			Properties: json.RawMessage(`{"foo":"bar","baz":"qux","a":[3,4,2]}`),
+			Stack:      "test-stack",
+			Ksuid:      util.NewID(),
+		},
+		ResourceTarget: pkgmodel.Target{
+			Label:     "test-target",
+			Namespace: "test-namespace",
+		},
+		State:      resource_update.ResourceUpdateStateSuccess,
+		StackLabel: "test-stack",
+		ProgressResult: []plugin.TrackedProgress{
+			{
+				ProgressResult: resource.ProgressResult{
+					Operation:          resource.OperationCreate,
+					OperationStatus:    resource.OperationStatusSuccess,
+					RequestID:          "test-request-id",
+					NativeID:           "test-native-id",
+					ResourceProperties: json.RawMessage(`{"foo":"bar","baz":"qux","a":[3,4,2]}`),
+				},
+				ResourceType: "FakeAWS::S3::Bucket",
+				StartTs:      util.TimeNow(),
+				ModifiedTs:   util.TimeNow(),
+				Attempts:     1,
+			},
+		},
+		GroupID: "test-group-id",
+	}
+
+	result := persister.Call(sender, resource_update.PersistResourceUpdate{
+		CommandID:         "test-command-id",
+		ResourceOperation: resource_update.OperationCreate,
+		PluginOperation:   resource.OperationCreate,
+		ResourceUpdate:    resourceUpdate,
+	})
+
+	assert.NoError(t, result.Error)
+	hashRes, ok := result.Response.(resource_update.PersistResourceUpdateResult)
+	var hash string
+	if ok {
+		hash = hashRes.Version
+	}
+	assert.True(t, ok)
+	assert.NotEmpty(t, hash)
+
+	// Verify the stack was stored correctly
+	loadedResources, err := ds.LoadResourcesByStack("test-stack")
+	assert.NoError(t, err)
+	assert.NotNil(t, loadedResources)
+	assert.Equal(t, 1, len(loadedResources))
+	assert.Equal(t, "test-resource", loadedResources[0].Label)
+	assert.JSONEq(t, `{"foo":"bar","baz":"qux","a":[3,4,2]}`, string(loadedResources[0].Properties))
+}
+
+func TestResourcePersister_Update(t *testing.T) {
+	persister, sender, ds, err := newResourcePersisterForTest(t)
+	assert.NoError(t, err)
+
+	resourceKsuid := util.NewID()
+	initialResource := resource_update.ResourceUpdate{
+		DesiredState: pkgmodel.Resource{
+			Label:      "test-resource",
+			Type:       "FakeAWS::S3::Bucket",
+			Properties: json.RawMessage(`{"foo":"bar","baz":"qux","a":[3,4,2]}`),
+			Stack:      "test-stack",
+			Ksuid:      resourceKsuid,
+			Schema: pkgmodel.Schema{
+				Fields: []string{"foo", "a", "baz"},
+			},
+		},
+		ResourceTarget: pkgmodel.Target{
+			Label:     "test-target",
+			Namespace: "test-namespace",
+		},
+		State:      resource_update.ResourceUpdateStateSuccess,
+		StackLabel: "test-stack",
+		ProgressResult: []plugin.TrackedProgress{
+			{
+				ProgressResult: resource.ProgressResult{
+					Operation:          resource.OperationCreate,
+					OperationStatus:    resource.OperationStatusSuccess,
+					RequestID:          "test-request-id",
+					NativeID:           "test-native-id",
+					ResourceProperties: json.RawMessage(`{"foo":"bar","baz":"qux","a":[3,4,2]}`),
+				},
+				ResourceType: "FakeAWS::S3::Bucket",
+				StartTs:      util.TimeNow(),
+				ModifiedTs:   util.TimeNow(),
+				Attempts:     1,
+			},
+		},
+		GroupID: "test-group-id",
+	}
+
+	createResult := persister.Call(sender, resource_update.PersistResourceUpdate{
+		CommandID:         "test-command-id",
+		ResourceOperation: resource_update.OperationCreate,
+		PluginOperation:   resource.OperationCreate,
+		ResourceUpdate:    initialResource,
+	})
+	assert.NoError(t, createResult.Error)
+	hashRes, ok := createResult.Response.(resource_update.PersistResourceUpdateResult)
+	var hash string
+	if ok {
+		hash = hashRes.Version
+	}
+	assert.True(t, ok)
+	assert.NotEmpty(t, hash)
+
+	// Now update with different properties
+	updateResource := resource_update.ResourceUpdate{
+		DesiredState: pkgmodel.Resource{
+			Label:      "test-resource",
+			Type:       "FakeAWS::S3::Bucket",
+			Properties: json.RawMessage(`{"foo":"barbar","a":[7,8]}`),
+			Stack:      "test-stack",
+			Ksuid:      resourceKsuid,
+			Schema: pkgmodel.Schema{
+				Fields: []string{"foo", "a", "baz"},
+			},
+		},
+		ResourceTarget: pkgmodel.Target{
+			Label:     "test-target",
+			Namespace: "test-namespace",
+		},
+		State:      resource_update.ResourceUpdateStateSuccess,
+		StackLabel: "test-stack",
+		ProgressResult: []plugin.TrackedProgress{
+			{
+				ProgressResult: resource.ProgressResult{
+					Operation:          resource.OperationUpdate,
+					OperationStatus:    resource.OperationStatusSuccess,
+					RequestID:          "test-request-id-2",
+					NativeID:           "test-native-id",
+					ResourceProperties: json.RawMessage(`{"foo":"barbar","a":[7,8]}`),
+				},
+				ResourceType: "FakeAWS::S3::Bucket",
+				StartTs:      util.TimeNow(),
+				ModifiedTs:   util.TimeNow(),
+				Attempts:     1,
+			},
+		},
+		GroupID: "test-group-id",
+	}
+
+	updateResult := persister.Call(sender, resource_update.PersistResourceUpdate{
+		CommandID:         "test-command-id-2",
+		ResourceOperation: resource_update.OperationUpdate,
+		PluginOperation:   resource.OperationUpdate,
+		ResourceUpdate:    updateResource,
+	})
+
+	assert.NoError(t, updateResult.Error)
+	latestHashRes, ok := updateResult.Response.(resource_update.PersistResourceUpdateResult)
+	var latestHash string
+	if ok {
+		latestHash = latestHashRes.Version
+	}
+	assert.True(t, ok)
+	assert.NotEmpty(t, latestHash)
+
+	// Verify properties were updated correctly
+	loadedResources, err := ds.LoadResourcesByStack("test-stack")
+	assert.NoError(t, err)
+	assert.NotNil(t, loadedResources)
+	assert.Equal(t, 1, len(loadedResources))
+
+	// Convert properties to maps for easier comparison
+	var props map[string]interface{}
+	err = json.Unmarshal(loadedResources[0].Properties, &props)
+	assert.NoError(t, err)
+
+	// Check updated properties
+	assert.Equal(t, "barbar", props["foo"])
+	assert.Contains(t, props, "a")
+	assert.Equal(t, []interface{}{float64(7), float64(8)}, props["a"])
+}
+
+// TestResourcePersister_RecordOnlyUpdateChangesOwnershipRecordOnly is the
+// persistence-invariant check for a record-only update: DesiredState carries
+// the exact same Properties and ReadOnlyProperties already stored, differing
+// only in OwnedMembers. This exercises processResourceUpdate's OperationUpdate
+// path directly (the seam TestResourcePersister_Update exercises) — there is
+// no unit seam inside package resource_update itself, since the executor
+// answers PersistResourceUpdate synthetically there rather than driving this
+// function.
+func TestResourcePersister_RecordOnlyUpdateChangesOwnershipRecordOnly(t *testing.T) {
+	persister, sender, ds, err := newResourcePersisterForTest(t)
+	assert.NoError(t, err)
+
+	resourceKsuid := util.NewID()
+	schema := pkgmodel.Schema{
+		Fields: []string{"Tags"},
+		Hints:  map[string]pkgmodel.FieldHint{"Tags": {UpdateMethod: pkgmodel.FieldUpdateMethodSet, CoOwned: &pkgmodel.CoOwnership{}}},
+	}
+	props := json.RawMessage(`{"Tags":["a","b"]}`)
+	readOnlyProps := json.RawMessage(`{"Arn":"arn:aws:ec2:sg/test"}`)
+
+	initialResource := resource_update.ResourceUpdate{
+		DesiredState: pkgmodel.Resource{
+			Label:              "test-resource",
+			Type:               "FakeAWS::EC2::SecurityGroup",
+			Properties:         props,
+			ReadOnlyProperties: readOnlyProps,
+			Stack:              "test-stack",
+			Ksuid:              resourceKsuid,
+			Schema:             schema,
+		},
+		ResourceTarget: pkgmodel.Target{Label: "test-target", Namespace: "test-namespace"},
+		State:          resource_update.ResourceUpdateStateSuccess,
+		StackLabel:     "test-stack",
+		ProgressResult: []plugin.TrackedProgress{
+			{
+				ProgressResult: resource.ProgressResult{
+					Operation:          resource.OperationCreate,
+					OperationStatus:    resource.OperationStatusSuccess,
+					RequestID:          "test-request-id",
+					NativeID:           "test-native-id",
+					ResourceProperties: props,
+				},
+				ResourceType: "FakeAWS::EC2::SecurityGroup",
+				StartTs:      util.TimeNow(),
+				ModifiedTs:   util.TimeNow(),
+				Attempts:     1,
+			},
+		},
+		GroupID: "test-group-id",
+	}
+
+	createResult := persister.Call(sender, resource_update.PersistResourceUpdate{
+		CommandID:         "test-command-id",
+		ResourceOperation: resource_update.OperationCreate,
+		PluginOperation:   resource.OperationCreate,
+		ResourceUpdate:    initialResource,
+	})
+	require.NoError(t, createResult.Error)
+
+	newRecord := pkgmodel.OwnedMembers{"Tags": {Rule: "Set", Members: []string{`"a"`}}}
+	recordOnlyResource := resource_update.ResourceUpdate{
+		DesiredState: pkgmodel.Resource{
+			Label:              "test-resource",
+			Type:               "FakeAWS::EC2::SecurityGroup",
+			Properties:         props,
+			ReadOnlyProperties: readOnlyProps,
+			Stack:              "test-stack",
+			Ksuid:              resourceKsuid,
+			Schema:             schema,
+			OwnedMembers:       newRecord,
+		},
+		ResourceTarget: pkgmodel.Target{Label: "test-target", Namespace: "test-namespace"},
+		State:          resource_update.ResourceUpdateStateSuccess,
+		StackLabel:     "test-stack",
+		RecordOnly:     true,
+		ProgressResult: []plugin.TrackedProgress{
+			{
+				ProgressResult: resource.ProgressResult{
+					Operation:          resource.OperationUpdate,
+					OperationStatus:    resource.OperationStatusSuccess,
+					RequestID:          "test-request-id-2",
+					NativeID:           "test-native-id",
+					ResourceProperties: props,
+				},
+				ResourceType: "FakeAWS::EC2::SecurityGroup",
+				StartTs:      util.TimeNow(),
+				ModifiedTs:   util.TimeNow(),
+				Attempts:     1,
+			},
+		},
+		GroupID: "test-group-id",
+	}
+
+	updateResult := persister.Call(sender, resource_update.PersistResourceUpdate{
+		CommandID:         "test-command-id-2",
+		ResourceOperation: resource_update.OperationUpdate,
+		PluginOperation:   resource.OperationUpdate,
+		ResourceUpdate:    recordOnlyResource,
+	})
+	require.NoError(t, updateResult.Error)
+
+	loaded, err := ds.LoadResource(pkgmodel.NewFormaeURI(resourceKsuid, ""))
+	require.NoError(t, err)
+	require.NotNil(t, loaded)
+
+	assert.JSONEq(t, string(props), string(loaded.Properties),
+		"Properties must be unchanged by a record-only update")
+	assert.JSONEq(t, string(readOnlyProps), string(loaded.ReadOnlyProperties),
+		"ReadOnlyProperties must be unchanged by a record-only update")
+	assert.True(t, pkgmodel.OwnedMembersEqual(newRecord, loaded.OwnedMembers),
+		"OwnedMembers must reflect the newly committed record")
+}
+
+func TestResourcePersister_Delete(t *testing.T) {
+	persister, sender, ds, err := newResourcePersisterForTest(t)
+	assert.NoError(t, err)
+
+	resource1KSUID := util.NewID()
+	resource2KSUID := util.NewID()
+
+	// Create two resources
+	createResource1 := resource_update.ResourceUpdate{
+		DesiredState: pkgmodel.Resource{
+			Label:      "resource-1",
+			Type:       "FakeAWS::S3::Bucket",
+			Properties: json.RawMessage(`{"name":"bucket1"}`),
+			Stack:      "test-stack",
+			Ksuid:      resource1KSUID,
+			Managed:    true,
+		},
+		ResourceTarget: pkgmodel.Target{
+			Label:     "test-target",
+			Namespace: "test-namespace",
+		},
+		State:      resource_update.ResourceUpdateStateSuccess,
+		StackLabel: "test-stack",
+		ProgressResult: []plugin.TrackedProgress{
+			{
+				ProgressResult: resource.ProgressResult{
+					Operation:          resource.OperationCreate,
+					OperationStatus:    resource.OperationStatusSuccess,
+					RequestID:          "test-request-id-1",
+					NativeID:           "test-native-id-1",
+					ResourceProperties: json.RawMessage(`{"name":"bucket1"}`),
+				},
+				ResourceType: "FakeAWS::S3::Bucket",
+				StartTs:      util.TimeNow(),
+				ModifiedTs:   util.TimeNow(),
+				Attempts:     1,
+			},
+		},
+		GroupID: "test-group-id-1",
+	}
+
+	result1 := persister.Call(sender, resource_update.PersistResourceUpdate{
+		CommandID:         "test-command-id-1",
+		ResourceOperation: resource_update.OperationCreate,
+		PluginOperation:   resource.OperationCreate,
+		ResourceUpdate:    createResource1,
+	})
+	assert.NoError(t, result1.Error)
+
+	createResource2 := resource_update.ResourceUpdate{
+		DesiredState: pkgmodel.Resource{
+			Label:      "resource-2",
+			Type:       "FakeAWS::S3::Bucket",
+			Properties: json.RawMessage(`{"name":"bucket2"}`),
+			Stack:      "test-stack",
+			Ksuid:      resource2KSUID,
+			Managed:    true,
+		},
+		ResourceTarget: pkgmodel.Target{
+			Label:     "test-target",
+			Namespace: "test-namespace",
+		},
+		State:      resource_update.ResourceUpdateStateSuccess,
+		StackLabel: "test-stack",
+		ProgressResult: []plugin.TrackedProgress{
+			{
+				ProgressResult: resource.ProgressResult{
+					Operation:          resource.OperationCreate,
+					OperationStatus:    resource.OperationStatusSuccess,
+					RequestID:          "test-request-id-2",
+					NativeID:           "test-native-id-2",
+					ResourceProperties: json.RawMessage(`{"name":"bucket2"}`),
+				},
+				ResourceType: "FakeAWS::S3::Bucket",
+				StartTs:      util.TimeNow(),
+				ModifiedTs:   util.TimeNow(),
+				Attempts:     1,
+			},
+		},
+		GroupID: "test-group-id-2",
+	}
+
+	result2 := persister.Call(sender, resource_update.PersistResourceUpdate{
+		CommandID:         "test-command-id-2",
+		ResourceOperation: resource_update.OperationCreate,
+		PluginOperation:   resource.OperationCreate,
+		ResourceUpdate:    createResource2,
+	})
+	assert.NoError(t, result2.Error)
+
+	resources, err := ds.LoadResourcesByStack("test-stack")
+	assert.NoError(t, err)
+	assert.Len(t, resources, 2)
+
+	// Delete resource-2
+	deleteResource2 := resource_update.ResourceUpdate{
+		DesiredState: pkgmodel.Resource{
+			Label:      "resource-2",
+			Type:       "FakeAWS::S3::Bucket",
+			Properties: json.RawMessage(`{"name":"bucket2"}`),
+			Stack:      "test-stack",
+			Ksuid:      resource2KSUID,
+		},
+		ResourceTarget: pkgmodel.Target{
+			Label:     "test-target",
+			Namespace: "test-namespace",
+		},
+		State:      resource_update.ResourceUpdateStateSuccess,
+		StackLabel: "test-stack",
+		ProgressResult: []plugin.TrackedProgress{
+			{
+				ProgressResult: resource.ProgressResult{
+					Operation:          resource.OperationDelete,
+					OperationStatus:    resource.OperationStatusSuccess,
+					RequestID:          "test-request-id-3",
+					NativeID:           "test-native-id-2",
+					ResourceProperties: json.RawMessage(`{"name":"bucket2"}`),
+				},
+				ResourceType: "FakeAWS::S3::Bucket",
+				StartTs:      util.TimeNow(),
+				ModifiedTs:   util.TimeNow(),
+				Attempts:     1,
+			},
+		},
+		GroupID: "test-group-id-2",
+	}
+
+	deleteResult := persister.Call(sender, resource_update.PersistResourceUpdate{
+		CommandID:         "test-command-id-3",
+		ResourceOperation: resource_update.OperationDelete,
+		PluginOperation:   resource.OperationDelete,
+		ResourceUpdate:    deleteResource2,
+	})
+	assert.NoError(t, deleteResult.Error)
+
+	resources, err = ds.LoadResourcesByStack("test-stack")
+	assert.NoError(t, err)
+	assert.Len(t, resources, 1)
+	assert.Equal(t, "resource-1", resources[0].Label)
+
+	// Delete resource-1
+	deleteResource1 := resource_update.ResourceUpdate{
+		DesiredState: pkgmodel.Resource{
+			Label:      "resource-1",
+			Type:       "FakeAWS::S3::Bucket",
+			Properties: json.RawMessage(`{"name":"bucket1"}`),
+			Stack:      "test-stack",
+			Ksuid:      resource1KSUID,
+		},
+		ResourceTarget: pkgmodel.Target{
+			Label:     "test-target",
+			Namespace: "test-namespace",
+		},
+		State:      resource_update.ResourceUpdateStateSuccess,
+		StackLabel: "test-stack",
+		ProgressResult: []plugin.TrackedProgress{
+			{
+				ProgressResult: resource.ProgressResult{
+					Operation:          resource.OperationDelete,
+					OperationStatus:    resource.OperationStatusSuccess,
+					RequestID:          "test-request-id-4",
+					NativeID:           "test-native-id-1",
+					ResourceProperties: json.RawMessage(`{"name":"bucket1"}`),
+				},
+				ResourceType: "FakeAWS::S3::Bucket",
+				StartTs:      util.TimeNow(),
+				ModifiedTs:   util.TimeNow(),
+				Attempts:     1,
+			},
+		},
+		GroupID: "test-group-id-1",
+	}
+
+	deleteResult2 := persister.Call(sender, resource_update.PersistResourceUpdate{
+		CommandID:         "test-command-id-4",
+		ResourceOperation: resource_update.OperationDelete,
+		PluginOperation:   resource.OperationDelete,
+		ResourceUpdate:    deleteResource1,
+	})
+	assert.NoError(t, deleteResult2.Error)
+
+	// Verify the stack was completely removed
+	emptyResources, err := ds.LoadResourcesByStack("test-stack")
+	assert.NoError(t, err)
+	assert.Empty(t, emptyResources)
+}
+
+func TestResourcePersister_MissingRequiredFields(t *testing.T) {
+	persister, sender, _, err := newResourcePersisterForTest(t)
+	assert.NoError(t, err)
+
+	resourceKsuid := util.NewID()
+	resourceUpdate := resource_update.ResourceUpdate{
+		DesiredState: pkgmodel.Resource{
+			Label:      "resource-1",
+			Type:       "FakeAWS::S3::Bucket",
+			Properties: json.RawMessage(`{"name":"bucket1"}`),
+			Stack:      "test-stack",
+			Target:     "test-target",
+			Ksuid:      resourceKsuid,
+			Schema: pkgmodel.Schema{
+				Fields: []string{"name", "required_field"},
+				Hints: map[string]pkgmodel.FieldHint{
+					"name":           {},
+					"required_field": {Required: true},
+				},
+			},
+		},
+		ResourceTarget: pkgmodel.Target{
+			Label:     "test-target",
+			Namespace: "test-namespace",
+		},
+		State:      resource_update.ResourceUpdateStateSuccess,
+		StackLabel: "test-stack",
+		ProgressResult: []plugin.TrackedProgress{
+			{
+				ProgressResult: resource.ProgressResult{
+					Operation:          resource.OperationCreate,
+					OperationStatus:    resource.OperationStatusSuccess,
+					RequestID:          "test-request-id-1",
+					NativeID:           "test-native-id-1",
+					ResourceProperties: json.RawMessage(`{"name":"bucket1"}`),
+				},
+				ResourceType: "FakeAWS::S3::Bucket",
+				StartTs:      util.TimeNow(),
+				ModifiedTs:   util.TimeNow(),
+				Attempts:     1,
+			},
+		},
+		GroupID: "test-group-id-1",
+	}
+
+	result := persister.Call(sender, resource_update.PersistResourceUpdate{
+		CommandID:         "test-command-id",
+		ResourceOperation: resource_update.OperationCreate,
+		PluginOperation:   resource.OperationCreate,
+		ResourceUpdate:    resourceUpdate,
+	})
+
+	// Validation should fail, returning empty hash
+	assert.NoError(t, result.Error)
+	hashRes, ok := result.Response.(resource_update.PersistResourceUpdateResult)
+	var hash string
+	if ok {
+		hash = hashRes.Version
+	}
+	assert.True(t, ok)
+	assert.Empty(t, hash)
+
+	// Verify the resource was not stored: the load is answered with a failure.
+	loadResult := persister.Call(sender, messages.LoadResource{
+		ResourceURI: resourceUpdate.URI(),
+	})
+	assert.NoError(t, loadResult.Error)
+	loadRes, ok := loadResult.Response.(messages.LoadResourceResult)
+	assert.True(t, ok, "expected a typed load reply, got %T", loadResult.Response)
+	assert.NotEmpty(t, loadRes.Error, "loading the never-stored resource must be answered with a failure")
+}
+
+func TestResourcePersister_IdempotentCreate(t *testing.T) {
+	persister, sender, _, err := newResourcePersisterForTest(t)
+	assert.NoError(t, err)
+
+	resourceUpdate := resource_update.ResourceUpdate{
+		DesiredState: pkgmodel.Resource{
+			Label:      "test-resource",
+			Type:       "FakeAWS::S3::Bucket",
+			Properties: json.RawMessage(`{"foo":"bar"}`),
+			Stack:      "test-stack",
+			Ksuid:      util.NewID(),
+		},
+		ResourceTarget: pkgmodel.Target{
+			Label:     "test-target",
+			Namespace: "aws",
+		},
+		State:      resource_update.ResourceUpdateStateSuccess,
+		StackLabel: "test-stack",
+		ProgressResult: []plugin.TrackedProgress{
+			{
+				ProgressResult: resource.ProgressResult{
+					Operation:          resource.OperationCreate,
+					OperationStatus:    resource.OperationStatusSuccess,
+					RequestID:          "test-request-id",
+					NativeID:           "test-native-id",
+					ResourceProperties: json.RawMessage(`{"foo":"bar"}`),
+				},
+				ResourceType: "FakeAWS::S3::Bucket",
+				StartTs:      util.TimeNow(),
+				ModifiedTs:   util.TimeNow(),
+				Attempts:     1,
+			},
+		},
+	}
+
+	// Store the same resource twice
+	result1 := persister.Call(sender, resource_update.PersistResourceUpdate{
+		CommandID:         "test-command-id",
+		ResourceOperation: resource_update.OperationCreate,
+		PluginOperation:   resource.OperationCreate,
+		ResourceUpdate:    resourceUpdate,
+	})
+	assert.NoError(t, result1.Error)
+	hash1Res, ok := result1.Response.(resource_update.PersistResourceUpdateResult)
+	var hash1 string
+	if ok {
+		hash1 = hash1Res.Version
+	}
+	assert.True(t, ok)
+	assert.NotEmpty(t, hash1)
+
+	result2 := persister.Call(sender, resource_update.PersistResourceUpdate{
+		CommandID:         "test-command-id",
+		ResourceOperation: resource_update.OperationCreate,
+		PluginOperation:   resource.OperationCreate,
+		ResourceUpdate:    resourceUpdate,
+	})
+	assert.NoError(t, result2.Error)
+	hash2Res, ok := result2.Response.(resource_update.PersistResourceUpdateResult)
+	var hash2 string
+	if ok {
+		hash2 = hash2Res.Version
+	}
+	assert.True(t, ok)
+	assert.NotEmpty(t, hash2)
+
+	// Hashes should be the same for idempotent operations
+	assert.Equal(t, hash1, hash2, "Hashes should be the same for idempotent operations")
+}
+
+func TestResourcePersister_ValidateFields(t *testing.T) {
+	t.Run("NestedFieldWithMissingParent", func(t *testing.T) {
+		// Parent field is missing - should pass validation
+		resource := pkgmodel.Resource{
+			Label: "test-record",
+			Type:  "AWS::Route53::RecordSet",
+			Properties: json.RawMessage(`{
+                "Name": "test.example.com",
+                "Type": "A",
+                "ResourceRecords": ["192.168.1.1"]
+            }`),
+			Stack:  "test-stack",
+			Target: "test-target",
+			Schema: pkgmodel.Schema{
+				Fields: []string{"Name", "Type", "AliasTarget", "ResourceRecords"},
+				Hints: map[string]pkgmodel.FieldHint{
+					"Name":                {Required: true},
+					"Type":                {Required: true},
+					"AliasTarget":         {Required: false},
+					"AliasTarget.DNSName": {Required: true}, // This should not be validated if AliasTarget is missing
+					"ResourceRecords":     {},
+				},
+			},
+		}
+
+		err := validateRequiredFields(resource)
+		assert.NoError(t, err, "Validation should pass when parent field is missing")
+	})
+
+	t.Run("NestedFieldWithNullParent", func(t *testing.T) {
+		// Parent field is null - should pass validation
+		resource := pkgmodel.Resource{
+			Label: "test-record-null",
+			Type:  "AWS::Route53::RecordSet",
+			Properties: json.RawMessage(`{
+                "Name": "test.example.com",
+                "Type": "A",
+                "AliasTarget": null,
+                "ResourceRecords": ["192.168.1.1"]
+            }`),
+			Stack:  "test-stack",
+			Target: "test-target",
+			Schema: pkgmodel.Schema{
+				Fields: []string{"Name", "Type", "AliasTarget", "ResourceRecords"},
+				Hints: map[string]pkgmodel.FieldHint{
+					"Name":                {Required: true},
+					"Type":                {Required: true},
+					"AliasTarget":         {Required: false},
+					"AliasTarget.DNSName": {Required: true}, // This should not be validated if AliasTarget is null
+					"ResourceRecords":     {},
+				},
+			},
+		}
+
+		err := validateRequiredFields(resource)
+		assert.NoError(t, err, "Validation should pass when parent field is null")
+	})
+
+	t.Run("NestedFieldWithEmptyParent", func(t *testing.T) {
+		// Parent field is empty - should fail validation
+		resource := pkgmodel.Resource{
+			Label: "test-record-empty",
+			Type:  "AWS::Route53::RecordSet",
+			Properties: json.RawMessage(`{
+                "Name": "test.example.com",
+                "Type": "A",
+                "AliasTarget": {},
+                "ResourceRecords": ["192.168.1.1"]
+            }`),
+			Stack:  "test-stack",
+			Target: "test-target",
+			Schema: pkgmodel.Schema{
+				Fields: []string{"Name", "Type", "AliasTarget", "ResourceRecords"},
+				Hints: map[string]pkgmodel.FieldHint{
+					"Name":                {Required: true},
+					"Type":                {Required: true},
+					"AliasTarget":         {Required: false},
+					"AliasTarget.DNSName": {Required: true}, // This should be validated since AliasTarget is present but empty
+					"ResourceRecords":     {},
+				},
+			},
+		}
+
+		err := validateRequiredFields(resource)
+		assert.Error(t, err, "Validation should fail when parent field is empty but child is required")
+		assert.Contains(t, err.Error(), "AliasTarget.DNSName")
+	})
+
+	t.Run("NestedFieldWithPresentParentMissingChild", func(t *testing.T) {
+		// Parent field is present but child field is missing - should fail validation
+		resource := pkgmodel.Resource{
+			Label: "test-record-missing-child",
+			Type:  "AWS::Route53::RecordSet",
+			Properties: json.RawMessage(`{
+                "Name": "test.example.com",
+                "Type": "A",
+                "AliasTarget": {
+                    "HostedZoneId": "Z123456789"
+                }
+            }`),
+			Stack:  "test-stack",
+			Target: "test-target",
+			Schema: pkgmodel.Schema{
+				Fields: []string{"Name", "Type", "AliasTarget", "ResourceRecords"},
+				Hints: map[string]pkgmodel.FieldHint{
+					"Name":                     {Required: true},
+					"Type":                     {Required: true},
+					"AliasTarget":              {Required: false},
+					"AliasTarget.DNSName":      {Required: true},
+					"AliasTarget.HostedZoneId": {Required: false},
+					"ResourceRecords":          {},
+				},
+			},
+		}
+
+		err := validateRequiredFields(resource)
+		assert.Error(t, err, "Validation should fail when required child field is missing but parent exists")
+		assert.Contains(t, err.Error(), "AliasTarget.DNSName")
+	})
+
+	t.Run("NestedFieldWithCompleteData", func(t *testing.T) {
+		// Both parent and child fields are present - should pass validation
+		resource := pkgmodel.Resource{
+			Label: "test-record-complete",
+			Type:  "AWS::Route53::RecordSet",
+			Properties: json.RawMessage(`{
+                "Name": "test.example.com",
+                "Type": "A",
+                "AliasTarget": {
+                    "DNSName": "example.elb.amazonaws.com",
+                    "HostedZoneId": "Z123456789"
+                }
+            }`),
+			Stack:  "test-stack",
+			Target: "test-target",
+			Schema: pkgmodel.Schema{
+				Fields: []string{"Name", "Type", "AliasTarget", "ResourceRecords"},
+				Hints: map[string]pkgmodel.FieldHint{
+					"Name":                     {Required: true},
+					"Type":                     {Required: true},
+					"AliasTarget":              {Required: false},
+					"AliasTarget.DNSName":      {Required: true}, // This should be validated and pass
+					"AliasTarget.HostedZoneId": {Required: false},
+					"ResourceRecords":          {},
+				},
+			},
+		}
+
+		err := validateRequiredFields(resource)
+		assert.NoError(t, err, "Validation should pass when both parent and child fields are present")
+	})
+
+	t.Run("MultiLevelMissingLevel1Parent", func(t *testing.T) {
+		// parent1 is missing - parent1.parent2.child should not be required
+		resource := pkgmodel.Resource{
+			Label: "test-multi-level-missing-parent1",
+			Type:  "AWS::TestResource",
+			Properties: json.RawMessage(`{
+                "Name": "test.example.com",
+                "Type": "A"
+            }`),
+			Stack:  "test-stack",
+			Target: "test-target",
+			Schema: pkgmodel.Schema{
+				Fields: []string{"Name", "Type", "parent1"},
+				Hints: map[string]pkgmodel.FieldHint{
+					"Name":                  {Required: true},
+					"Type":                  {Required: true},
+					"parent1":               {Required: false},
+					"parent1.parent2":       {Required: false},
+					"parent1.parent2.child": {Required: true}, // Should not be validated since parent1 is missing
+				},
+			},
+		}
+
+		err := validateRequiredFields(resource)
+		assert.NoError(t, err, "Validation should pass when top-level parent is missing")
+	})
+
+	t.Run("MultiLevelNullLevel1Parent", func(t *testing.T) {
+		// parent1 is null - parent1.parent2.child should not be required
+		resource := pkgmodel.Resource{
+			Label: "test-multi-level-null-parent1",
+			Type:  "AWS::TestResource",
+			Properties: json.RawMessage(`{
+                "Name": "test.example.com",
+                "Type": "A",
+                "parent1": null
+            }`),
+			Stack:  "test-stack",
+			Target: "test-target",
+			Schema: pkgmodel.Schema{
+				Fields: []string{"Name", "Type", "parent1"},
+				Hints: map[string]pkgmodel.FieldHint{
+					"Name":                  {Required: true},
+					"Type":                  {Required: true},
+					"parent1":               {Required: false},
+					"parent1.parent2":       {Required: false},
+					"parent1.parent2.child": {Required: true}, // Should not be validated since parent1 is null
+				},
+			},
+		}
+
+		err := validateRequiredFields(resource)
+		assert.NoError(t, err, "Validation should pass when top-level parent is null")
+	})
+
+	t.Run("MultiLevelMissingLevel2Parent", func(t *testing.T) {
+		// parent1 exists but parent2 is missing - parent1.parent2.child should not be required
+		resource := pkgmodel.Resource{
+			Label: "test-multi-level-missing-parent2",
+			Type:  "AWS::TestResource",
+			Properties: json.RawMessage(`{
+                "Name": "test.example.com",
+                "Type": "A",
+                "parent1": {
+                    "someOtherField": "value"
+                }
+            }`),
+			Stack:  "test-stack",
+			Target: "test-target",
+			Schema: pkgmodel.Schema{
+				Fields: []string{"Name", "Type", "parent1"},
+				Hints: map[string]pkgmodel.FieldHint{
+					"Name":                  {Required: true},
+					"Type":                  {Required: true},
+					"parent1":               {Required: false},
+					"parent1.parent2":       {Required: false},
+					"parent1.parent2.child": {Required: true}, // Should not be validated since parent2 is missing
+				},
+			},
+		}
+
+		err := validateRequiredFields(resource)
+		assert.NoError(t, err, "Validation should pass when second-level parent is missing")
+	})
+
+	t.Run("MultiLevelNullLevel2Parent", func(t *testing.T) {
+		// parent1 exists but parent2 is null - parent1.parent2.child should not be required
+		resource := pkgmodel.Resource{
+			Label: "test-multi-level-null-parent2",
+			Type:  "AWS::TestResource",
+			Properties: json.RawMessage(`{
+                "Name": "test.example.com",
+                "Type": "A",
+                "parent1": {
+                    "parent2": null,
+                    "someOtherField": "value"
+                }
+            }`),
+			Stack:  "test-stack",
+			Target: "test-target",
+			Schema: pkgmodel.Schema{
+				Fields: []string{"Name", "Type", "parent1"},
+				Hints: map[string]pkgmodel.FieldHint{
+					"Name":                  {Required: true},
+					"Type":                  {Required: true},
+					"parent1":               {Required: false},
+					"parent1.parent2":       {Required: false},
+					"parent1.parent2.child": {Required: true}, // Should not be validated since parent2 is null
+				},
+			},
+		}
+
+		err := validateRequiredFields(resource)
+		assert.NoError(t, err, "Validation should pass when second-level parent is null")
+	})
+
+	t.Run("MultiLevelMissingChildWithPresentParents", func(t *testing.T) {
+		// Both parents exist but child is missing - should fail validation
+		resource := pkgmodel.Resource{
+			Label: "test-multi-level-missing-child",
+			Type:  "AWS::TestResource",
+			Properties: json.RawMessage(`{
+                "Name": "test.example.com",
+                "Type": "A",
+                "parent1": {
+                    "parent2": {
+                        "someOtherField": "value"
+                    }
+                }
+            }`),
+			Stack:  "test-stack",
+			Target: "test-target",
+			Schema: pkgmodel.Schema{
+				Fields: []string{"Name", "Type", "parent1"},
+				Hints: map[string]pkgmodel.FieldHint{
+					"Name":                  {Required: true},
+					"Type":                  {Required: true},
+					"parent1":               {Required: false},
+					"parent1.parent2":       {Required: false},
+					"parent1.parent2.child": {Required: true}, // Should be validated since both parents exist
+				},
+			},
+		}
+
+		err := validateRequiredFields(resource)
+		assert.Error(t, err, "Validation should fail when required child field is missing but all parents exist")
+		assert.Contains(t, err.Error(), "parent1.parent2.child")
+	})
+
+	t.Run("MultiLevelCompleteHierarchy", func(t *testing.T) {
+		// Complete hierarchy - should pass validation
+		resource := pkgmodel.Resource{
+			Label: "test-multi-level-complete",
+			Type:  "AWS::TestResource",
+			Properties: json.RawMessage(`{
+                "Name": "test.example.com",
+                "Type": "A",
+                "parent1": {
+                    "parent2": {
+                        "child": "required_value"
+                    }
+                }
+            }`),
+			Stack:  "test-stack",
+			Target: "test-target",
+			Schema: pkgmodel.Schema{
+				Fields: []string{"Name", "Type", "parent1"},
+				Hints: map[string]pkgmodel.FieldHint{
+					"Name":                  {Required: true},
+					"Type":                  {Required: true},
+					"parent1":               {Required: false},
+					"parent1.parent2":       {Required: false},
+					"parent1.parent2.child": {Required: true}, // Should pass validation
+				},
+			},
+		}
+
+		err := validateRequiredFields(resource)
+		assert.NoError(t, err, "Validation should pass when complete hierarchy is present")
+	})
+
+	t.Run("MultiLevelMixedNestedFields", func(t *testing.T) {
+		// Multiple nested fields with mixed presence
+		resource := pkgmodel.Resource{
+			Label: "test-mixed-nested",
+			Type:  "AWS::TestResource",
+			Properties: json.RawMessage(`{
+                "Name": "test.example.com",
+                "Type": "A",
+                "parent1": {
+                    "parent2": {
+                        "child1": "value1"
+                    }
+                },
+                "otherParent": null
+            }`),
+			Stack:  "test-stack",
+			Target: "test-target",
+			Schema: pkgmodel.Schema{
+				Fields: []string{"Name", "Type", "parent1", "otherParent"},
+				Hints: map[string]pkgmodel.FieldHint{
+					"Name":                      {Required: true},
+					"Type":                      {Required: true},
+					"parent1":                   {Required: false},
+					"parent1.parent2":           {Required: false},
+					"parent1.parent2.child1":    {Required: true}, // Should pass - all parents exist
+					"parent1.parent2.child2":    {Required: true}, // Should fail - child2 is missing
+					"otherParent":               {Required: false},
+					"otherParent.requiredChild": {Required: true}, // Should pass - otherParent is null
+				},
+			},
+		}
+
+		err := validateRequiredFields(resource)
+		assert.Error(t, err, "Validation should fail when some required nested fields are missing")
+		assert.Contains(t, err.Error(), "parent1.parent2.child2")
+		assert.NotContains(t, err.Error(), "otherParent.requiredChild")
+	})
+}
+
+func TestResourcePersister_ReadPreservesCurrentStack(t *testing.T) {
+	persister, sender, ds, err := newResourcePersisterForTest(t)
+	assert.NoError(t, err)
+
+	resourceKsuid := util.NewID()
+
+	initialResource := resource_update.ResourceUpdate{
+		DesiredState: pkgmodel.Resource{
+			Label:      "test-vpc",
+			Type:       "AWS::EC2::VPC",
+			Properties: json.RawMessage(`{"CidrBlock":"10.0.0.0/16"}`),
+			Stack:      "managed-stack",
+			Ksuid:      resourceKsuid,
+			Managed:    true,
+		},
+		ResourceTarget: pkgmodel.Target{
+			Label:     "test-target",
+			Namespace: "aws",
+		},
+		State:      resource_update.ResourceUpdateStateSuccess,
+		StackLabel: "managed-stack",
+		ProgressResult: []plugin.TrackedProgress{
+			{
+				ProgressResult: resource.ProgressResult{
+					Operation:          resource.OperationCreate,
+					OperationStatus:    resource.OperationStatusSuccess,
+					NativeID:           "vpc-123",
+					ResourceProperties: json.RawMessage(`{"CidrBlock":"10.0.0.0/16"}`),
+				},
+				ResourceType: "AWS::EC2::VPC",
+				StartTs:      util.TimeNow(),
+				ModifiedTs:   util.TimeNow(),
+			},
+		},
+	}
+
+	createResult := persister.Call(sender, resource_update.PersistResourceUpdate{
+		CommandID:         "create-cmd",
+		ResourceOperation: resource_update.OperationCreate,
+		PluginOperation:   resource.OperationCreate,
+		ResourceUpdate:    initialResource,
+	})
+	assert.NoError(t, createResult.Error)
+
+	syncUpdate := resource_update.ResourceUpdate{
+		DesiredState: pkgmodel.Resource{
+			Label:      "test-vpc",
+			Type:       "AWS::EC2::VPC",
+			Properties: json.RawMessage(`{"CidrBlock":"10.0.0.0/16","VpcId":"vpc-123"}`),
+			Stack:      "$unmanaged",
+			Ksuid:      resourceKsuid,
+			Managed:    false,
+		},
+		ResourceTarget: pkgmodel.Target{
+			Label:     "test-target",
+			Namespace: "aws",
+		},
+		State:      resource_update.ResourceUpdateStateSuccess,
+		StackLabel: "$unmanaged",
+		ProgressResult: []plugin.TrackedProgress{
+			{
+				ProgressResult: resource.ProgressResult{
+					Operation:          resource.OperationRead,
+					OperationStatus:    resource.OperationStatusSuccess,
+					NativeID:           "vpc-123",
+					ResourceProperties: json.RawMessage(`{"CidrBlock":"10.0.0.0/16","VpcId":"vpc-123"}`),
+				},
+				ResourceType: "AWS::EC2::VPC",
+				StartTs:      util.TimeNow(),
+				ModifiedTs:   util.TimeNow(),
+			},
+		},
+	}
+
+	readResult := persister.Call(sender, resource_update.PersistResourceUpdate{
+		CommandID:         "sync-cmd",
+		ResourceOperation: resource_update.OperationRead,
+		PluginOperation:   resource.OperationRead,
+		ResourceUpdate:    syncUpdate,
+	})
+	assert.NoError(t, readResult.Error)
+
+	loadedResources, err := ds.LoadResourcesByStack("managed-stack")
+	assert.NoError(t, err)
+	assert.NotEmpty(t, loadedResources, "Resource should remain in managed-stack, not move to $unmanaged")
+	assert.Equal(t, 1, len(loadedResources))
+	assert.Equal(t, "test-vpc", loadedResources[0].Label)
+	assert.True(t, loadedResources[0].Managed, "Resource should remain managed")
+
+	unmanagedResources, err := ds.LoadResourcesByStack("$unmanaged")
+	assert.NoError(t, err)
+	assert.Empty(t, unmanagedResources, "Resource should not appear in $unmanaged stack")
+}
+
+// TestResourcePersister_ReadDoesNotResurrectResourceWhoseTargetIsGone covers the
+// resurrection race: a sync/discovery Read snapshotted before a target was deleted
+// can land at the persister afterwards with live properties. Because the target's
+// unmanaged resources are tombstoned when the target is deleted, the current row is
+// absent — and the persister must not re-create it against a target that no longer
+// exists. Here the target was never created (stands in for "already deleted"), so
+// the successful Read must be dropped and the $unmanaged stack must stay empty.
+func TestResourcePersister_ReadDoesNotResurrectResourceWhoseTargetIsGone(t *testing.T) {
+	persister, sender, ds, err := newResourcePersisterForTest(t)
+	require.NoError(t, err)
+
+	syncUpdate := resource_update.ResourceUpdate{
+		DesiredState: pkgmodel.Resource{
+			Label:      "orphan-bucket",
+			Type:       "FakeAWS::S3::Bucket",
+			Properties: json.RawMessage(`{"BucketName":"orphan-bucket"}`),
+			Stack:      "$unmanaged",
+			Target:     "gone-target",
+			Ksuid:      util.NewID(),
+			NativeID:   "native-orphan",
+			Managed:    false,
+		},
+		ResourceTarget: pkgmodel.Target{Label: "gone-target", Namespace: "aws"},
+		State:          resource_update.ResourceUpdateStateSuccess,
+		StackLabel:     "$unmanaged",
+		ProgressResult: []plugin.TrackedProgress{
+			{
+				ProgressResult: resource.ProgressResult{
+					Operation:          resource.OperationRead,
+					OperationStatus:    resource.OperationStatusSuccess,
+					NativeID:           "native-orphan",
+					ResourceProperties: json.RawMessage(`{"BucketName":"orphan-bucket"}`),
+				},
+				ResourceType: "FakeAWS::S3::Bucket",
+				StartTs:      util.TimeNow(),
+				ModifiedTs:   util.TimeNow(),
+			},
+		},
+	}
+
+	readResult := persister.Call(sender, resource_update.PersistResourceUpdate{
+		CommandID:         "sync-cmd",
+		ResourceOperation: resource_update.OperationRead,
+		PluginOperation:   resource.OperationRead,
+		ResourceUpdate:    syncUpdate,
+	})
+	require.NoError(t, readResult.Error)
+
+	unmanaged, err := ds.LoadResourcesByStack("$unmanaged")
+	require.NoError(t, err)
+	assert.Empty(t, unmanaged, "a read must not resurrect an unmanaged resource whose target has been deleted")
+}
+
+// TestResourcePersister_ReadCreatesNewlyDiscoveredResourceWhenTargetExists is the
+// companion to the guard above: when the target still exists, a Read with no current
+// row is a legitimate newly-discovered resource and must be stored. This ensures the
+// target-existence guard does not suppress ordinary discovery.
+func TestResourcePersister_ReadCreatesNewlyDiscoveredResourceWhenTargetExists(t *testing.T) {
+	persister, sender, ds, err := newResourcePersisterForTest(t)
+	require.NoError(t, err)
+
+	_, err = ds.CreateTarget(&pkgmodel.Target{Label: "live-target", Namespace: "aws"})
+	require.NoError(t, err)
+
+	syncUpdate := resource_update.ResourceUpdate{
+		DesiredState: pkgmodel.Resource{
+			Label:      "discovered-bucket",
+			Type:       "FakeAWS::S3::Bucket",
+			Properties: json.RawMessage(`{"BucketName":"discovered-bucket"}`),
+			Stack:      "$unmanaged",
+			Target:     "live-target",
+			Ksuid:      util.NewID(),
+			NativeID:   "native-discovered",
+			Managed:    false,
+		},
+		ResourceTarget: pkgmodel.Target{Label: "live-target", Namespace: "aws"},
+		State:          resource_update.ResourceUpdateStateSuccess,
+		StackLabel:     "$unmanaged",
+		ProgressResult: []plugin.TrackedProgress{
+			{
+				ProgressResult: resource.ProgressResult{
+					Operation:          resource.OperationRead,
+					OperationStatus:    resource.OperationStatusSuccess,
+					NativeID:           "native-discovered",
+					ResourceProperties: json.RawMessage(`{"BucketName":"discovered-bucket"}`),
+				},
+				ResourceType: "FakeAWS::S3::Bucket",
+				StartTs:      util.TimeNow(),
+				ModifiedTs:   util.TimeNow(),
+			},
+		},
+	}
+
+	readResult := persister.Call(sender, resource_update.PersistResourceUpdate{
+		CommandID:         "sync-cmd",
+		ResourceOperation: resource_update.OperationRead,
+		PluginOperation:   resource.OperationRead,
+		ResourceUpdate:    syncUpdate,
+	})
+	require.NoError(t, readResult.Error)
+
+	unmanaged, err := ds.LoadResourcesByStack("$unmanaged")
+	require.NoError(t, err)
+	require.Len(t, unmanaged, 1, "a newly-discovered resource on an existing target should be stored")
+	assert.Equal(t, "discovered-bucket", unmanaged[0].Label)
+}
+
+func TestResourcePersister_CleanupEmptyStacks(t *testing.T) {
+	persister, sender, ds, err := newResourcePersisterForTest(t)
+	assert.NoError(t, err)
+
+	// Create a stack first
+	_, err = ds.CreateStack(&pkgmodel.Stack{Label: "test-stack", Description: "Test stack"}, "cmd-1")
+	assert.NoError(t, err)
+
+	// Create a resource in the stack
+	resourceKsuid := util.NewID()
+	_, err = ds.StoreResource(&pkgmodel.Resource{
+		Label:      "test-resource",
+		Type:       "FakeAWS::S3::Bucket",
+		Properties: json.RawMessage(`{"foo":"bar"}`),
+		Stack:      "test-stack",
+		Ksuid:      resourceKsuid,
+		Target:     "test-target",
+		NativeID:   "native-1",
+		Managed:    true,
+	}, "cmd-1")
+	assert.NoError(t, err)
+
+	// Verify stack exists with resource
+	stack, err := ds.GetStackByLabel("test-stack")
+	assert.NoError(t, err)
+	assert.NotNil(t, stack)
+
+	// Send CleanupEmptyStacks - stack should NOT be deleted because it has resources
+	// Use SendMessage (async) to match production code which uses proc.Send
+	persister.SendMessage(sender, messages.CleanupEmptyStacks{
+		StackLabels: []string{"test-stack"},
+		CommandID:   "cmd-2",
+	})
+
+	// Give time for the async message to be processed, then verify stack still exists
+	// (we need to wait to prove CleanupEmptyStacks correctly preserved the non-empty stack)
+	time.Sleep(100 * time.Millisecond)
+	stack, err = ds.GetStackByLabel("test-stack")
+	assert.NoError(t, err)
+	assert.NotNil(t, stack, "Stack should still exist because it has resources")
+
+	// Delete the resource from the stack
+	_, err = ds.DeleteResource(&pkgmodel.Resource{
+		Ksuid: resourceKsuid,
+		Stack: "test-stack",
+	}, "cmd-3")
+	assert.NoError(t, err)
+
+	// Cleanup must have a durably completed command for this incarnation.
+	terminal := &forma_command.FormaCommand{ID: "cmd-4", Command: pkgmodel.CommandDestroy, Source: forma_command.SourceUser, State: forma_command.CommandStateSuccess, Stacks: []forma_command.CommandStack{{ID: stack.ID, Label: stack.Label}}}
+	require.NoError(t, ds.StoreFormaCommand(terminal, terminal.ID))
+	// Send CleanupEmptyStacks - stack should be deleted because it's now empty
+	persister.SendMessage(sender, messages.CleanupEmptyStacks{
+		StackLabels: []string{"test-stack"},
+		CommandID:   "cmd-4",
+	})
+
+	// Verify stack was deleted - use Eventually since SendMessage is async
+	assert.Eventually(t, func() bool {
+		stack, err = ds.GetStackByLabel("test-stack")
+		return err == nil && stack == nil
+	}, 5*time.Second, 100*time.Millisecond, "Stack should be deleted because it's empty")
+}
+
+func TestResourcePersister_IdempotentTargetCreate_IdenticalConfig(t *testing.T) {
+	persister, sender, ds, err := newResourcePersisterForTest(t)
+	assert.NoError(t, err)
+
+	targetConfig := json.RawMessage(`{"region":"us-east-1"}`)
+
+	// Pre-seed the target in the DB (simulates crash recovery: target persisted but command didn't complete)
+	_, err = ds.CreateTarget(&pkgmodel.Target{
+		Label:     "aws-us-east-1",
+		Namespace: "FakeAWS",
+		Config:    targetConfig,
+	})
+	require.NoError(t, err)
+
+	// Now try to "create" the same target via the persister — should succeed via idempotent fallback
+	result := persister.Call(sender, target_update.PersistTargetUpdates{
+		CommandID: "cmd-1",
+		TargetUpdates: []target_update.TargetUpdate{
+			{
+				Target: pkgmodel.Target{
+					Label:     "aws-us-east-1",
+					Namespace: "FakeAWS",
+					Config:    targetConfig,
+				},
+				Operation: target_update.TargetOperationCreate,
+			},
+		},
+	})
+	assert.NotNil(t, result)
+
+	// Verify target still exists with original config
+	stored, loadErr := ds.LoadTarget("aws-us-east-1")
+	require.NoError(t, loadErr)
+	assert.Equal(t, "FakeAWS", stored.Namespace)
+	assert.JSONEq(t, `{"region":"us-east-1"}`, string(stored.Config))
+}
+
+func TestResourcePersister_IdempotentTargetCreate_DifferentConfig(t *testing.T) {
+	persister, sender, ds, err := newResourcePersisterForTest(t)
+	assert.NoError(t, err)
+
+	// Pre-seed the target with old config
+	_, err = ds.CreateTarget(&pkgmodel.Target{
+		Label:     "aws-us-east-1",
+		Namespace: "FakeAWS",
+		Config:    json.RawMessage(`{"region":"us-east-1"}`),
+	})
+	require.NoError(t, err)
+
+	// Try to "create" with a different config — should update via idempotent fallback
+	newConfig := json.RawMessage(`{"region":"us-west-2"}`)
+	result := persister.Call(sender, target_update.PersistTargetUpdates{
+		CommandID: "cmd-1",
+		TargetUpdates: []target_update.TargetUpdate{
+			{
+				Target: pkgmodel.Target{
+					Label:     "aws-us-east-1",
+					Namespace: "FakeAWS",
+					Config:    newConfig,
+				},
+				Operation: target_update.TargetOperationCreate,
+			},
+		},
+	})
+	assert.NotNil(t, result)
+
+	// Verify config was updated to the new value
+	stored, loadErr := ds.LoadTarget("aws-us-east-1")
+	require.NoError(t, loadErr)
+	assert.JSONEq(t, `{"region":"us-west-2"}`, string(stored.Config))
+}
+
+// newResourcePersisterForTest creates a ResourcePersister actor for testing.
+// This follows the same pattern as FormaCommandPersister tests.
+func TestResourcePersister_UpdateTargetHealth(t *testing.T) {
+	persister, sender, ds, err := newResourcePersisterForTest(t)
+	require.NoError(t, err)
+
+	target := &pkgmodel.Target{
+		Label:     "health-actor-test",
+		Namespace: "AWS",
+		Config:    json.RawMessage(`{"Region":"us-east-1"}`),
+	}
+	_, err = ds.CreateTarget(target)
+	require.NoError(t, err)
+
+	now := time.Now().UTC().Truncate(time.Second)
+	obs := pkgmodel.TargetHealthObservation{
+		TargetLabel: "health-actor-test",
+		State:       pkgmodel.TargetHealthStateReachable,
+		ObservedAt:  now,
+		LastSeenAt:  &now,
+	}
+
+	persister.SendMessage(sender, messages.UpdateTargetHealth{
+		Observation: obs,
+	})
+
+	assert.Eventually(t, func() bool {
+		loaded, loadErr := ds.LoadTarget("health-actor-test")
+		if loadErr != nil || loaded == nil || loaded.Health == nil {
+			return false
+		}
+		return loaded.Health.State == pkgmodel.TargetHealthStateReachable
+	}, 5*time.Second, 50*time.Millisecond, "datastore must reflect the health observation sent to the actor")
+}
+
+func TestResourcePersister_PersistTargetReap(t *testing.T) {
+	persister, sender, ds, err := newResourcePersisterForTest(t)
+	require.NoError(t, err)
+
+	const label = "reap-actor-target"
+	const stack = "reap-actor-stack"
+
+	_, err = ds.CreateTarget(&pkgmodel.Target{
+		Label:     label,
+		Namespace: "AWS",
+		Config:    json.RawMessage(`{"Region":"us-east-1"}`),
+		Reaping:   json.RawMessage(`{"Kind":"after","MaxUnreachableSeconds":100}`),
+	})
+	require.NoError(t, err)
+
+	loaded, err := ds.LoadTarget(label)
+	require.NoError(t, err)
+	require.NotNil(t, loaded.Health)
+	inc := loaded.Health.IncarnationID
+
+	seenAt := time.Now().UTC().Add(-2 * time.Hour).Truncate(time.Second)
+	observedAt := time.Now().UTC().Add(-90 * time.Minute).Truncate(time.Second)
+	applied, err := ds.UpdateTargetHealth(pkgmodel.TargetHealthObservation{
+		TargetLabel:   label,
+		State:         pkgmodel.TargetHealthStateUnreachable,
+		ObservedAt:    observedAt,
+		LastSeenAt:    &seenAt,
+		IncarnationID: inc,
+	})
+	require.NoError(t, err)
+	require.True(t, applied)
+	sampleAt := time.Now().UTC().Add(-time.Hour).Truncate(time.Second)
+	applied, err = ds.AdvanceTargetAccrual(label, inc, sampleAt, 100)
+	require.NoError(t, err)
+	require.True(t, applied)
+
+	res := &pkgmodel.Resource{
+		Ksuid:      util.NewID(),
+		NativeID:   "native-reap-actor",
+		Stack:      stack,
+		Type:       "AWS::S3::Bucket",
+		Label:      "bucket",
+		Target:     label,
+		Managed:    true,
+		Properties: json.RawMessage(`{"key":"value"}`),
+	}
+	_, err = ds.StoreResource(res, "cmd-create")
+	require.NoError(t, err)
+
+	result := persister.Call(sender, messages.PersistTargetReap{
+		Label:            label,
+		IncarnationID:    inc,
+		LastSeenBefore:   time.Now().UTC(),
+		LastSampleBefore: time.Now().UTC(),
+		ReapedAt:         time.Now().UTC(),
+	})
+	require.NoError(t, result.Error)
+	reapResult, ok := result.Response.(messages.PersistTargetReapResult)
+	require.True(t, ok, "handler must reply with PersistTargetReapResult, got %T", result.Response)
+	assert.True(t, reapResult.Reaped, "an over-threshold unreachable target must reap")
+
+	reloaded, err := ds.LoadTarget(label)
+	require.NoError(t, err)
+	require.NotNil(t, reloaded.Health)
+	assert.Equal(t, pkgmodel.TargetHealthStateReaped, reloaded.Health.State)
+
+	live, err := ds.LoadResourcesByStack(stack)
+	require.NoError(t, err)
+	assert.Empty(t, live, "the reaped target's resources must be invisible to live queries")
+}
+
+func newResourcePersisterForTest(t *testing.T) (*unit.TestActor, gen.PID, datastore.Datastore, error) {
+	// Create an in-memory datastore for testing
+	ds, err := newTestDatastore()
+	if err != nil {
+		return nil, gen.PID{}, nil, err
+	}
+
+	env := map[gen.Env]any{
+		"Datastore": ds,
+		"DiscoveryConfig": pkgmodel.DiscoveryConfig{
+			Enabled:  true,
+			Interval: 10 * time.Minute,
+		},
+	}
+
+	sender := gen.PID{Node: "test", ID: 100}
+
+	actor, err := unit.Spawn(t, NewResourcePersister, unit.WithEnv(env))
+	if err != nil {
+		return nil, gen.PID{}, nil, err
+	}
+
+	return actor, sender, ds, nil
+}
+
+func newTestDatastore() (datastore.Datastore, error) {
+	cfg := &pkgmodel.DatastoreConfig{
+		DatastoreType: pkgmodel.SqliteDatastore,
+		Sqlite: pkgmodel.SqliteConfig{
+			FilePath: ":memory:",
+		},
+	}
+
+	ds, err := dssqlite.NewDatastoreSQLite(context.Background(), cfg, "test")
+	if err != nil {
+		return nil, err
+	}
+
+	return ds, nil
+}
+
+// syncReadUpdate constructs a ResourceUpdate for a OperationRead/OperationRead call,
+// seeding DesiredState with the supplied properties and readOnly properties.
+func syncReadUpdate(ksuid string, props, readOnlyProps json.RawMessage, matchFilters []pkgmodel.MatchFilter) resource_update.ResourceUpdate {
+	return resource_update.ResourceUpdate{
+		DesiredState: pkgmodel.Resource{
+			Label:              "discovered-resource",
+			Type:               "FakeAWS::EC2::Instance",
+			NativeID:           "i-abc123",
+			Properties:         props,
+			ReadOnlyProperties: readOnlyProps,
+			Stack:              "$unmanaged",
+			Target:             "test-target",
+			Ksuid:              ksuid,
+			Managed:            false,
+		},
+		ResourceTarget: pkgmodel.Target{
+			Label:     "test-target",
+			Namespace: "aws",
+		},
+		State:        resource_update.ResourceUpdateStateSuccess,
+		StackLabel:   "$unmanaged",
+		MatchFilters: matchFilters,
+		ProgressResult: []plugin.TrackedProgress{
+			{
+				ProgressResult: resource.ProgressResult{
+					Operation:          resource.OperationRead,
+					OperationStatus:    resource.OperationStatusSuccess,
+					NativeID:           "i-abc123",
+					ResourceProperties: props,
+				},
+				ResourceType: "FakeAWS::EC2::Instance",
+				StartTs:      util.TimeNow(),
+				ModifiedTs:   util.TimeNow(),
+			},
+		},
+	}
+}
+
+// seedUnmanagedRow stores an unmanaged resource row directly into the datastore, bypassing the actor.
+// It is used to set up the "existing row" that processResourceUpdate will load before deciding
+// whether to evict or persist.
+func seedUnmanagedRow(t *testing.T, ds datastore.Datastore, ksuid string, props json.RawMessage, managed bool) {
+	t.Helper()
+	_, err := ds.StoreResource(&pkgmodel.Resource{
+		Label:      "discovered-resource",
+		Type:       "FakeAWS::EC2::Instance",
+		NativeID:   "i-abc123",
+		Properties: props,
+		Stack:      "$unmanaged",
+		Target:     "test-target",
+		Ksuid:      ksuid,
+		Managed:    managed,
+	}, "seed-cmd")
+	require.NoError(t, err)
+}
+
+// TestResourcePersister_SyncRead_EvictsUnmanagedRowMatchingFilter covers the primary
+// eviction path: an existing unmanaged row whose freshly-read cloud state matches a
+// discovery filter is tombstoned (DB-only, no cloud mutation).
+func TestResourcePersister_SyncRead_EvictsUnmanagedRowMatchingFilter(t *testing.T) {
+	persister, sender, ds, err := newResourcePersisterForTest(t)
+	require.NoError(t, err)
+
+	_, err = ds.CreateTarget(&pkgmodel.Target{Label: "test-target", Namespace: "aws"})
+	require.NoError(t, err)
+
+	ksuid := util.NewID()
+	props := json.RawMessage(`{"Name":"filtered-instance","SkipMe":"yes"}`)
+	seedUnmanagedRow(t, ds, ksuid, props, false /* unmanaged */)
+
+	filter := pkgmodel.MatchFilter{
+		ResourceTypes: []string{"FakeAWS::EC2::Instance"},
+		Conditions: []pkgmodel.FilterCondition{
+			{PropertyPath: "$.SkipMe", PropertyValue: "yes"},
+		},
+	}
+	ru := syncReadUpdate(ksuid, props, nil, []pkgmodel.MatchFilter{filter})
+
+	result := persister.Call(sender, resource_update.PersistResourceUpdate{
+		CommandID:         "evict-cmd",
+		ResourceOperation: resource_update.OperationRead,
+		PluginOperation:   resource.OperationRead,
+		ResourceUpdate:    ru,
+	})
+	require.NoError(t, result.Error)
+
+	// Row must have been tombstoned (DeleteResource appends a delete version).
+	// LoadResourcesByStack filters out tombstoned URIs, making it the reliable
+	// way to confirm a row has been evicted.
+	remaining, loadErr := ds.LoadResourcesByStack("$unmanaged")
+	require.NoError(t, loadErr)
+	assert.Empty(t, remaining, "unmanaged row matching a filter must be evicted")
+}
+
+// TestResourcePersister_SyncRead_DoesNotEvictManagedRowMatchingFilter ensures that
+// a managed resource is never evicted by the filter check, even when its properties
+// match a discovery filter.
+func TestResourcePersister_SyncRead_DoesNotEvictManagedRowMatchingFilter(t *testing.T) {
+	persister, sender, ds, err := newResourcePersisterForTest(t)
+	require.NoError(t, err)
+
+	_, err = ds.CreateTarget(&pkgmodel.Target{Label: "test-target", Namespace: "aws"})
+	require.NoError(t, err)
+
+	ksuid := util.NewID()
+	props := json.RawMessage(`{"SkipMe":"yes"}`)
+	seedUnmanagedRow(t, ds, ksuid, props, true /* managed */)
+
+	filter := pkgmodel.MatchFilter{
+		ResourceTypes: []string{"FakeAWS::EC2::Instance"},
+		Conditions: []pkgmodel.FilterCondition{
+			{PropertyPath: "$.SkipMe", PropertyValue: "yes"},
+		},
+	}
+	ru := syncReadUpdate(ksuid, props, nil, []pkgmodel.MatchFilter{filter})
+
+	result := persister.Call(sender, resource_update.PersistResourceUpdate{
+		CommandID:         "managed-cmd",
+		ResourceOperation: resource_update.OperationRead,
+		PluginOperation:   resource.OperationRead,
+		ResourceUpdate:    ru,
+	})
+	require.NoError(t, result.Error)
+
+	// Managed row must survive.
+	loaded, loadErr := ds.LoadResource(ru.DesiredState.URI())
+	require.NoError(t, loadErr)
+	assert.NotNil(t, loaded, "managed row must not be evicted even when properties match a filter")
+}
+
+// TestResourcePersister_SyncRead_DoesNotEvictNonMatchingUnmanagedRow verifies that an
+// unmanaged row whose properties do NOT match any filter falls through to the normal
+// persist path and is retained.
+func TestResourcePersister_SyncRead_DoesNotEvictNonMatchingUnmanagedRow(t *testing.T) {
+	persister, sender, ds, err := newResourcePersisterForTest(t)
+	require.NoError(t, err)
+
+	_, err = ds.CreateTarget(&pkgmodel.Target{Label: "test-target", Namespace: "aws"})
+	require.NoError(t, err)
+
+	ksuid := util.NewID()
+	// Seed with old props; read returns new props that do NOT match the filter.
+	oldProps := json.RawMessage(`{"Name":"keeper"}`)
+	newProps := json.RawMessage(`{"Name":"keeper","Extra":"data"}`)
+	seedUnmanagedRow(t, ds, ksuid, oldProps, false /* unmanaged */)
+
+	filter := pkgmodel.MatchFilter{
+		ResourceTypes: []string{"FakeAWS::EC2::Instance"},
+		Conditions: []pkgmodel.FilterCondition{
+			{PropertyPath: "$.SkipMe", PropertyValue: "yes"},
+		},
+	}
+	ru := syncReadUpdate(ksuid, newProps, nil, []pkgmodel.MatchFilter{filter})
+
+	result := persister.Call(sender, resource_update.PersistResourceUpdate{
+		CommandID:         "keep-cmd",
+		ResourceOperation: resource_update.OperationRead,
+		PluginOperation:   resource.OperationRead,
+		ResourceUpdate:    ru,
+	})
+	require.NoError(t, result.Error)
+
+	// Row must still exist (updated or unchanged).
+	loaded, loadErr := ds.LoadResource(ru.DesiredState.URI())
+	require.NoError(t, loadErr)
+	assert.NotNil(t, loaded, "non-matching unmanaged row must not be evicted")
+}
+
+// TestResourcePersister_SyncRead_EvictsWhenPropsUnchangedButMatchFilter proves that the
+// filter eviction check runs BEFORE the JsonEqualRaw early-return: even when the
+// freshly-read properties are identical to the seeded row, the filter still fires and
+// the row is deleted.
+func TestResourcePersister_SyncRead_EvictsWhenPropsUnchangedButMatchFilter(t *testing.T) {
+	persister, sender, ds, err := newResourcePersisterForTest(t)
+	require.NoError(t, err)
+
+	_, err = ds.CreateTarget(&pkgmodel.Target{Label: "test-target", Namespace: "aws"})
+	require.NoError(t, err)
+
+	ksuid := util.NewID()
+	// Seed and read with identical properties — JsonEqualRaw would normally skip persist.
+	props := json.RawMessage(`{"SkipMe":"yes"}`)
+	seedUnmanagedRow(t, ds, ksuid, props, false /* unmanaged */)
+
+	filter := pkgmodel.MatchFilter{
+		ResourceTypes: []string{"FakeAWS::EC2::Instance"},
+		Conditions: []pkgmodel.FilterCondition{
+			{PropertyPath: "$.SkipMe", PropertyValue: "yes"},
+		},
+	}
+	// Read returns the same props — no diff, but the filter still matches.
+	ru := syncReadUpdate(ksuid, props, nil, []pkgmodel.MatchFilter{filter})
+
+	result := persister.Call(sender, resource_update.PersistResourceUpdate{
+		CommandID:         "unchanged-evict-cmd",
+		ResourceOperation: resource_update.OperationRead,
+		PluginOperation:   resource.OperationRead,
+		ResourceUpdate:    ru,
+	})
+	require.NoError(t, result.Error)
+
+	remaining, loadErr := ds.LoadResourcesByStack("$unmanaged")
+	require.NoError(t, loadErr)
+	assert.Empty(t, remaining, "unmanaged row must be evicted even when properties are unchanged")
+}
+
+// TestResourcePersister_SyncRead_EvictsWhenFilterMatchesReadOnlyProperties verifies that
+// the filter evaluates against the MERGED cloud state (Properties + ReadOnlyProperties),
+// not just Properties. A resource whose sole filter-matching field lives in
+// ReadOnlyProperties must still be evicted.
+func TestResourcePersister_SyncRead_EvictsWhenFilterMatchesReadOnlyProperties(t *testing.T) {
+	persister, sender, ds, err := newResourcePersisterForTest(t)
+	require.NoError(t, err)
+
+	_, err = ds.CreateTarget(&pkgmodel.Target{Label: "test-target", Namespace: "aws"})
+	require.NoError(t, err)
+
+	ksuid := util.NewID()
+	baseProps := json.RawMessage(`{"Name":"instance"}`)
+	// Matching field lives exclusively in ReadOnlyProperties.
+	readOnlyProps := json.RawMessage(`{"ManagedByEks":"true"}`)
+	seedUnmanagedRow(t, ds, ksuid, baseProps, false /* unmanaged */)
+
+	filter := pkgmodel.MatchFilter{
+		ResourceTypes: []string{"FakeAWS::EC2::Instance"},
+		Conditions: []pkgmodel.FilterCondition{
+			{PropertyPath: "$.ManagedByEks", PropertyValue: "true"},
+		},
+	}
+	ru := syncReadUpdate(ksuid, baseProps, readOnlyProps, []pkgmodel.MatchFilter{filter})
+
+	result := persister.Call(sender, resource_update.PersistResourceUpdate{
+		CommandID:         "readonly-evict-cmd",
+		ResourceOperation: resource_update.OperationRead,
+		PluginOperation:   resource.OperationRead,
+		ResourceUpdate:    ru,
+	})
+	require.NoError(t, result.Error)
+
+	remaining, loadErr := ds.LoadResourcesByStack("$unmanaged")
+	require.NoError(t, loadErr)
+	assert.Empty(t, remaining, "row must be evicted when filter matches a ReadOnly field")
+}
+
+// TestResourcePersister_SyncRead_EvictsWhenFilterMatchesPropertiesReadOnlyNil verifies that when
+// ReadOnlyProperties is nil (absent), matching against Properties alone still evicts.
+func TestResourcePersister_SyncRead_EvictsWhenFilterMatchesPropertiesReadOnlyNil(t *testing.T) {
+	persister, sender, ds, err := newResourcePersisterForTest(t)
+	require.NoError(t, err)
+
+	_, err = ds.CreateTarget(&pkgmodel.Target{Label: "test-target", Namespace: "aws"})
+	require.NoError(t, err)
+
+	ksuid := util.NewID()
+	props := json.RawMessage(`{"SkipMe":"yes"}`)
+	seedUnmanagedRow(t, ds, ksuid, props, false /* unmanaged */)
+
+	filter := pkgmodel.MatchFilter{
+		ResourceTypes: []string{"FakeAWS::EC2::Instance"},
+		Conditions: []pkgmodel.FilterCondition{
+			// Matches a field in Properties; ReadOnlyProperties is nil.
+			{PropertyPath: "$.SkipMe", PropertyValue: "yes"},
+		},
+	}
+	// No ReadOnlyProperties supplied.
+	ru := syncReadUpdate(ksuid, props, nil, []pkgmodel.MatchFilter{filter})
+
+	result := persister.Call(sender, resource_update.PersistResourceUpdate{
+		CommandID:         "no-readonly-cmd",
+		ResourceOperation: resource_update.OperationRead,
+		PluginOperation:   resource.OperationRead,
+		ResourceUpdate:    ru,
+	})
+	require.NoError(t, result.Error)
+
+	remaining, loadErr := ds.LoadResourcesByStack("$unmanaged")
+	require.NoError(t, loadErr)
+	assert.Empty(t, remaining, "row must be evicted when Properties match and ReadOnlyProperties is nil")
+}
+
+// TestResourcePersister_SyncRead_NoEvictionWithEmptyMatchFilters confirms that an
+// unmanaged row is never evicted when MatchFilters is nil (empty slice).
+func TestResourcePersister_SyncRead_NoEvictionWithEmptyMatchFilters(t *testing.T) {
+	persister, sender, ds, err := newResourcePersisterForTest(t)
+	require.NoError(t, err)
+
+	_, err = ds.CreateTarget(&pkgmodel.Target{Label: "test-target", Namespace: "aws"})
+	require.NoError(t, err)
+
+	ksuid := util.NewID()
+	props := json.RawMessage(`{"SkipMe":"yes"}`)
+	seedUnmanagedRow(t, ds, ksuid, props, false /* unmanaged */)
+
+	// No MatchFilters at all.
+	ru := syncReadUpdate(ksuid, props, nil, nil)
+
+	result := persister.Call(sender, resource_update.PersistResourceUpdate{
+		CommandID:         "no-filter-cmd",
+		ResourceOperation: resource_update.OperationRead,
+		PluginOperation:   resource.OperationRead,
+		ResourceUpdate:    ru,
+	})
+	require.NoError(t, result.Error)
+
+	// Row must survive (normal persist path).
+	loaded, loadErr := ds.LoadResource(ru.DesiredState.URI())
+	require.NoError(t, loadErr)
+	assert.NotNil(t, loaded, "unmanaged row must not be evicted when MatchFilters is empty")
+}
+
+// TestResourcePersister_SyncRead_NoEvictionWithEmptyConditions confirms that an
+// unmanaged row is never evicted when a filter has no conditions (empty Conditions slice).
+func TestResourcePersister_SyncRead_NoEvictionWithEmptyConditions(t *testing.T) {
+	persister, sender, ds, err := newResourcePersisterForTest(t)
+	require.NoError(t, err)
+
+	_, err = ds.CreateTarget(&pkgmodel.Target{Label: "test-target", Namespace: "aws"})
+	require.NoError(t, err)
+
+	ksuid := util.NewID()
+	props := json.RawMessage(`{"SkipMe":"yes"}`)
+	seedUnmanagedRow(t, ds, ksuid, props, false /* unmanaged */)
+
+	ru := syncReadUpdate(ksuid, props, nil, []pkgmodel.MatchFilter{
+		{ResourceTypes: []string{"FakeAWS::EC2::Instance"}, Conditions: nil},
+	})
+
+	result := persister.Call(sender, resource_update.PersistResourceUpdate{
+		CommandID:         "empty-cond-cmd",
+		ResourceOperation: resource_update.OperationRead,
+		PluginOperation:   resource.OperationRead,
+		ResourceUpdate:    ru,
+	})
+	require.NoError(t, result.Error)
+
+	loaded, loadErr := ds.LoadResource(ru.DesiredState.URI())
+	require.NoError(t, loadErr)
+	assert.NotNil(t, loaded, "unmanaged row must not be evicted when filter has no conditions")
+}
+
+// TestResourcePersister_ReadOfUnchangedSecretDoesNotDrift covers a resource whose
+// schema marks a field Opaque (secret). The stored row holds the hashed
+// representation (via ApplyToResource on Create). A subsequent sync Read that reads
+// back the SAME plaintext secret from the cloud must not be seen as drift: comparing
+// the freshly-hashed copy (secretSafeResource) against the stored hashed copy
+// (currentResource) must converge to equal, so no re-persist happens. Comparing the
+// stored hash against the raw plaintext DesiredState (as before this fix) would never
+// be equal and would re-persist on every sync.
+func TestResourcePersister_ReadOfUnchangedSecretDoesNotDrift(t *testing.T) {
+	persister, sender, ds, err := newResourcePersisterForTest(t)
+	require.NoError(t, err)
+
+	_, err = ds.CreateTarget(&pkgmodel.Target{Label: "test-target", Namespace: "aws"})
+	require.NoError(t, err)
+
+	resourceKsuid := util.NewID()
+	schema := pkgmodel.Schema{
+		Fields: []string{"Password"},
+		Hints: map[string]pkgmodel.FieldHint{
+			"Password": {Opaque: true},
+		},
+	}
+
+	createUpdate := resource_update.ResourceUpdate{
+		DesiredState: pkgmodel.Resource{
+			Label:      "secret-resource",
+			Type:       "FakeAWS::RDS::Instance",
+			Properties: json.RawMessage(`{"Password":"super-secret"}`),
+			Stack:      "test-stack",
+			Target:     "test-target",
+			Ksuid:      resourceKsuid,
+			NativeID:   "rds-1",
+			Schema:     schema,
+			Managed:    true,
+		},
+		ResourceTarget: pkgmodel.Target{Label: "test-target", Namespace: "aws"},
+		State:          resource_update.ResourceUpdateStateSuccess,
+		StackLabel:     "test-stack",
+		ProgressResult: []plugin.TrackedProgress{
+			{
+				ProgressResult: resource.ProgressResult{
+					Operation:          resource.OperationCreate,
+					OperationStatus:    resource.OperationStatusSuccess,
+					NativeID:           "rds-1",
+					ResourceProperties: json.RawMessage(`{"Password":"super-secret"}`),
+				},
+				ResourceType: "FakeAWS::RDS::Instance",
+				StartTs:      util.TimeNow(),
+				ModifiedTs:   util.TimeNow(),
+			},
+		},
+	}
+
+	createResult := persister.Call(sender, resource_update.PersistResourceUpdate{
+		CommandID:         "create-cmd",
+		ResourceOperation: resource_update.OperationCreate,
+		PluginOperation:   resource.OperationCreate,
+		ResourceUpdate:    createUpdate,
+	})
+	require.NoError(t, createResult.Error)
+	createHashRes, ok := createResult.Response.(resource_update.PersistResourceUpdateResult)
+	var createHash string
+	if ok {
+		createHash = createHashRes.Version
+	}
+	require.True(t, ok)
+	require.NotEmpty(t, createHash)
+
+	// Confirm the stored row is hashed, not plaintext.
+	stored, loadErr := ds.LoadResource(createUpdate.DesiredState.URI())
+	require.NoError(t, loadErr)
+	require.NotContains(t, string(stored.Properties), "super-secret",
+		"stored resource must hold the hashed secret, not the plaintext")
+
+	// A sync Read reports the SAME secret, as bare plaintext, straight from the cloud
+	// (this is what a real Read operation returns - the plugin has no notion of hashing).
+	readUpdate := resource_update.ResourceUpdate{
+		DesiredState: pkgmodel.Resource{
+			Label:      "secret-resource",
+			Type:       "FakeAWS::RDS::Instance",
+			Properties: json.RawMessage(`{"Password":"super-secret"}`),
+			Stack:      "test-stack",
+			Target:     "test-target",
+			Ksuid:      resourceKsuid,
+			NativeID:   "rds-1",
+			Schema:     schema,
+			Managed:    true,
+		},
+		ResourceTarget: pkgmodel.Target{Label: "test-target", Namespace: "aws"},
+		State:          resource_update.ResourceUpdateStateSuccess,
+		StackLabel:     "test-stack",
+		ProgressResult: []plugin.TrackedProgress{
+			{
+				ProgressResult: resource.ProgressResult{
+					Operation:          resource.OperationRead,
+					OperationStatus:    resource.OperationStatusSuccess,
+					NativeID:           "rds-1",
+					ResourceProperties: json.RawMessage(`{"Password":"super-secret"}`),
+				},
+				ResourceType: "FakeAWS::RDS::Instance",
+				StartTs:      util.TimeNow(),
+				ModifiedTs:   util.TimeNow(),
+			},
+		},
+	}
+
+	readResult := persister.Call(sender, resource_update.PersistResourceUpdate{
+		CommandID:         "sync-cmd",
+		ResourceOperation: resource_update.OperationRead,
+		PluginOperation:   resource.OperationRead,
+		ResourceUpdate:    readUpdate,
+	})
+	require.NoError(t, readResult.Error)
+	readHashRes, ok := readResult.Response.(resource_update.PersistResourceUpdateResult)
+	var readHash string
+	if ok {
+		readHash = readHashRes.Version
+	}
+	require.True(t, ok)
+	assert.Empty(t, readHash,
+		"a read-back of an unchanged secret must not be treated as drift and re-persisted")
+}
+
+// createPolicyStack creates a stack for the policy persistence tests and returns it
+// with its generated ID populated.
+func createPolicyStack(t *testing.T, ds datastore.Datastore, label string) *pkgmodel.Stack {
+	t.Helper()
+	stack := &pkgmodel.Stack{Label: label, Description: "policy persistence"}
+	_, err := ds.CreateStack(stack, "cmd-stack")
+	require.NoError(t, err)
+	require.NotEmpty(t, stack.ID)
+	return stack
+}
+
+// seedPolicy stores a policy directly into the datastore, bypassing the actor. A
+// policy carrying a stack ID is inline on that stack; one without is standalone.
+func seedPolicy(t *testing.T, ds datastore.Datastore, policy pkgmodel.Policy) {
+	t.Helper()
+	_, err := ds.CreatePolicy(policy, "cmd-seed")
+	require.NoError(t, err)
+}
+
+// TestResourcePersister_DeletesInlinePolicyLeavingStandaloneIntact covers an inline
+// policy delete on a stack that also has a same-labelled standalone policy attached:
+// the inline row is tombstoned and the standalone one is untouched.
+func TestResourcePersister_DeletesInlinePolicyLeavingStandaloneIntact(t *testing.T) {
+	persister, sender, ds, err := newResourcePersisterForTest(t)
+	require.NoError(t, err)
+
+	stack := createPolicyStack(t, ds, "inline-delete-stack")
+	seedPolicy(t, ds, &pkgmodel.TTLPolicy{
+		Label: "expiry", TTLSeconds: 86400, OnDependents: "cascade", StackID: stack.ID,
+	})
+	seedPolicy(t, ds, &pkgmodel.TTLPolicy{
+		Label: "expiry", TTLSeconds: 7200, OnDependents: "cascade",
+	})
+	require.NoError(t, ds.AttachPolicyToStack(stack.ID, "expiry"))
+
+	result := persister.Call(sender, policy_update.PersistPolicyUpdates{
+		CommandID: "cmd-delete",
+		PolicyUpdates: []policy_update.PolicyUpdate{
+			{
+				Operation:  policy_update.PolicyOperationDelete,
+				Policy:     &pkgmodel.TTLPolicy{Label: "expiry", TTLSeconds: 86400, OnDependents: "cascade"},
+				StackLabel: stack.Label,
+			},
+		},
+		StackIDMap: map[string]string{stack.Label: stack.ID},
+	})
+	require.NoError(t, result.Error)
+
+	inlinePolicies, err := ds.GetInlinePoliciesForStack(stack.ID)
+	require.NoError(t, err)
+	assert.Empty(t, inlinePolicies, "the inline policy must be tombstoned")
+
+	standalone, err := ds.GetStandalonePolicy("expiry")
+	require.NoError(t, err)
+	assert.NotNil(t, standalone, "the standalone policy sharing the label must survive an inline delete")
+}
+
+// TestResourcePersister_DeletesStandalonePolicyLeavingInlineIntact is the mirror
+// case: a delete without a stack label stays scoped to the standalone row.
+func TestResourcePersister_DeletesStandalonePolicyLeavingInlineIntact(t *testing.T) {
+	persister, sender, ds, err := newResourcePersisterForTest(t)
+	require.NoError(t, err)
+
+	stack := createPolicyStack(t, ds, "standalone-delete-stack")
+	seedPolicy(t, ds, &pkgmodel.TTLPolicy{
+		Label: "expiry", TTLSeconds: 86400, OnDependents: "cascade", StackID: stack.ID,
+	})
+	seedPolicy(t, ds, &pkgmodel.TTLPolicy{
+		Label: "expiry", TTLSeconds: 7200, OnDependents: "cascade",
+	})
+
+	result := persister.Call(sender, policy_update.PersistPolicyUpdates{
+		CommandID: "cmd-delete",
+		PolicyUpdates: []policy_update.PolicyUpdate{
+			{
+				Operation: policy_update.PolicyOperationDelete,
+				Policy:    &pkgmodel.TTLPolicy{Label: "expiry", TTLSeconds: 7200, OnDependents: "cascade"},
+			},
+		},
+		StackIDMap: map[string]string{stack.Label: stack.ID},
+	})
+	require.NoError(t, result.Error)
+
+	standalone, err := ds.GetStandalonePolicy("expiry")
+	require.NoError(t, err)
+	assert.Nil(t, standalone, "the standalone policy must be tombstoned")
+
+	inlinePolicies, err := ds.GetInlinePoliciesForStack(stack.ID)
+	require.NoError(t, err)
+	assert.Len(t, inlinePolicies, 1, "the inline policy sharing the label must survive a standalone delete")
+}
+
+// TestResourcePersister_InlinePolicyDeleteFailsWithoutStackID pins the destructive
+// branch: an inline delete whose stack label cannot be resolved fails instead of
+// falling through to a differently scoped delete.
+func TestResourcePersister_InlinePolicyDeleteFailsWithoutStackID(t *testing.T) {
+	persister, sender, ds, err := newResourcePersisterForTest(t)
+	require.NoError(t, err)
+
+	stack := createPolicyStack(t, ds, "unmapped-stack")
+	seedPolicy(t, ds, &pkgmodel.TTLPolicy{
+		Label: "expiry", TTLSeconds: 86400, OnDependents: "cascade", StackID: stack.ID,
+	})
+
+	result := persister.Call(sender, policy_update.PersistPolicyUpdates{
+		CommandID: "cmd-delete",
+		PolicyUpdates: []policy_update.PolicyUpdate{
+			{
+				Operation:  policy_update.PolicyOperationDelete,
+				Policy:     &pkgmodel.TTLPolicy{Label: "expiry", TTLSeconds: 86400, OnDependents: "cascade"},
+				StackLabel: stack.Label,
+			},
+		},
+		StackIDMap: map[string]string{},
+	})
+	require.NoError(t, result.Error, "the failed delete must be answered, not terminate the persister")
+	failedReply, ok := result.Response.(messages.PersistVersionsResult)
+	require.True(t, ok, "expected a typed persist reply, got %T", result.Response)
+	require.NotEmpty(t, failedReply.Error, "an inline delete without a resolvable stack ID must fail")
+
+	inlinePolicies, err := ds.GetInlinePoliciesForStack(stack.ID)
+	require.NoError(t, err)
+	assert.Len(t, inlinePolicies, 1, "a failed inline delete must leave the policy in place")
+}
+
+// TestResourcePersister_InlineAutoReconcileDeleteNotifiesAutoReconciler covers the
+// last auto-reconcile policy of a stack being deleted: the AutoReconciler is told to
+// drop the stack's schedule.
+func TestResourcePersister_InlineAutoReconcileDeleteNotifiesAutoReconciler(t *testing.T) {
+	persister, sender, ds, err := newResourcePersisterForTest(t)
+	require.NoError(t, err)
+
+	stack := createPolicyStack(t, ds, "auto-reconcile-stack")
+	seedPolicy(t, ds, &pkgmodel.AutoReconcilePolicy{
+		Label: "inline-reconcile", IntervalSeconds: 300, StackID: stack.ID,
+	})
+
+	result := persister.Call(sender, policy_update.PersistPolicyUpdates{
+		CommandID: "cmd-delete",
+		PolicyUpdates: []policy_update.PolicyUpdate{
+			{
+				Operation:  policy_update.PolicyOperationDelete,
+				Policy:     &pkgmodel.AutoReconcilePolicy{Label: "inline-reconcile", IntervalSeconds: 300},
+				StackLabel: stack.Label,
+			},
+		},
+		StackIDMap: map[string]string{stack.Label: stack.ID},
+	})
+	require.NoError(t, result.Error)
+
+	persister.ShouldSend().
+		Message(messages.PolicyRemoved{StackLabel: stack.Label}).
+		Once().
+		Assert()
+}
+
+// TestResourcePersister_InlineAutoReconcileDeleteKeepsScheduleWhenStandaloneRemains
+// covers a stack carrying both an inline and an attached standalone auto-reconcile
+// policy: deleting the inline one leaves the stack auto-reconciled, so the
+// AutoReconciler must not be told to drop its schedule.
+func TestResourcePersister_InlineAutoReconcileDeleteKeepsScheduleWhenStandaloneRemains(t *testing.T) {
+	persister, sender, ds, err := newResourcePersisterForTest(t)
+	require.NoError(t, err)
+
+	stack := createPolicyStack(t, ds, "shared-reconcile-stack")
+	seedPolicy(t, ds, &pkgmodel.AutoReconcilePolicy{
+		Label: "inline-reconcile", IntervalSeconds: 300, StackID: stack.ID,
+	})
+	seedPolicy(t, ds, &pkgmodel.AutoReconcilePolicy{Label: "shared-reconcile", IntervalSeconds: 600})
+	require.NoError(t, ds.AttachPolicyToStack(stack.ID, "shared-reconcile"))
+
+	result := persister.Call(sender, policy_update.PersistPolicyUpdates{
+		CommandID: "cmd-delete",
+		PolicyUpdates: []policy_update.PolicyUpdate{
+			{
+				Operation:  policy_update.PolicyOperationDelete,
+				Policy:     &pkgmodel.AutoReconcilePolicy{Label: "inline-reconcile", IntervalSeconds: 300},
+				StackLabel: stack.Label,
+			},
+		},
+		StackIDMap: map[string]string{stack.Label: stack.ID},
+	})
+	require.NoError(t, result.Error)
+
+	inlinePolicies, err := ds.GetInlinePoliciesForStack(stack.ID)
+	require.NoError(t, err)
+	require.Empty(t, inlinePolicies, "the inline policy must be tombstoned")
+
+	persister.ShouldNotSend().
+		Message(messages.PolicyRemoved{StackLabel: stack.Label}).
+		Assert()
+}
+
+// TestResourcePersister_DetachKeepsScheduleWhenInlineAutoReconcileRemains covers the
+// same invariant on the detach path: detaching a standalone auto-reconcile policy
+// from a stack that also declares an inline one must not drop the schedule.
+func TestResourcePersister_DetachKeepsScheduleWhenInlineAutoReconcileRemains(t *testing.T) {
+	persister, sender, ds, err := newResourcePersisterForTest(t)
+	require.NoError(t, err)
+
+	stack := createPolicyStack(t, ds, "detach-shared-stack")
+	seedPolicy(t, ds, &pkgmodel.AutoReconcilePolicy{
+		Label: "inline-reconcile", IntervalSeconds: 300, StackID: stack.ID,
+	})
+	seedPolicy(t, ds, &pkgmodel.AutoReconcilePolicy{Label: "shared-reconcile", IntervalSeconds: 600})
+	require.NoError(t, ds.AttachPolicyToStack(stack.ID, "shared-reconcile"))
+
+	result := persister.Call(sender, policy_update.PersistPolicyUpdates{
+		CommandID: "cmd-detach",
+		PolicyUpdates: []policy_update.PolicyUpdate{
+			{
+				Operation:  policy_update.PolicyOperationDetach,
+				PolicyRef:  "shared-reconcile",
+				StackLabel: stack.Label,
+			},
+		},
+		StackIDMap: map[string]string{stack.Label: stack.ID},
+	})
+	require.NoError(t, result.Error)
+
+	attached, err := ds.IsPolicyAttachedToStack(stack.Label, "shared-reconcile")
+	require.NoError(t, err)
+	require.False(t, attached, "the standalone policy must be detached")
+
+	persister.ShouldNotSend().
+		Message(messages.PolicyRemoved{StackLabel: stack.Label}).
+		Assert()
+}
+
+// TestResourcePersister_DetachNotifiesAutoReconcilerWhenNoPolicyRemains keeps the
+// detach notification alive for the case it was written for: the detached policy was
+// the stack's only auto-reconcile policy.
+func TestResourcePersister_DetachNotifiesAutoReconcilerWhenNoPolicyRemains(t *testing.T) {
+	persister, sender, ds, err := newResourcePersisterForTest(t)
+	require.NoError(t, err)
+
+	stack := createPolicyStack(t, ds, "detach-only-stack")
+	seedPolicy(t, ds, &pkgmodel.AutoReconcilePolicy{Label: "shared-reconcile", IntervalSeconds: 600})
+	require.NoError(t, ds.AttachPolicyToStack(stack.ID, "shared-reconcile"))
+
+	result := persister.Call(sender, policy_update.PersistPolicyUpdates{
+		CommandID: "cmd-detach",
+		PolicyUpdates: []policy_update.PolicyUpdate{
+			{
+				Operation:  policy_update.PolicyOperationDetach,
+				PolicyRef:  "shared-reconcile",
+				StackLabel: stack.Label,
+			},
+		},
+		StackIDMap: map[string]string{stack.Label: stack.ID},
+	})
+	require.NoError(t, result.Error)
+
+	persister.ShouldSend().
+		Message(messages.PolicyRemoved{StackLabel: stack.Label}).
+		Once().
+		Assert()
+}
+
+// createGeneratorStack creates a stack for the generator persister tests and
+// returns it with its generated ID populated.
+func createGeneratorStack(t *testing.T, ds datastore.Datastore, label string) *pkgmodel.Stack {
+	t.Helper()
+	stack := &pkgmodel.Stack{Label: label, Description: "generator persistence"}
+	_, err := ds.CreateStack(stack, "cmd-stack")
+	require.NoError(t, err)
+	require.NotEmpty(t, stack.ID)
+	return stack
+}
+
+// TestResourcePersister_CreateGenerator covers a bare create: the stack label
+// is resolved to its KSUID from StackIDMap and set on the generator with
+// SetStackID before the datastore write, exactly as the policy path does.
+func TestResourcePersister_CreateGenerator(t *testing.T) {
+	persister, sender, ds, err := newResourcePersisterForTest(t)
+	require.NoError(t, err)
+
+	stack := createGeneratorStack(t, ds, "generator-create-stack")
+
+	result := persister.Call(sender, generator_update.PersistGeneratorUpdates{
+		CommandID: "cmd-create",
+		GeneratorUpdates: []generator_update.GeneratorUpdate{
+			{
+				Operation: generator_update.GeneratorOperationCreate,
+				Generator: &pkgmodel.PasswordGenerator{
+					Label: "db-password", Stack: stack.Label,
+					Length: 24, Uppercase: true, Lowercase: true, Digits: true, RequireEachIncludedType: true,
+				},
+				StackLabel: stack.Label,
+			},
+		},
+		StackIDMap: map[string]string{stack.Label: stack.ID},
+	})
+	require.NoError(t, result.Error)
+
+	got, err := ds.GetGenerator("db-password", stack.Label)
+	require.NoError(t, err)
+	require.NotNil(t, got, "the generator must be retrievable under the resolved stack KSUID")
+	assert.Equal(t, "db-password", got.GetLabel())
+}
+
+// TestResourcePersister_CreateGeneratorFailsWithoutStackID pins that a
+// generator update whose stack label is absent from StackIDMap fails rather
+// than being written with an empty stack_id — a generator has no standalone
+// form, so there is no fallback scope to write it to.
+func TestResourcePersister_CreateGeneratorFailsWithoutStackID(t *testing.T) {
+	persister, sender, _, err := newResourcePersisterForTest(t)
+	require.NoError(t, err)
+
+	result := persister.Call(sender, generator_update.PersistGeneratorUpdates{
+		CommandID: "cmd-create",
+		GeneratorUpdates: []generator_update.GeneratorUpdate{
+			{
+				Operation:  generator_update.GeneratorOperationCreate,
+				Generator:  &pkgmodel.PasswordGenerator{Label: "db-password", Stack: "unmapped-stack", Length: 24},
+				StackLabel: "unmapped-stack",
+			},
+		},
+		StackIDMap: map[string]string{},
+	})
+	require.NoError(t, result.Error, "a failed generator write must be answered, not terminate the persister")
+	failed, ok := result.Response.(messages.PersistVersionsResult)
+	require.True(t, ok, "the caller must receive a typed reply, got %T", result.Response)
+	require.NotEmpty(t, failed.Error)
+}
+
+// TestResourcePersister_UpdateGenerator covers an in-place spec change: the
+// existing row's KSUID identity is preserved (checked via GetGenerator
+// reading back the updated spec, since the datastore's version bump is the
+// observable proxy for "the row was updated, not recreated" at this layer).
+func TestResourcePersister_UpdateGenerator(t *testing.T) {
+	persister, sender, ds, err := newResourcePersisterForTest(t)
+	require.NoError(t, err)
+
+	stack := createGeneratorStack(t, ds, "generator-update-stack")
+	_, err = ds.CreateGenerator(&pkgmodel.PasswordGenerator{
+		Label: "db-password", Stack: stack.Label, StackID: stack.ID, Length: 24,
+	}, "cmd-seed")
+	require.NoError(t, err)
+
+	result := persister.Call(sender, generator_update.PersistGeneratorUpdates{
+		CommandID: "cmd-update",
+		GeneratorUpdates: []generator_update.GeneratorUpdate{
+			{
+				Operation:  generator_update.GeneratorOperationUpdate,
+				Generator:  &pkgmodel.PasswordGenerator{Label: "db-password", Stack: stack.Label, Length: 32},
+				StackLabel: stack.Label,
+			},
+		},
+		StackIDMap: map[string]string{stack.Label: stack.ID},
+	})
+	require.NoError(t, result.Error)
+
+	got, err := ds.GetGenerator("db-password", stack.Label)
+	require.NoError(t, err)
+	require.NotNil(t, got)
+	pw, ok := got.(*pkgmodel.PasswordGenerator)
+	require.True(t, ok)
+	assert.Equal(t, 32, pw.Length, "the read-back generator must reflect the update")
+}
+
+// TestResourcePersister_DeleteGenerator covers a delete: DeleteGenerator is
+// scoped by label and stack label directly, with no StackIDMap resolution
+// needed (unlike Create/Update, which write gen.SetStackID onto the
+// generator itself).
+func TestResourcePersister_DeleteGenerator(t *testing.T) {
+	persister, sender, ds, err := newResourcePersisterForTest(t)
+	require.NoError(t, err)
+
+	stack := createGeneratorStack(t, ds, "generator-delete-stack")
+	_, err = ds.CreateGenerator(&pkgmodel.PasswordGenerator{
+		Label: "temp-secret", Stack: stack.Label, StackID: stack.ID, Length: 20,
+	}, "cmd-seed")
+	require.NoError(t, err)
+
+	result := persister.Call(sender, generator_update.PersistGeneratorUpdates{
+		CommandID: "cmd-delete",
+		GeneratorUpdates: []generator_update.GeneratorUpdate{
+			{
+				Operation:  generator_update.GeneratorOperationDelete,
+				Generator:  &pkgmodel.PasswordGenerator{Label: "temp-secret", Stack: stack.Label},
+				StackLabel: stack.Label,
+			},
+		},
+	})
+	require.NoError(t, result.Error)
+
+	got, err := ds.GetGenerator("temp-secret", stack.Label)
+	require.NoError(t, err)
+	assert.Nil(t, got, "the deleted generator must no longer be live")
+}
+
+// persistCreateForTest stores a resource through the persister the way a
+// successful create does, so a test can seed the record at a given NativeID.
+func persistCreateForTest(t *testing.T, persister *unit.TestActor, sender gen.PID, res pkgmodel.Resource, commandID string) {
+	t.Helper()
+
+	result := persister.Call(sender, resource_update.PersistResourceUpdate{
+		CommandID:         commandID,
+		ResourceOperation: resource_update.OperationCreate,
+		PluginOperation:   resource.OperationCreate,
+		ResourceUpdate: resource_update.ResourceUpdate{
+			DesiredState:   res,
+			ResourceTarget: pkgmodel.Target{Label: "test-target", Namespace: "test-namespace"},
+			State:          resource_update.ResourceUpdateStateSuccess,
+			StackLabel:     res.Stack,
+			ProgressResult: []plugin.TrackedProgress{
+				{
+					ProgressResult: resource.ProgressResult{
+						Operation:          resource.OperationCreate,
+						OperationStatus:    resource.OperationStatusSuccess,
+						NativeID:           res.NativeID,
+						ResourceProperties: res.Properties,
+					},
+					ResourceType: res.Type,
+					StartTs:      util.TimeNow(),
+					ModifiedTs:   util.TimeNow(),
+					Attempts:     1,
+				},
+			},
+		},
+	})
+	require.NoError(t, result.Error)
+}
+
+// syncReadNotFoundForTest builds the ResourceUpdate a sync cycle produces for a
+// resource whose Read came back NotFound. generatedFrom is the record as it
+// stood when the sync planned the read; probedNativeID is the id the Read
+// actually asked the plugin about, which the ResourceUpdater copies onto
+// DesiredState from the progress before the persist call.
+func syncReadNotFoundForTest(generatedFrom pkgmodel.Resource, probedNativeID string) resource_update.ResourceUpdate {
+	desired := generatedFrom
+	desired.NativeID = probedNativeID
+
+	return resource_update.ResourceUpdate{
+		PriorState:         generatedFrom,
+		DesiredState:       desired,
+		ResourceTarget:     pkgmodel.Target{Label: "test-target", Namespace: "test-namespace"},
+		Operation:          resource_update.OperationRead,
+		State:              resource_update.ResourceUpdateStateSuccess,
+		Source:             resource_update.FormaCommandSourceSynchronize,
+		StackLabel:         generatedFrom.Stack,
+		PreviousProperties: generatedFrom.Properties,
+		ProgressResult: []plugin.TrackedProgress{
+			{
+				ProgressResult: resource.ProgressResult{
+					Operation:       resource.OperationRead,
+					OperationStatus: resource.OperationStatusSuccess,
+					ErrorCode:       resource.OperationErrorCodeNotFound,
+					NativeID:        probedNativeID,
+				},
+				ResourceType: generatedFrom.Type,
+				StartTs:      util.TimeNow(),
+				ModifiedTs:   util.TimeNow(),
+				Attempts:     1,
+			},
+		},
+	}
+}
+
+func TestResourcePersister_StaleSyncReadDoesNotDeleteMovedRecord(t *testing.T) {
+	persister, sender, ds, err := newResourcePersisterForTest(t)
+	require.NoError(t, err)
+
+	ksuid := util.NewID()
+
+	// The record as the sync cycle saw it when it planned its read.
+	atRevision4 := pkgmodel.Resource{
+		Label:      "task-def",
+		Type:       "FakeAWS::ECS::TaskDefinition",
+		Stack:      "test-stack",
+		Ksuid:      ksuid,
+		Managed:    true,
+		NativeID:   "arn:task-definition/app:4",
+		Properties: json.RawMessage(`{"memory":"512"}`),
+	}
+	persistCreateForTest(t, persister, sender, atRevision4, "cmd-plan")
+
+	// The snapshot the sync plans from, taken off the stored record the way
+	// the generator takes it.
+	generatedFrom, err := ds.LoadResource(atRevision4.URI())
+	require.NoError(t, err)
+	require.NotNil(t, generatedFrom)
+
+	// An apply replaces the resource; the record now points at :5 and the
+	// cloud has deregistered :4.
+	atRevision5 := atRevision4
+	atRevision5.NativeID = "arn:task-definition/app:5"
+	atRevision5.Properties = json.RawMessage(`{"memory":"1024"}`)
+	persistCreateForTest(t, persister, sender, atRevision5, "cmd-apply")
+
+	// The sync's queued read finally runs, against the deregistered :4.
+	result := persister.Call(sender, resource_update.PersistResourceUpdate{
+		CommandID:         "cmd-sync",
+		ResourceOperation: resource_update.OperationRead,
+		PluginOperation:   resource.OperationRead,
+		ResourceUpdate:    syncReadNotFoundForTest(*generatedFrom, "arn:task-definition/app:4"),
+	})
+	require.NoError(t, result.Error)
+
+	resources, err := ds.LoadResourcesByStack("test-stack")
+	require.NoError(t, err)
+	require.Len(t, resources, 1, "a NotFound read of an identity the record has moved past must not delete it")
+	assert.Equal(t, "arn:task-definition/app:5", resources[0].NativeID)
+}
+
+func TestResourcePersister_SyncReadNotFoundDeletesUnchangedRecord(t *testing.T) {
+	persister, sender, ds, err := newResourcePersisterForTest(t)
+	require.NoError(t, err)
+
+	current := pkgmodel.Resource{
+		Label:      "task-def",
+		Type:       "FakeAWS::ECS::TaskDefinition",
+		Stack:      "test-stack",
+		Ksuid:      util.NewID(),
+		Managed:    true,
+		NativeID:   "arn:task-definition/app:5",
+		Properties: json.RawMessage(`{"memory":"1024"}`),
+	}
+	persistCreateForTest(t, persister, sender, current, "cmd-apply")
+
+	generatedFrom, err := ds.LoadResource(current.URI())
+	require.NoError(t, err)
+	require.NotNil(t, generatedFrom)
+
+	// The resource was deleted out of band: the sync planned against the
+	// current record, nothing has rewritten it since, and its read of that
+	// same identity came back NotFound.
+	result := persister.Call(sender, resource_update.PersistResourceUpdate{
+		CommandID:         "cmd-sync",
+		ResourceOperation: resource_update.OperationRead,
+		PluginOperation:   resource.OperationRead,
+		ResourceUpdate:    syncReadNotFoundForTest(*generatedFrom, "arn:task-definition/app:5"),
+	})
+	require.NoError(t, result.Error)
+
+	resources, err := ds.LoadResourcesByStack("test-stack")
+	require.NoError(t, err)
+	assert.Empty(t, resources, "an out-of-band delete must still be absorbed")
+}
+
+func TestResourcePersister_StaleSyncReadDoesNotDeleteRecordChangedUnderSameNativeID(t *testing.T) {
+	persister, sender, ds, err := newResourcePersisterForTest(t)
+	require.NoError(t, err)
+
+	// A resource whose identity is a stable name, so a replace recreates it
+	// under the same NativeID.
+	asPlanned := pkgmodel.Resource{
+		Label:      "assets-bucket",
+		Type:       "FakeAWS::S3::Bucket",
+		Stack:      "test-stack",
+		Ksuid:      util.NewID(),
+		Managed:    true,
+		NativeID:   "assets-bucket",
+		Properties: json.RawMessage(`{"versioning":"Suspended"}`),
+	}
+	persistCreateForTest(t, persister, sender, asPlanned, "cmd-plan")
+
+	generatedFrom, err := ds.LoadResource(asPlanned.URI())
+	require.NoError(t, err)
+	require.NotNil(t, generatedFrom)
+
+	// An apply rewrites the record under that same identity.
+	rewritten := asPlanned
+	rewritten.Properties = json.RawMessage(`{"versioning":"Enabled"}`)
+	persistCreateForTest(t, persister, sender, rewritten, "cmd-apply")
+
+	// The sync's queued read runs against the snapshot it planned from.
+	result := persister.Call(sender, resource_update.PersistResourceUpdate{
+		CommandID:         "cmd-sync",
+		ResourceOperation: resource_update.OperationRead,
+		PluginOperation:   resource.OperationRead,
+		ResourceUpdate:    syncReadNotFoundForTest(*generatedFrom, "assets-bucket"),
+	})
+	require.NoError(t, result.Error)
+
+	resources, err := ds.LoadResourcesByStack("test-stack")
+	require.NoError(t, err)
+	require.Len(t, resources, 1, "a NotFound read must not delete a record rewritten since the read was planned")
+}
+
+// persistDeleteForTest tombstones a resource through the persister the way a
+// successful cloud delete does.
+func persistDeleteForTest(t *testing.T, persister *unit.TestActor, sender gen.PID, res pkgmodel.Resource, commandID string) {
+	t.Helper()
+
+	result := persister.Call(sender, resource_update.PersistResourceUpdate{
+		CommandID:         commandID,
+		ResourceOperation: resource_update.OperationDelete,
+		PluginOperation:   resource.OperationDelete,
+		ResourceUpdate: resource_update.ResourceUpdate{
+			DesiredState:   res,
+			ResourceTarget: pkgmodel.Target{Label: "test-target", Namespace: "test-namespace"},
+			State:          resource_update.ResourceUpdateStateSuccess,
+			StackLabel:     res.Stack,
+			ProgressResult: []plugin.TrackedProgress{
+				{
+					ProgressResult: resource.ProgressResult{
+						Operation:       resource.OperationDelete,
+						OperationStatus: resource.OperationStatusSuccess,
+						NativeID:        res.NativeID,
+					},
+					ResourceType: res.Type,
+					StartTs:      util.TimeNow(),
+					ModifiedTs:   util.TimeNow(),
+					Attempts:     1,
+				},
+			},
+		},
+	})
+	require.NoError(t, result.Error)
+}
+
+func TestResourcePersister_StaleSyncReadDoesNotDeleteContentIdenticalRecreation(t *testing.T) {
+	persister, sender, ds, err := newResourcePersisterForTest(t)
+	require.NoError(t, err)
+
+	// A resource whose identity is a stable name, so a replace recreates it
+	// under the same NativeID with byte-identical stored properties.
+	res := pkgmodel.Resource{
+		Label:      "assets-bucket",
+		Type:       "FakeAWS::S3::Bucket",
+		Stack:      "test-stack",
+		Ksuid:      util.NewID(),
+		Managed:    true,
+		NativeID:   "assets-bucket",
+		Properties: json.RawMessage(`{"versioning":"Enabled"}`),
+	}
+	persistCreateForTest(t, persister, sender, res, "cmd-initial")
+
+	// The snapshot the sync cycle plans from, taken through the same loader
+	// the sync generator uses (LoadResourcesByStack), not a more convenient
+	// one — the guard is only real if it works on that path.
+	byStack, err := ds.LoadResourcesByStack("test-stack")
+	require.NoError(t, err)
+	require.Len(t, byStack, 1)
+	generatedFrom := byStack[0]
+	require.NotEmpty(t, generatedFrom.Version, "the sync generator's loader must supply the row version")
+
+	// A target-driven replace destroys and recreates the resource with
+	// identical content, so neither the identity nor the properties change.
+	persistDeleteForTest(t, persister, sender, res, "cmd-replace")
+	persistCreateForTest(t, persister, sender, res, "cmd-replace")
+
+	result := persister.Call(sender, resource_update.PersistResourceUpdate{
+		CommandID:         "cmd-sync",
+		ResourceOperation: resource_update.OperationRead,
+		PluginOperation:   resource.OperationRead,
+		ResourceUpdate:    syncReadNotFoundForTest(*generatedFrom, "assets-bucket"),
+	})
+	require.NoError(t, result.Error)
+
+	resources, err := ds.LoadResourcesByStack("test-stack")
+	require.NoError(t, err)
+	require.Len(t, resources, 1, "a NotFound read must not delete a record recreated since the read was planned, even when the recreation is content-identical")
+}
+
+func TestResourcePersister_StaleSyncReadDoesNotDeleteWhenSnapshotVersionIsUnknown(t *testing.T) {
+	persister, sender, ds, err := newResourcePersisterForTest(t)
+	require.NoError(t, err)
+
+	atRevision4 := pkgmodel.Resource{
+		Label:      "task-def",
+		Type:       "FakeAWS::ECS::TaskDefinition",
+		Stack:      "test-stack",
+		Ksuid:      util.NewID(),
+		Managed:    true,
+		NativeID:   "arn:task-definition/app:4",
+		Properties: json.RawMessage(`{"memory":"512"}`),
+	}
+	persistCreateForTest(t, persister, sender, atRevision4, "cmd-plan")
+
+	atRevision5 := atRevision4
+	atRevision5.NativeID = "arn:task-definition/app:5"
+	persistCreateForTest(t, persister, sender, atRevision5, "cmd-apply")
+
+	// A command resumed after an agent restart rebuilds its updates from the
+	// serialized snapshot, which does not carry the row version. The guard
+	// cannot tell whether the record moved, and must not gamble on it.
+	resumed := syncReadNotFoundForTest(atRevision4, "arn:task-definition/app:4")
+	require.Empty(t, resumed.PriorState.Version)
+
+	result := persister.Call(sender, resource_update.PersistResourceUpdate{
+		CommandID:         "cmd-sync-resumed",
+		ResourceOperation: resource_update.OperationRead,
+		PluginOperation:   resource.OperationRead,
+		ResourceUpdate:    resumed,
+	})
+	require.NoError(t, result.Error)
+
+	resources, err := ds.LoadResourcesByStack("test-stack")
+	require.NoError(t, err)
+	require.Len(t, resources, 1, "an unknown snapshot version must not be read as unchanged")
+}
+
+// loadResourceFlakyDatastore fails the next LoadResource for one URI a single
+// time and serves every other call from the real datastore, reproducing a
+// transient lookup failure.
+type loadResourceFlakyDatastore struct {
+	datastore.Datastore
+	failURI pkgmodel.FormaeURI
+	armed   bool
+	// hide makes the single armed call report the row as absent rather than
+	// failing, which is what a reaped row looks like to LoadResource.
+	hide bool
+}
+
+func (d *loadResourceFlakyDatastore) LoadResource(uri pkgmodel.FormaeURI) (*pkgmodel.Resource, error) {
+	if d.armed && uri == d.failURI {
+		d.armed = false
+		if d.hide {
+			return nil, nil
+		}
+		return nil, errors.New("transient datastore failure")
+	}
+	return d.Datastore.LoadResource(uri)
+}
+
+func TestResourcePersister_StaleSyncReadDoesNotDeleteAfterReadOnlyRewrite(t *testing.T) {
+	persister, sender, ds, err := newResourcePersisterForTest(t)
+	require.NoError(t, err)
+
+	res := pkgmodel.Resource{
+		Label:              "task-def",
+		Type:               "FakeAWS::ECS::TaskDefinition",
+		Stack:              "test-stack",
+		Ksuid:              util.NewID(),
+		Managed:            true,
+		NativeID:           "arn:task-definition/app:4",
+		Properties:         json.RawMessage(`{"memory":"512"}`),
+		ReadOnlyProperties: json.RawMessage(`{"status":"ACTIVE"}`),
+	}
+	persistCreateForTest(t, persister, sender, res, "cmd-plan")
+
+	byStack, err := ds.LoadResourcesByStack("test-stack")
+	require.NoError(t, err)
+	require.Len(t, byStack, 1)
+	generatedFrom := byStack[0]
+	require.NotEmpty(t, generatedFrom.Version)
+
+	// Another command refreshes only read-only state. The datastore rewrites
+	// that row in place and deliberately reuses its version, so the version
+	// alone cannot witness this rewrite.
+	refreshed := res
+	refreshed.ReadOnlyProperties = json.RawMessage(`{"status":"INACTIVE"}`)
+	persistCreateForTest(t, persister, sender, refreshed, "cmd-refresh")
+
+	afterRefresh, err := ds.LoadResourcesByStack("test-stack")
+	require.NoError(t, err)
+	require.Len(t, afterRefresh, 1)
+	require.Equal(t, generatedFrom.Version, afterRefresh[0].Version,
+		"premise: a read-only-only rewrite reuses the row version")
+
+	result := persister.Call(sender, resource_update.PersistResourceUpdate{
+		CommandID:         "cmd-sync",
+		ResourceOperation: resource_update.OperationRead,
+		PluginOperation:   resource.OperationRead,
+		ResourceUpdate:    syncReadNotFoundForTest(*generatedFrom, "arn:task-definition/app:4"),
+	})
+	require.NoError(t, result.Error)
+
+	resources, err := ds.LoadResourcesByStack("test-stack")
+	require.NoError(t, err)
+	require.Len(t, resources, 1, "a record rewritten since the read was planned must survive, even when the rewrite reused the version")
+}
+
+func TestResourcePersister_DiscoveryReadNotFoundStillDeletesOrphanedRow(t *testing.T) {
+	persister, sender, ds, err := newResourcePersisterForTest(t)
+	require.NoError(t, err)
+
+	orphan := pkgmodel.Resource{
+		Label:      "orphan",
+		Type:       "FakeAWS::S3::Bucket",
+		Stack:      "test-stack",
+		Ksuid:      util.NewID(),
+		Managed:    true,
+		NativeID:   "orphan-bucket",
+		Properties: json.RawMessage(`{"versioning":"Enabled"}`),
+	}
+	persistCreateForTest(t, persister, sender, orphan, "cmd-create")
+
+	// Discovery builds its updates straight from the forma rather than from a
+	// loaded row, so they carry no row version. The sentinel-target path relies
+	// on that NotFound to clean up a row whose target is gone, so an absent
+	// version must not be read as staleness here.
+	update := syncReadNotFoundForTest(orphan, "orphan-bucket")
+	update.Source = resource_update.FormaCommandSourceDiscovery
+	require.Empty(t, update.PriorState.Version)
+
+	result := persister.Call(sender, resource_update.PersistResourceUpdate{
+		CommandID:         "cmd-discovery",
+		ResourceOperation: resource_update.OperationRead,
+		PluginOperation:   resource.OperationRead,
+		ResourceUpdate:    update,
+	})
+	require.NoError(t, result.Error)
+
+	resources, err := ds.LoadResourcesByStack("test-stack")
+	require.NoError(t, err)
+	require.Empty(t, resources, "discovery must still be able to clean up an orphaned row")
+}
+
+func TestResourcePersister_StaleReadGuardFailsClosedWhenLiveRowIsHidden(t *testing.T) {
+	realDatastore, err := newTestDatastore()
+	require.NoError(t, err)
+
+	flaky := &loadResourceFlakyDatastore{Datastore: realDatastore, hide: true}
+	persister, sender, err := newResourcePersisterWithDatastore(t, flaky)
+	require.NoError(t, err)
+
+	res := pkgmodel.Resource{
+		Label:      "task-def",
+		Type:       "FakeAWS::ECS::TaskDefinition",
+		Stack:      "test-stack",
+		Ksuid:      util.NewID(),
+		Managed:    true,
+		NativeID:   "arn:task-definition/app:4",
+		Properties: json.RawMessage(`{"memory":"512"}`),
+	}
+	persistCreateForTest(t, persister, sender, res, "cmd-plan")
+
+	generatedFrom, err := realDatastore.LoadResource(res.URI())
+	require.NoError(t, err)
+	require.NotNil(t, generatedFrom)
+
+	// The staleness lookup sees no live row, as it would for a row hidden by
+	// reaping, while the delete path's own lookup still finds one. Without a
+	// guard the tombstone lands and shadows a row that recovery could have
+	// restored.
+	flaky.failURI = res.URI()
+	flaky.armed = true
+
+	result := persister.Call(sender, resource_update.PersistResourceUpdate{
+		CommandID:         "cmd-sync",
+		ResourceOperation: resource_update.OperationRead,
+		PluginOperation:   resource.OperationRead,
+		ResourceUpdate:    syncReadNotFoundForTest(*generatedFrom, "arn:task-definition/app:4"),
+	})
+	require.NoError(t, result.Error)
+
+	resources, err := realDatastore.LoadResourcesByStack("test-stack")
+	require.NoError(t, err)
+	require.Len(t, resources, 1, "a staleness lookup that finds no live row must not let the delete through")
+}
+
+func newResourcePersisterWithDatastore(t *testing.T, ds datastore.Datastore) (*unit.TestActor, gen.PID, error) {
+	env := map[gen.Env]any{
+		"Datastore": ds,
+		"DiscoveryConfig": pkgmodel.DiscoveryConfig{
+			Enabled:  true,
+			Interval: 10 * time.Minute,
+		},
+	}
+
+	actor, err := unit.Spawn(t, NewResourcePersister, unit.WithEnv(env))
+	if err != nil {
+		return nil, gen.PID{}, err
+	}
+
+	return actor, gen.PID{Node: "test", ID: 100}, nil
+}
+
+func TestResourcePersister_StaleReadGuardFailsClosedWhenLookupErrors(t *testing.T) {
+	realDatastore, err := newTestDatastore()
+	require.NoError(t, err)
+
+	flaky := &loadResourceFlakyDatastore{Datastore: realDatastore}
+	persister, sender, err := newResourcePersisterWithDatastore(t, flaky)
+	require.NoError(t, err)
+
+	atRevision4 := pkgmodel.Resource{
+		Label:      "task-def",
+		Type:       "FakeAWS::ECS::TaskDefinition",
+		Stack:      "test-stack",
+		Ksuid:      util.NewID(),
+		Managed:    true,
+		NativeID:   "arn:task-definition/app:4",
+		Properties: json.RawMessage(`{"memory":"512"}`),
+	}
+	persistCreateForTest(t, persister, sender, atRevision4, "cmd-plan")
+
+	generatedFrom, err := realDatastore.LoadResource(atRevision4.URI())
+	require.NoError(t, err)
+	require.NotNil(t, generatedFrom)
+
+	atRevision5 := atRevision4
+	atRevision5.NativeID = "arn:task-definition/app:5"
+	atRevision5.Properties = json.RawMessage(`{"memory":"1024"}`)
+	persistCreateForTest(t, persister, sender, atRevision5, "cmd-apply")
+
+	// Fail the staleness lookup only. The delete path's own lookup still
+	// succeeds, so nothing else stops the tombstone from landing.
+	flaky.failURI = atRevision4.URI()
+	flaky.armed = true
+
+	result := persister.Call(sender, resource_update.PersistResourceUpdate{
+		CommandID:         "cmd-sync",
+		ResourceOperation: resource_update.OperationRead,
+		PluginOperation:   resource.OperationRead,
+		ResourceUpdate:    syncReadNotFoundForTest(*generatedFrom, "arn:task-definition/app:4"),
+	})
+	require.NoError(t, result.Error)
+
+	resources, err := realDatastore.LoadResourcesByStack("test-stack")
+	require.NoError(t, err)
+	require.Len(t, resources, 1, "a staleness lookup that errors must not let the delete through")
+}
+
+// A queued successful read can combine a fresh digest with build inputs from
+// its old snapshot. It must not overwrite a completed apply's version reference.
+func TestResourcePersister_StaleSuccessfulSyncReadPreservesBuildInputs(t *testing.T) {
+	persister, sender, ds, err := newResourcePersisterForTest(t)
+	require.NoError(t, err)
+	old := pkgmodel.Resource{
+		Label:      "image",
+		Type:       "FakeAWS::ImageBuild",
+		Stack:      "test-stack",
+		Ksuid:      util.NewID(),
+		Managed:    true,
+		NativeID:   "repo|current|builder",
+		Properties: json.RawMessage(`{"Dockerfile":"old","ImageDigest":"old"}`),
+	}
+	persistCreateForTest(t, persister, sender, old, "cmd-old")
+	snapshot, err := ds.LoadResource(old.URI())
+	require.NoError(t, err)
+	fresh := old
+	fresh.Properties = json.RawMessage(`{"Dockerfile":"new","ImageDigest":"new","VersionUri":"repo:release"}`)
+	persistCreateForTest(t, persister, sender, fresh, "cmd-build")
+	read := syncReadNotFoundForTest(*snapshot, old.NativeID)
+	read.DesiredState.Properties = json.RawMessage(`{"Dockerfile":"old","ImageDigest":"new"}`)
+	read.ProgressResult[0].ErrorCode = ""
+	read.ProgressResult[0].ResourceProperties = read.DesiredState.Properties
+	result := persister.Call(sender, resource_update.PersistResourceUpdate{
+		CommandID:         "cmd-sync",
+		ResourceOperation: resource_update.OperationRead,
+		PluginOperation:   resource.OperationRead,
+		ResourceUpdate:    read,
+	})
+	require.NoError(t, result.Error)
+	stored, err := ds.LoadResource(old.URI())
+	require.NoError(t, err)
+	require.NotNil(t, stored)
+	require.JSONEq(t, string(fresh.Properties), string(stored.Properties))
+
+	// A later cycle planned from the current row must still absorb cloud changes.
+	currentRead := syncReadNotFoundForTest(*stored, old.NativeID)
+	currentRead.DesiredState.Properties = json.RawMessage(`{"Dockerfile":"new","ImageDigest":"newer","VersionUri":"repo:release"}`)
+	currentRead.ProgressResult[0].ErrorCode = ""
+	currentRead.ProgressResult[0].ResourceProperties = currentRead.DesiredState.Properties
+	result = persister.Call(sender, resource_update.PersistResourceUpdate{
+		CommandID:         "cmd-fresh-sync",
+		ResourceOperation: resource_update.OperationRead,
+		PluginOperation:   resource.OperationRead,
+		ResourceUpdate:    currentRead,
+	})
+	require.NoError(t, result.Error)
+	stored, err = ds.LoadResource(old.URI())
+	require.NoError(t, err)
+	require.JSONEq(t, string(currentRead.DesiredState.Properties), string(stored.Properties))
+}
+
+// TestResourcePersister_SyncRead_OrderOnlyCollectionDifferenceIsNotAChange
+// seeds a row whose properties carry an unkeyed list, then delivers a sync
+// read of the same members in a different order. Unkeyed collections compare
+// as sets, so no new version may be stored; a read that changes a member
+// still is.
+func TestResourcePersister_SyncRead_OrderOnlyCollectionDifferenceIsNotAChange(t *testing.T) {
+	persister, sender, ds, err := newResourcePersisterForTest(t)
+	require.NoError(t, err)
+
+	_, err = ds.CreateTarget(&pkgmodel.Target{Label: "test-target", Namespace: "aws"})
+	require.NoError(t, err)
+
+	ksuid := util.NewID()
+	seedUnmanagedRow(t, ds, ksuid, json.RawMessage(`{"Principal":{"Service":["edgelambda.amazonaws.com","lambda.amazonaws.com"]}}`), true)
+
+	versionsBefore, err := ds.LoadAllResourceVersions()
+	require.NoError(t, err)
+	require.Len(t, versionsBefore, 1)
+
+	reordered := syncReadUpdate(ksuid, json.RawMessage(`{"Principal":{"Service":["lambda.amazonaws.com","edgelambda.amazonaws.com"]}}`), nil, nil)
+	result := persister.Call(sender, resource_update.PersistResourceUpdate{
+		CommandID:         "sync-reordered",
+		ResourceOperation: resource_update.OperationRead,
+		PluginOperation:   resource.OperationRead,
+		ResourceUpdate:    reordered,
+	})
+	require.NoError(t, result.Error)
+
+	versionsAfter, err := ds.LoadAllResourceVersions()
+	require.NoError(t, err)
+	assert.Len(t, versionsAfter, 1, "an order-only difference in an unkeyed collection must not store a new version")
+
+	changed := syncReadUpdate(ksuid, json.RawMessage(`{"Principal":{"Service":["lambda.amazonaws.com"]}}`), nil, nil)
+	result = persister.Call(sender, resource_update.PersistResourceUpdate{
+		CommandID:         "sync-changed",
+		ResourceOperation: resource_update.OperationRead,
+		PluginOperation:   resource.OperationRead,
+		ResourceUpdate:    changed,
+	})
+	require.NoError(t, result.Error)
+
+	versionsChanged, err := ds.LoadAllResourceVersions()
+	require.NoError(t, err)
+	assert.Len(t, versionsChanged, 2, "a member change must store a new version")
+}
+
+// TestResourcePersister_SyncRead_OrderedArrayReorderIsAChange seeds a row whose
+// list field is hinted as an ordered array and delivers a sync read with the
+// same members reordered. Order is meaning for such a field, so a new version
+// must be stored.
+func TestResourcePersister_SyncRead_OrderedArrayReorderIsAChange(t *testing.T) {
+	persister, sender, ds, err := newResourcePersisterForTest(t)
+	require.NoError(t, err)
+
+	_, err = ds.CreateTarget(&pkgmodel.Target{Label: "test-target", Namespace: "aws"})
+	require.NoError(t, err)
+
+	ksuid := util.NewID()
+	seedUnmanagedRow(t, ds, ksuid, json.RawMessage(`{"Topics":["arn:a","arn:b"]}`), true)
+
+	reordered := syncReadUpdate(ksuid, json.RawMessage(`{"Topics":["arn:b","arn:a"]}`), nil, nil)
+	reordered.DesiredState.Schema = pkgmodel.Schema{
+		Hints: map[string]pkgmodel.FieldHint{"Topics": {UpdateMethod: pkgmodel.FieldUpdateMethodArray}},
+	}
+	result := persister.Call(sender, resource_update.PersistResourceUpdate{
+		CommandID:         "sync-reordered-array",
+		ResourceOperation: resource_update.OperationRead,
+		PluginOperation:   resource.OperationRead,
+		ResourceUpdate:    reordered,
+	})
+	require.NoError(t, result.Error)
+
+	versions, err := ds.LoadAllResourceVersions()
+	require.NoError(t, err)
+	assert.Len(t, versions, 2, "reordering an ordered array must store a new version")
+}
+
+// TestResourcePersister_SyncRead_RemovedPropertyIsAChange delivers a sync read
+// that no longer carries a property the stored row has. A deletion is a change
+// and must store a new version.
+func TestResourcePersister_SyncRead_RemovedPropertyIsAChange(t *testing.T) {
+	persister, sender, ds, err := newResourcePersisterForTest(t)
+	require.NoError(t, err)
+
+	_, err = ds.CreateTarget(&pkgmodel.Target{Label: "test-target", Namespace: "aws"})
+	require.NoError(t, err)
+
+	ksuid := util.NewID()
+	seedUnmanagedRow(t, ds, ksuid, json.RawMessage(`{"Name":"n","Endpoint":"old"}`), true)
+
+	removed := syncReadUpdate(ksuid, json.RawMessage(`{"Name":"n"}`), nil, nil)
+	result := persister.Call(sender, resource_update.PersistResourceUpdate{
+		CommandID:         "sync-removed",
+		ResourceOperation: resource_update.OperationRead,
+		PluginOperation:   resource.OperationRead,
+		ResourceUpdate:    removed,
+	})
+	require.NoError(t, result.Error)
+
+	versions, err := ds.LoadAllResourceVersions()
+	require.NoError(t, err)
+	assert.Len(t, versions, 2, "a removed property must store a new version")
+}

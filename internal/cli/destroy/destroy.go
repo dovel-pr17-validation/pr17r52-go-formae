@@ -1,0 +1,491 @@
+// © 2025 Platform Engineering Labs Inc.
+//
+// SPDX-License-Identifier: FSL-1.1-ALv2
+
+package destroy
+
+import (
+	"fmt"
+	"io"
+	"os"
+	"strings"
+
+	"github.com/spf13/cobra"
+	"golang.org/x/term"
+
+	"github.com/charmbracelet/lipgloss"
+	"github.com/platform-engineering-labs/formae/internal/cli/app"
+	"github.com/platform-engineering-labs/formae/internal/cli/cmd"
+	"github.com/platform-engineering-labs/formae/internal/cli/config"
+	"github.com/platform-engineering-labs/formae/internal/cli/nag"
+	"github.com/platform-engineering-labs/formae/internal/cli/printer"
+	"github.com/platform-engineering-labs/formae/internal/cli/status"
+	"github.com/platform-engineering-labs/formae/internal/cli/tui"
+	"github.com/platform-engineering-labs/formae/internal/cli/tui/components"
+	"github.com/platform-engineering-labs/formae/internal/cli/tui/errfmt"
+	"github.com/platform-engineering-labs/formae/internal/cli/tui/simview"
+	"github.com/platform-engineering-labs/formae/internal/cli/tui/statuswatch"
+	"github.com/platform-engineering-labs/formae/internal/cli/tui/theme"
+	"github.com/platform-engineering-labs/formae/internal/logging"
+	apimodel "github.com/platform-engineering-labs/formae/pkg/api/model"
+)
+
+// Package-level seams — replaced in tests to avoid TTY / network calls.
+var (
+	isInteractive = tui.IsInteractive
+	runConfirm    = components.RunConfirm
+)
+
+// printBanner is a seam so tests can assert the banner is/isn't called.
+var printBanner = func(a *app.App) { a.PrintBanner() }
+
+// isTerminal, launchSimView, launchWatch, and destroyFn are package-level vars so tests can stub them.
+var (
+	isTerminal = tui.IsTerminal
+
+	launchSimView = func(th *theme.Theme, sim *apimodel.Simulation, opts simview.Options) (simview.Decision, error) {
+		model := simview.New(th, sim, opts)
+		final, err := tui.Run(model, tui.DefaultRunOptions())
+		if err != nil {
+			return simview.DecisionAborted, err
+		}
+		return final.(simview.Model).Decision(), nil
+	}
+
+	launchWatch = func(a *app.App, commandID string) (bool, error) {
+		th := a.Theme()
+		model := statuswatch.New(th, a, statuswatch.Options{
+			Query:          "id:" + commandID,
+			FocusCommandID: commandID,
+			HeaderCommand:  "destroy",
+			ExitWhenDone:   true,
+			SingleCommand:  true, // destroy --watch is scoped to one command: no back-to-list nav
+		})
+		final, err := tui.Run(model, tui.DefaultRunOptions())
+		if err != nil {
+			return false, err
+		}
+		return final.(statuswatch.Model).Finished(), nil
+	}
+
+	destroyFn = func(a *app.App, opts *DestroyOptions, simulate bool) (*apimodel.SubmitCommandResponse, []string, error) {
+		return a.Destroy(opts.FormaFile, opts.Query, opts.Properties, simulate, string(opts.OnDependents))
+	}
+)
+
+// legacyWidth is a package-level var so tests can stub it. Returns 100 for
+// non-TTY output (piped/redirected) or the real terminal width for TTY.
+var legacyWidth = func(w io.Writer) int {
+	if !isTerminal(w) {
+		return 100
+	}
+	if f, ok := w.(*os.File); ok {
+		if width, _, err := term.GetSize(int(f.Fd())); err == nil && width > 0 {
+			return width
+		}
+	}
+	return 100
+}
+
+// printAsyncNotice reminds the user how to check on a command that is still
+// running after the watch TUI has closed (the user detached early via
+// q/esc/ctrl+c). Not printed when the watch TUI closed because the command
+// already reached a terminal state.
+func printAsyncNotice(commandID string) {
+	fmt.Printf("\nStill running asynchronously on the agent. Check its status with:\n\n  formae command status %s\n", commandID)
+}
+
+// OnDependents defines the behavior when resources depend on those being deleted.
+type OnDependents string
+
+const (
+	// OnDependentsAbort aborts the delete if dependent resources exist.
+	OnDependentsAbort OnDependents = "abort"
+	// OnDependentsCascade deletes dependent resources along with the target.
+	OnDependentsCascade OnDependents = "cascade"
+)
+
+type DestroyOptions struct {
+	FormaFile      string
+	Query          string
+	OutputConsumer printer.Consumer
+	OutputSchema   string
+	StatusOutput   status.StatusOutput
+	Simulate       bool
+	Yes            bool
+	OnDependents   OnDependents
+	Properties     map[string]string
+}
+
+func DestroyCmd() *cobra.Command {
+	command := &cobra.Command{
+		Use:   "destroy",
+		Short: "Destroy all resources included with a forma",
+		PreRun: func(cmd *cobra.Command, args []string) {
+			logging.SetupClientLogging(fmt.Sprintf("%s/log/client.log", config.Config.DataDirectory()))
+		},
+		RunE: func(command *cobra.Command, args []string) error {
+			opts := &DestroyOptions{}
+			opts.FormaFile = command.Flags().Arg(0)
+			query, _ := command.Flags().GetString("query")
+			opts.Query = strings.TrimSpace(query)
+			outputConsumer, _ := command.Flags().GetString("output-consumer")
+			opts.OutputConsumer = printer.Consumer(outputConsumer)
+			opts.OutputSchema, _ = command.Flags().GetString("output-schema")
+			opts.Simulate, _ = command.Flags().GetBool("simulate")
+			statusOutput, _ := command.Flags().GetString("status-output-layout")
+			opts.StatusOutput = status.StatusOutput(statusOutput)
+			opts.Yes, _ = command.Flags().GetBool("yes")
+			onDependents, _ := command.Flags().GetString("on-dependents")
+			opts.OnDependents = OnDependents(onDependents)
+			opts.Properties = cmd.ExplicitPropertiesFromCmd(command)
+
+			configFile, _ := command.Flags().GetString("config")
+			app, err := cmd.AppFromContext(command.Context(), configFile, "", command)
+			if err != nil {
+				return err
+			}
+
+			return runDestroy(app, opts)
+		},
+		Annotations: map[string]string{
+			"type": "Forma",
+			"examples": "formae destroy forma.pkl" +
+				" | formae destroy --query 'stack:test-* managed:false'" +
+				" | formae destroy --query 'type:AWS::S3::Bucket stack:scratch' --yes",
+			"args": "<forma file>",
+		},
+		SilenceErrors: true,
+	}
+
+	command.SetUsageTemplate(cmd.SimpleCmdUsageTemplate)
+
+	command.Flags().String("query", " ", "Query that allows to find resources by their attributes. Only used when no forma file is provided. Use * as a wildcard anywhere (e.g. foo*, *foo, *foo*, foo*bar). ? and regex are not yet supported.")
+	command.Flags().String("output-consumer", string(printer.ConsumerHuman), "Consumer of the command result (human | machine)")
+	command.Flags().String("output-schema", "json", "The schema to use for the result output (json | yaml)")
+	command.Flags().Bool("simulate", false, "Simulate the command rather than make actual changes")
+	command.Flags().String("status-output-layout", string(status.StatusOutputSummary), fmt.Sprintf("What to print as status output (%s | %s)", status.StatusOutputSummary, status.StatusOutputDetailed))
+	command.Flags().Bool("yes", false, "Allow the command to run without any confirmations")
+	command.Flags().String("on-dependents", "abort", "Behavior when resources depend on those being deleted (abort | cascade)")
+	cmd.AddConfigFlags(command)
+
+	return command
+}
+
+func validateDestroyOptions(opts *DestroyOptions) error {
+	if opts.FormaFile == "" && opts.Query == "" {
+		return cmd.FlagErrorf("either a forma file needs to be provided, or --query must be specified")
+	}
+	if opts.FormaFile != "" && opts.Query != "" {
+		return cmd.FlagErrorf("either a forma file needs to be provided, or --query must be specified, but not both")
+	}
+	if opts.OutputConsumer != printer.ConsumerHuman && opts.OutputConsumer != printer.ConsumerMachine {
+		return cmd.FlagErrorf("output consumer must be either 'human' or 'machine'")
+	}
+	if opts.OutputConsumer == printer.ConsumerMachine {
+		if opts.OutputSchema != "json" && opts.OutputSchema != "yaml" {
+			return cmd.FlagErrorf("output schema must be either 'json' or 'yaml' for machine consumer")
+		}
+	}
+	if opts.OnDependents != OnDependentsAbort && opts.OnDependents != OnDependentsCascade {
+		return cmd.FlagErrorf("--on-dependents must be either 'abort' or 'cascade'")
+	}
+
+	return nil
+}
+
+func runDestroy(app *app.App, opts *DestroyOptions) error {
+	err := validateDestroyOptions(opts)
+	if err != nil {
+		return err
+	}
+	if opts.OutputConsumer == printer.ConsumerHuman {
+		return runDestroyForHumans(app, opts)
+	}
+	return runDestroyForMachines(app, opts)
+}
+
+func runDestroyForHumans(app *app.App, opts *DestroyOptions) error {
+	// Interactive path: human + TTY + no --yes flag → alt-screen TUI; suppress banner.
+	if !opts.Yes && isTerminal(os.Stdout) {
+		return runDestroyInteractive(app, opts)
+	}
+	printBanner(app)
+	return runDestroyLegacy(app, opts)
+}
+
+// runDestroyInteractive implements the new TTY destroy flow: simview preview → watch.
+// Unlike apply there is no drift phase; the simview renders the cascade warning
+// banner and the direct-vs-dependent confirm footer when cascade rows exist, and
+// the interactive confirmation substitutes for --on-dependents=cascade.
+func runDestroyInteractive(a *app.App, opts *DestroyOptions) error {
+	th := a.Theme()
+
+	res, _, err := destroyFn(a, opts, true)
+	if err != nil {
+		msg, renderErr := errfmt.Render(err)
+		if renderErr != nil {
+			return fmt.Errorf("error rendering error message: %v", renderErr)
+		}
+		return fmt.Errorf("%s", msg)
+	}
+
+	if !res.Simulation.ChangesRequired {
+		msg := "The specified forma does not have any resources that need to be destroyed."
+		if opts.FormaFile == "" {
+			msg = "The specified query does not match any resources that can be destroyed."
+		}
+		// Plain logo + message (the banner is already printed above), matching the
+		// legacy path and how other outcomes/errors render — no box.
+		fmt.Printf("%s\n\n%s\n\n",
+			lipgloss.NewStyle().Foreground(th.Palette.Done).Render("No resources to destroy:"),
+			lipgloss.NewStyle().Foreground(th.Palette.TextSubtle).Render(msg))
+		return nil
+	}
+
+	source := opts.FormaFile
+	if source == "" {
+		source = "query: " + opts.Query
+	}
+
+	decision, err := launchSimView(th, &res.Simulation, simview.Options{
+		Kind:         simview.KindDestroy,
+		Source:       source,
+		SimulateOnly: opts.Simulate,
+		Description:  res.Description,
+	})
+	if err != nil {
+		return err
+	}
+
+	if opts.Simulate {
+		return nil
+	}
+
+	if decision == simview.DecisionAborted {
+		th := a.Theme()
+		fmt.Print(lipgloss.NewStyle().Foreground(th.Palette.TextSubtle).Render("Destroy aborted.") + "\n")
+		return nil
+	}
+
+	// Confirmed: run the real destroy. If the simulation showed cascade deletes,
+	// the interactive confirmation serves as the user's opt-in — elevate to cascade
+	// so the server gate does not reject with a dependents conflict.
+	if hasCascadeDeletes(&res.Simulation.Command) {
+		opts.OnDependents = OnDependentsCascade
+	}
+	realRes, _, err := destroyFn(a, opts, false)
+	if err != nil {
+		msg, renderErr := errfmt.Render(err)
+		if renderErr != nil {
+			return fmt.Errorf("error rendering error message: %v", renderErr)
+		}
+		return fmt.Errorf("%s", msg)
+	}
+
+	// Watch the command to completion (D4: watch-by-default on TTY path).
+	finished, err := launchWatch(a, realRes.CommandID)
+	if err != nil {
+		return err
+	}
+
+	// The user detached (q/esc/ctrl+c) before the command reached a terminal
+	// state — remind them how to check on it. When it finished before the TUI
+	// closed, there is nothing more to say.
+	if !finished {
+		printAsyncNotice(realRes.CommandID)
+	}
+
+	// No post-TUI nag here: the interactive path exits clean.
+
+	return nil
+}
+
+// runDestroyLegacy is the pre-existing human destroy flow (non-TTY / --yes / legacy).
+// Byte-identical to the old runDestroyForHumans minus the banner (which is now in
+// runDestroyForHumans), except the cascade abort block which renders a styled
+// panel (the issue-mandated D5 exception to the legacy-paths-unchanged rule).
+func runDestroyLegacy(app *app.App, opts *DestroyOptions) error {
+	{
+		th := app.Theme()
+		headerStyle := lipgloss.NewStyle().Foreground(th.Palette.Error)
+		doneStyle := lipgloss.NewStyle().Foreground(th.Palette.Done)
+		if opts.FormaFile != "" {
+			fmt.Print(headerStyle.Render("Destroying resources defined by forma:\n ") + doneStyle.Render("File: ") + fmt.Sprintf("%s\n\n", opts.FormaFile))
+		} else {
+			fmt.Print(headerStyle.Render("Destroying resources defined by query:\n ") + doneStyle.Render("Query: ") + fmt.Sprintf("%s\n\n", opts.Query))
+		}
+	}
+
+	res, _, err := destroyFn(app, opts, true)
+	if err != nil {
+		msg, renderErr := errfmt.Render(err)
+		if renderErr != nil {
+			return fmt.Errorf("error rendering error message: %v", renderErr)
+		}
+		return fmt.Errorf("%s", msg)
+	}
+
+	if !res.Simulation.ChangesRequired {
+		th := app.Theme()
+		doneStyle := lipgloss.NewStyle().Foreground(th.Palette.Done)
+		subtleStyle := lipgloss.NewStyle().Foreground(th.Palette.TextSubtle)
+		var msg string
+		if opts.FormaFile != "" {
+			msg = subtleStyle.Render("The specified forma does not have any resources that need to be destroyed.")
+		} else {
+			msg = subtleStyle.Render("The specified query does not match any resources that can be destroyed.")
+		}
+
+		fmt.Printf("%s\n\n%s\n\n",
+			doneStyle.Render("No resources to destroy:"),
+			msg)
+		return nil
+	}
+
+	// Check for cascade deletes
+	hasCascades := hasCascadeDeletes(&res.Simulation.Command)
+
+	// If --yes is specified with --on-dependents=abort and there are cascades, abort.
+	// The styled panel renders even on the --yes path — the issue-mandated D5
+	// exception to the legacy-paths-unchanged rule (destroy-cascade mockup VIEW 2).
+	if opts.Yes && hasCascades && opts.OnDependents == OnDependentsAbort {
+		th := app.Theme()
+
+		var lines []string
+		for _, ru := range res.Simulation.Command.ResourceUpdates {
+			if ru.IsCascade {
+				lines = append(lines, fmt.Sprintf("%s (%s)", ru.ResourceLabel, ru.ResourceType))
+				lines = append(lines, fmt.Sprintf("  will be deleted because it depends on %s", ru.CascadeSource))
+			}
+		}
+		for _, tu := range res.Simulation.Command.TargetUpdates {
+			if tu.IsCascade {
+				lines = append(lines, fmt.Sprintf("%s (target)", tu.TargetLabel))
+				lines = append(lines, fmt.Sprintf("  will be deleted because it depends on %s", tu.CascadeSource))
+			}
+		}
+		lines = append(lines, "", "To proceed, use --on-dependents=cascade")
+
+		fmt.Println(components.Panel(th, th.Palette.Warning, "Command Aborted", lines, 80))
+		return fmt.Errorf("cascade deletes detected, aborting (use --on-dependents=cascade to proceed)")
+	}
+
+	// don't show anything if --yes is specified
+	if !opts.Yes {
+		// Show warning about cascades before simulation output
+		if hasCascades {
+			th := app.Theme()
+			fmt.Printf("%s\n\n", lipgloss.NewStyle().Foreground(th.Palette.Warning).Render("Warning: This operation will cascade delete additional resources."))
+		}
+
+		th := app.Theme()
+		width := legacyWidth(os.Stdout)
+		_, _ = fmt.Print(simview.RenderSimulationPlain(th, &res.Simulation, width))
+	}
+
+	if opts.Simulate {
+		th := app.Theme()
+		fmt.Print(lipgloss.NewStyle().Foreground(th.Palette.TextSubtle).Render("Command will not continue - simulation only") + "\n")
+		return nil
+	}
+
+	// confirm with the user before proceeding (unless --yes is specified)
+	if !opts.Yes {
+		if !isInteractive() {
+			return fmt.Errorf("interactive input requires a TTY — pass --yes")
+		}
+		prompt := components.PromptForOperations(app.Theme(), &res.Simulation.Command)
+		ok, err := runConfirm(app.Theme(), prompt, "")
+		if err != nil {
+			return err
+		}
+		if !ok {
+			th := app.Theme()
+			fmt.Print(lipgloss.NewStyle().Foreground(th.Palette.Error).Render("\nCommand aborted") + "\n")
+			return nil
+		}
+		// The interactive confirmation serves as the user's opt-in for cascade
+		// deletes — elevate so the server gate does not reject with a dependents
+		// conflict when the simulation showed cascades.
+		if hasCascades {
+			opts.OnDependents = OnDependentsCascade
+		}
+	}
+
+	var nags []string
+	res, nags, err = destroyFn(app, opts, false)
+	if err != nil {
+		msg, renderErr := errfmt.Render(err)
+		if renderErr != nil {
+			return fmt.Errorf("error rendering error message: %v", renderErr)
+		}
+		return fmt.Errorf("%s", msg)
+	}
+
+	{
+		th := app.Theme()
+		fmt.Printf("\n%s\n", lipgloss.NewStyle().Foreground(th.Palette.Warning).Render("The asynchronous command has started on the formae agent."))
+	}
+
+	// Watch by default on an interactive terminal (this path also serves --yes,
+	// which skips the confirmation but is still an interactive session). Off a
+	// TTY (piped/CI) stay fire-and-forget and print the status hint. Mirrors the
+	// interactive (non --yes) path, which always watches.
+	if isInteractive() {
+		finished, werr := launchWatch(app, res.CommandID)
+		if werr != nil {
+			return werr
+		}
+		if !finished {
+			printAsyncNotice(res.CommandID)
+		}
+		return nil
+	}
+
+	{
+		th := app.Theme()
+		subtleStyle := lipgloss.NewStyle().Foreground(th.Palette.TextSubtle)
+		accentStyle := lipgloss.NewStyle().Foreground(th.Palette.PrimaryAccent)
+		fmt.Printf("\nRun the following command to check the status of this command:\n\n  %s%s\n",
+			subtleStyle.Render("formae command status "), accentStyle.Render(res.CommandID))
+	}
+
+	nag.MaybePrintNags(app.Theme(), nags)
+
+	return nil
+}
+
+func runDestroyForMachines(app *app.App, opts *DestroyOptions) error {
+	if opts.Simulate {
+		res, _, err := destroyFn(app, opts, true)
+		if err != nil {
+			return fmt.Errorf("error simlating destroy command: %v", err)
+		}
+		printer := printer.NewMachineReadablePrinter[apimodel.Simulation](os.Stdout, opts.OutputSchema)
+
+		return printer.Print(&res.Simulation)
+	}
+	res, _, err := destroyFn(app, opts, false)
+	if err != nil {
+		return fmt.Errorf("error destroying forma: %v", err)
+	}
+	printer := printer.NewMachineReadablePrinter[apimodel.CommandID](os.Stdout, opts.OutputSchema)
+
+	return printer.Print(&apimodel.CommandID{CommandID: res.CommandID})
+}
+
+// hasCascadeDeletes checks if any resource or target updates in the command are cascade deletes
+func hasCascadeDeletes(cmd *apimodel.Command) bool {
+	for _, ru := range cmd.ResourceUpdates {
+		if ru.IsCascade {
+			return true
+		}
+	}
+	for _, tu := range cmd.TargetUpdates {
+		if tu.IsCascade {
+			return true
+		}
+	}
+	return false
+}

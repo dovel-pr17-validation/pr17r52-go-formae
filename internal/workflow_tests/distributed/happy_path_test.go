@@ -1,0 +1,322 @@
+// © 2025 Platform Engineering Labs Inc.
+//
+// SPDX-License-Identifier: FSL-1.1-ALv2
+
+//go:build integration
+
+package workflow_tests_distributed
+
+import (
+	"context"
+	"encoding/json"
+	"log/slog"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"testing"
+	"time"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+
+	dssqlite "github.com/platform-engineering-labs/formae/internal/datastore/sqlite"
+	"github.com/platform-engineering-labs/formae/internal/logging"
+	"github.com/platform-engineering-labs/formae/internal/metastructure"
+	"github.com/platform-engineering-labs/formae/internal/metastructure/config"
+	"github.com/platform-engineering-labs/formae/internal/metastructure/forma_command"
+	"github.com/platform-engineering-labs/formae/internal/metastructure/testutil"
+	"github.com/platform-engineering-labs/formae/internal/metastructure/util"
+	pkgmodel "github.com/platform-engineering-labs/formae/pkg/model"
+	"github.com/platform-engineering-labs/formae/pkg/plugin"
+	plugindiscovery "github.com/platform-engineering-labs/formae/pkg/plugin/discovery"
+)
+
+// TestMetastructure_ExternalPlugin_Registration tests the distributed plugin workflow
+// with FakeAWS running as a separate process that announces itself to PluginCoordinator.
+//
+// This test verifies:
+// - Building the fake-aws plugin binary
+// - Starting the plugin process via PluginProcessSupervisor
+// - Plugin announcing itself to PluginCoordinator
+// - Plugin registration being logged
+func TestMetastructure_ExternalPlugin_Registration(t *testing.T) {
+	testutil.RunTestFromProjectRoot(t, func(t *testing.T) {
+		// Step 1: Create isolated plugins directory for this test
+		testPluginsDir := t.TempDir()
+
+		// Step 2: Build the fake-aws plugin binary into isolated directory
+		pluginBinaryPath := buildFakeAWSPluginToDir(t, testPluginsDir)
+		defer os.Remove(pluginBinaryPath)
+
+		// Step 3: Setup test configuration
+		cfg := newDistributedTestConfig(t)
+		defer cleanupTestDatabase(t, cfg)
+
+		// Step 4: Setup test logger to capture all logs
+		logCapture := setupTestLogger()
+
+		// Step 5: Create and start metastructure with isolated plugins directory
+		m := newDistributedMetastructure(t, cfg, testPluginsDir)
+		defer m.Stop(true)
+
+		// Step 6: Wait for the plugin to register with PluginCoordinator
+		// The plugin sends a PluginAnnouncement to PluginCoordinator which logs it
+		foundMessage := logCapture.WaitForLog("Plugin registered", 5*time.Second)
+
+		require.True(t, foundMessage, "Plugin should have registered with PluginCoordinator")
+		t.Logf("✓ Plugin registered successfully")
+	})
+}
+
+// TestMetastructure_ExternalPlugin_ApplyForma_HappyPathtests a full apply workflow
+// with FakeAWS running as a separate process.
+//
+// This test verifies the end-to-end flow:
+// - Building and starting the fake-aws plugin as a separate process
+// - Plugin announcing itself to PluginCoordinator with capabilities
+// - Submitting a Forma apply command
+// - PluginOperator routing CRUD operations to the remote plugin
+// - Command completing successfully
+func TestMetastructure_ExternalPlugin_ApplyForma_HappyPath(t *testing.T) {
+	testutil.RunTestFromProjectRoot(t, func(t *testing.T) {
+		// Step 1: Create isolated plugins directory for this test
+		testPluginsDir := t.TempDir()
+
+		// Step 2: Build the fake-aws plugin binary into isolated directory
+		pluginBinaryPath := buildFakeAWSPluginToDir(t, testPluginsDir)
+		defer os.Remove(pluginBinaryPath)
+
+		// Step 3: Setup test configuration
+		cfg := newDistributedTestConfig(t)
+		defer cleanupTestDatabase(t, cfg)
+
+		// Step 4: Setup test logger to capture logs
+		logCapture := setupTestLogger()
+
+		// Step 5: Create and start metastructure with isolated plugins directory
+		m := newDistributedMetastructure(t, cfg, testPluginsDir)
+		// NOTE: We don't use defer m.Stop(true) here because we need to
+		// explicitly test the shutdown behavior
+
+		// Step 6: Wait for the plugin to register
+		foundMessage := logCapture.WaitForLog("Plugin registered", 5*time.Second)
+		require.True(t, foundMessage, "Plugin should have registered with PluginCoordinator")
+		t.Logf("✓ Plugin registered successfully")
+
+		// Step 7: Submit a Forma apply command (mirrors happy_path_test.go)
+		forma := &pkgmodel.Forma{
+			Stacks: []pkgmodel.Stack{
+				{
+					Label: "test-stack",
+				},
+			},
+			Resources: []pkgmodel.Resource{
+				{
+					Label:      "test-resource",
+					Type:       "FakeAWS::S3::Bucket",
+					Stack:      "test-stack",
+					Target:     "test-target",
+					Properties: json.RawMessage(`{"BucketName":"my-test-bucket"}`),
+					Managed:    true,
+				},
+			},
+			Targets: []pkgmodel.Target{
+				{
+					Label:     "test-target",
+					Namespace: "FakeAWS",
+				},
+			},
+		}
+
+		_, err := m.ApplyForma(
+			forma,
+			&config.FormaCommandConfig{Mode: pkgmodel.FormaApplyModeReconcile, Simulate: false},
+			"test-client-id", "", "",
+		)
+		require.NoError(t, err, "ApplyForma should not return an error")
+
+		// Step 8: Wait for the command to complete successfully
+		var commands []*forma_command.FormaCommand
+		require.Eventually(t, func() bool {
+			var err error
+			commands, err = m.Datastore.LoadFormaCommands()
+			if err != nil {
+				t.Logf("Error loading commands: %v", err)
+				return false
+			}
+			if len(commands) > 0 {
+				t.Logf("Command state: %s", commands[0].State)
+			}
+
+			return len(commands) == 1 && commands[0].State == forma_command.CommandStateSuccess
+		}, 10*time.Second, 100*time.Millisecond, "Command should complete successfully")
+
+		require.Len(t, commands[0].ResourceUpdates[0].ProgressResult, 1)
+		assert.Equal(t, "1234", commands[0].ResourceUpdates[0].ProgressResult[0].RequestID)
+		assert.Equal(t, "5678", commands[0].ResourceUpdates[0].ProgressResult[0].NativeID)
+		assert.Equal(t, json.RawMessage(`{"BucketName":"my-test-bucket"}`), commands[0].ResourceUpdates[0].ProgressResult[0].ResourceProperties)
+
+		t.Logf("✓ Apply command completed successfully")
+
+		// Step 9: Verify the plugin process is running before shutdown
+		require.True(t, isPluginProcessRunning("fake-aws"),
+			"Plugin process should be running before shutdown")
+		t.Logf("✓ Plugin process is running before shutdown")
+
+		// Step 10: Stop the metastructure
+		m.Stop(true)
+		t.Logf("✓ Metastructure stopped")
+
+		// Step 11: Verify the plugin process has been terminated
+		// Wait a reasonable amount of time for graceful shutdown
+		// With proper graceful shutdown, the plugin should terminate within 2 seconds
+		var pluginStillRunning bool
+		require.Eventually(t, func() bool {
+			pluginStillRunning = isPluginProcessRunning("fake-aws")
+			return !pluginStillRunning
+		}, 2*time.Second, 100*time.Millisecond,
+			"Plugin process should be terminated within 2 seconds after metastructure stops")
+		t.Logf("✓ Plugin process terminated after shutdown")
+	})
+}
+
+// buildFakeAWSPluginToDir compiles the fake-aws plugin binary into the specified directory
+func buildFakeAWSPluginToDir(t *testing.T, baseDir string) string {
+	t.Helper()
+
+	// Build to isolated plugin location: <baseDir>/fake-aws/v1.0.0/fake-aws
+	pluginDir := filepath.Join(baseDir, "fake-aws", "v1.0.0")
+	err := os.MkdirAll(pluginDir, 0755)
+	require.NoError(t, err, "Failed to create plugin directory")
+
+	pluginPath := filepath.Join(pluginDir, "fake-aws")
+
+	// Build the plugin binary from the internal test command
+	cmd := exec.Command("go", "build",
+		"-o", pluginPath,
+		"./internal/workflow_tests/cmd/fake-aws",
+	)
+
+	output, err := cmd.CombinedOutput()
+	require.NoError(t, err, "Failed to build fake-aws plugin: %s", string(output))
+
+	// Verify the binary was created
+	_, err = os.Stat(pluginPath)
+	require.NoError(t, err, "Plugin binary should exist at %s", pluginPath)
+
+	t.Logf("Built fake-aws plugin at: %s", pluginPath)
+	return pluginPath
+}
+
+// newDistributedTestConfig creates a test configuration for distributed plugins
+func newDistributedTestConfig(t *testing.T) *pkgmodel.Config {
+	t.Helper()
+
+	prefix := util.RandomString(10) + "-"
+
+	// Create temporary database
+	tmpFile, err := os.CreateTemp("", "formae_distributed_test_*.db")
+	require.NoError(t, err)
+	_ = tmpFile.Close()
+
+	// Generate a unique network cookie for this test
+	cookie := util.RandomString(32)
+
+	return &pkgmodel.Config{
+		Agent: pkgmodel.AgentConfig{
+			Server: pkgmodel.ServerConfig{
+				Nodename:     "agent-test-" + prefix,
+				Hostname:     "localhost",
+				ObserverPort: 0,
+				Secret:       cookie, // Network cookie for plugin communication
+			},
+			Datastore: pkgmodel.DatastoreConfig{
+				DatastoreType: pkgmodel.SqliteDatastore,
+				Sqlite: pkgmodel.SqliteConfig{
+					FilePath: tmpFile.Name(),
+				},
+			},
+			Retry: pkgmodel.RetryConfig{
+				MaxRetries:          2,
+				RetryDelay:          1 * time.Second,
+				StatusCheckInterval: 1 * time.Second,
+			},
+			Synchronization: pkgmodel.SynchronizationConfig{
+				Enabled: false,
+			},
+			Discovery: pkgmodel.DiscoveryConfig{
+				Enabled: false,
+			},
+		},
+		// PluginCoordinator will scan ~/.pel/formae/plugins/ for plugins
+		PluginDir: "~/.pel/formae/plugins",
+	}
+}
+
+// newDistributedMetastructure creates a metastructure instance configured for distributed plugins
+func newDistributedMetastructure(t *testing.T, cfg *pkgmodel.Config, pluginsDir string) *metastructure.Metastructure {
+	t.Helper()
+
+	// Create datastore
+	db, err := dssqlite.NewDatastoreSQLite(context.Background(), &cfg.Agent.Datastore, "test")
+	require.NoError(t, err, "Failed to create datastore")
+
+	// Discover external resource plugins from isolated plugins directory
+	resourceInfos := plugindiscovery.DiscoverPlugins(pluginsDir, plugindiscovery.Resource)
+	externalResourcePlugins := make([]plugin.ResourcePluginInfo, len(resourceInfos))
+	for i, p := range resourceInfos {
+		externalResourcePlugins[i] = p.ToResourcePluginInfo()
+	}
+
+	// Create metastructure
+	ctx := context.Background()
+	m, err := metastructure.NewMetastructureWithDataStoreAndContext(
+		ctx,
+		cfg,
+		externalResourcePlugins,
+		nil,
+		db,
+		"test",
+	)
+	require.NoError(t, err, "Failed to create metastructure")
+
+	// Start the metastructure (this should spawn PluginCoordinator and plugin processes)
+	err = m.Start()
+	require.NoError(t, err, "Failed to start metastructure")
+
+	t.Logf("Started metastructure with distributed plugins")
+	return m
+}
+
+// cleanupTestDatabase removes the test database file
+func cleanupTestDatabase(t *testing.T, cfg *pkgmodel.Config) {
+	t.Helper()
+	if cfg.Agent.Datastore.Sqlite.FilePath != ":memory:" {
+		_ = os.Remove(cfg.Agent.Datastore.Sqlite.FilePath)
+	}
+}
+
+// setupTestLogger configures a test logger that captures all log output
+// Returns the log capture that tests can use for assertions
+func setupTestLogger() *logging.TestLogCapture {
+	capture := logging.NewTestLogCapture()
+
+	// Create a text handler that writes to our capture
+	handler := slog.NewTextHandler(capture, &slog.HandlerOptions{
+		Level: slog.LevelDebug, // Capture all debug logs
+	})
+
+	// Set as the global default - this will affect all slog calls
+	// including those from ErgoLogger
+	slog.SetDefault(slog.New(handler))
+
+	return capture
+}
+
+// isPluginProcessRunning checks if a process with the given name pattern is running
+func isPluginProcessRunning(processName string) bool {
+	cmd := exec.Command("pgrep", "-f", processName)
+	err := cmd.Run()
+	// pgrep returns exit code 0 if a process is found, non-zero otherwise
+	return err == nil
+}

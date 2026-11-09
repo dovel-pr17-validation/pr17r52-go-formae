@@ -1,0 +1,2400 @@
+{
+    "swagger": "2.0",
+    "info": {
+        "description": "This API allows you to programatically interact with Formae without the CLI.",
+        "title": "Formae REST API",
+        "contact": {},
+        "version": "1.0"
+    },
+    "host": "localhost:8080",
+    "basePath": "/api/v1",
+    "paths": {
+        "/admin/check-ttl": {
+            "post": {
+                "description": "Triggers a one-shot TTL expiry check. Identifies stacks with expired TTL policies\nand initiates their destruction. Stacks with active commands are skipped.\n\nSide effects: This endpoint destroys infrastructure. Any stack whose TTL has expired\nwill have all its resources destroyed. This is irreversible.",
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "admin"
+                ],
+                "summary": "Force TTL expiry check",
+                "responses": {
+                    "200": {
+                        "description": "OK: TTL check complete.",
+                        "schema": {
+                            "$ref": "#/definitions/model.ForceCheckTTLResponse"
+                        }
+                    },
+                    "500": {
+                        "description": "Internal Server Error.",
+                        "schema": {
+                            "type": "string"
+                        }
+                    }
+                }
+            }
+        },
+        "/admin/discover": {
+            "post": {
+                "description": "Initiates an immediate discovery process to identify resources in the infrastructure.",
+                "tags": [
+                    "admin"
+                ],
+                "summary": "Force resource discovery",
+                "responses": {
+                    "200": {
+                        "description": "OK"
+                    },
+                    "500": {
+                        "description": "Internal Server Error.",
+                        "schema": {
+                            "type": "string"
+                        }
+                    }
+                }
+            }
+        },
+        "/admin/reap": {
+            "post": {
+                "description": "Triggers a single, immediate TargetReaper tick: advances the unreachability-accrual\nclock for every currently-unreachable target, detects reap candidates that have\nreached their reap-after duration, and reaps (tombstones) the eligible ones, subject\nto the per-tick rate cap.",
+                "tags": [
+                    "admin"
+                ],
+                "summary": "Force a target-reaper tick",
+                "responses": {
+                    "200": {
+                        "description": "OK"
+                    },
+                    "500": {
+                        "description": "Internal Server Error.",
+                        "schema": {
+                            "type": "string"
+                        }
+                    }
+                }
+            }
+        },
+        "/admin/synchronize": {
+            "post": {
+                "description": "Triggers an immediate synchronization of the resource state with the actual infrastructure.",
+                "tags": [
+                    "admin"
+                ],
+                "summary": "Force resource synchronization",
+                "responses": {
+                    "200": {
+                        "description": "OK"
+                    },
+                    "500": {
+                        "description": "Internal Server Error.",
+                        "schema": {
+                            "type": "string"
+                        }
+                    }
+                }
+            }
+        },
+        "/command/{id}/status": {
+            "get": {
+                "description": "Retrieves the status of a previously submitted Forma command using its ID.",
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "commands"
+                ],
+                "summary": "Get the status of a Forma command",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "Unique identifier for the client.",
+                        "name": "Client-ID",
+                        "in": "header",
+                        "required": true
+                    },
+                    {
+                        "type": "string",
+                        "description": "The ID of the command.",
+                        "name": "id",
+                        "in": "path",
+                        "required": true
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK: The command's execution status.",
+                        "schema": {
+                            "$ref": "#/definitions/model.ListCommandStatusResponse"
+                        }
+                    },
+                    "400": {
+                        "description": "Bad Request: Missing or invalid parameters.",
+                        "schema": {
+                            "type": "string"
+                        }
+                    },
+                    "500": {
+                        "description": "Internal Server Error.",
+                        "schema": {
+                            "type": "string"
+                        }
+                    }
+                }
+            }
+        },
+        "/commands": {
+            "post": {
+                "description": "Submits a Forma command to the agent. The command is executed asynchronously.",
+                "consumes": [
+                    "multipart/form-data"
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "commands"
+                ],
+                "summary": "Submit a Forma command",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "Unique identifier for the client.",
+                        "name": "Client-ID",
+                        "in": "header",
+                        "required": true
+                    },
+                    {
+                        "type": "string",
+                        "description": "The command to execute, either apply or destroy.",
+                        "name": "command",
+                        "in": "formData",
+                        "required": true
+                    },
+                    {
+                        "type": "string",
+                        "description": "Optional human-readable reason for the command.",
+                        "name": "message",
+                        "in": "formData"
+                    },
+                    {
+                        "type": "string",
+                        "description": "Only applies to the apply command. The desired command mode, either reconcile or patch.",
+                        "name": "mode",
+                        "in": "formData"
+                    },
+                    {
+                        "type": "boolean",
+                        "description": "If true, simulates command execution without actual changes to the infrastructure (defaults to false).",
+                        "name": "simulate",
+                        "in": "formData"
+                    },
+                    {
+                        "type": "boolean",
+                        "description": "Only applies to the apply command in reconcile mode. If true, any changes made to the infrastructure since the last reconcile, either by patches or outside of Formae, will be overwritten.",
+                        "name": "force",
+                        "in": "formData"
+                    },
+                    {
+                        "type": "string",
+                        "description": "JSON drift-resolution controls for soft reconcile: ObservationID, Decisions [{ResourceID, Action (absorb or revert)}], ReviewID, IdempotencyKey. Simulate the final choices first; real submission requires its ReviewID and a stable IdempotencyKey. Mutually exclusive with force. Requires shared-drift-resolution capability.",
+                        "name": "resolution",
+                        "in": "formData"
+                    },
+                    {
+                        "type": "string",
+                        "description": "Only applies to destroy commands. A query string to select the resources to be destroyed.",
+                        "name": "query",
+                        "in": "formData"
+                    },
+                    {
+                        "type": "string",
+                        "description": "Only applies to destroy commands. Behavior when a delete would cascade onto dependent targets: abort (default) or cascade.",
+                        "name": "on-dependents",
+                        "in": "formData"
+                    },
+                    {
+                        "type": "file",
+                        "description": "A valid Forma file.",
+                        "name": "file",
+                        "in": "formData"
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK: No changes required, or simulation result returned.",
+                        "schema": {
+                            "$ref": "#/definitions/model.SubmitCommandResponse"
+                        }
+                    },
+                    "202": {
+                        "description": "Accepted: The command is validated, stored, and queued for execution.",
+                        "schema": {
+                            "$ref": "#/definitions/model.SubmitCommandResponse"
+                        },
+                        "headers": {
+                            "string Location": {
+                                "type": "string",
+                                "description": "The URL to poll for the command's execution status (e.g., /api/v1/commands/{command_id}/status)."
+                            }
+                        }
+                    },
+                    "409": {
+                        "description": "Conflict: drift resolution rejected; inspect data.Code and data.Reason before retrying.",
+                        "schema": {
+                            "$ref": "#/definitions/model.ErrorResponse-model_DriftResolutionError"
+                        }
+                    },
+                    "500": {
+                        "description": "Internal Server Error.",
+                        "schema": {
+                            "type": "string"
+                        }
+                    }
+                }
+            }
+        },
+        "/commands/cancel": {
+            "post": {
+                "description": "Cancels commands that are currently in progress. Can cancel either the most recent command or commands matching a query.",
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "commands"
+                ],
+                "summary": "Cancel commands",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "Unique identifier for the client.",
+                        "name": "Client-ID",
+                        "in": "header",
+                        "required": true
+                    },
+                    {
+                        "type": "string",
+                        "description": "Optional query string to select commands to cancel. If not provided, cancels the most recent command.",
+                        "name": "query",
+                        "in": "query"
+                    },
+                    {
+                        "type": "boolean",
+                        "description": "If true, abandon in-progress work and drive the command to a terminal 'Canceled' state immediately instead of waiting for in-progress resources to finish. Defaults to false.",
+                        "name": "force",
+                        "in": "query"
+                    }
+                ],
+                "responses": {
+                    "202": {
+                        "description": "Accepted: Commands are being canceled.",
+                        "schema": {
+                            "$ref": "#/definitions/model.CancelCommandResponse"
+                        }
+                    },
+                    "400": {
+                        "description": "Bad Request: Invalid query or missing Client-ID.",
+                        "schema": {
+                            "type": "string"
+                        }
+                    },
+                    "404": {
+                        "description": "Not Found: No in-progress commands found to cancel.",
+                        "schema": {
+                            "type": "string"
+                        }
+                    },
+                    "500": {
+                        "description": "Internal Server Error.",
+                        "schema": {
+                            "type": "string"
+                        }
+                    }
+                }
+            }
+        },
+        "/commands/status": {
+            "get": {
+                "description": "Retrieves the statuses of multiple Forma commands based on a query string.",
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "commands"
+                ],
+                "summary": "Get the status of multiple Forma commands",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "Unique identifier for the client.",
+                        "name": "Client-ID",
+                        "in": "header",
+                        "required": true
+                    },
+                    {
+                        "type": "string",
+                        "description": "The query string to select the commands. If empty, the scope parameter decides what is returned.",
+                        "name": "query",
+                        "in": "query"
+                    },
+                    {
+                        "enum": [
+                            "client",
+                            "agent"
+                        ],
+                        "type": "string",
+                        "description": "How an empty query is answered: 'client' (default) returns the calling client's most recent command; 'agent' returns every client's commands, newest first. Ignored when query is set.",
+                        "name": "scope",
+                        "in": "query"
+                    },
+                    {
+                        "type": "string",
+                        "description": "The maximum number of command statuses to return (default is 10, capped at 200).",
+                        "name": "max_results",
+                        "in": "query"
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK: The commands' execution statuses.",
+                        "schema": {
+                            "$ref": "#/definitions/model.ListCommandStatusResponse"
+                        }
+                    },
+                    "400": {
+                        "description": "Bad Request: Missing or invalid parameters.",
+                        "schema": {
+                            "type": "string"
+                        }
+                    },
+                    "404": {
+                        "description": "Not Found: No commands matched.",
+                        "schema": {
+                            "type": "string"
+                        }
+                    },
+                    "500": {
+                        "description": "Internal Server Error.",
+                        "schema": {
+                            "type": "string"
+                        }
+                    }
+                }
+            }
+        },
+        "/commands/{id}/desired-delta": {
+            "get": {
+                "description": "Returns partial recorded desired intent for source catch-up. This is not a complete reconcile declaration. Requires shared-drift-resolution capability.",
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "commands"
+                ],
+                "summary": "Get a command's desired source delta",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "Unique identifier for the client.",
+                        "name": "Client-ID",
+                        "in": "header",
+                        "required": true
+                    },
+                    {
+                        "type": "string",
+                        "description": "Command ID returned by the accepted submission.",
+                        "name": "id",
+                        "in": "path",
+                        "required": true
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "Partial desired source guidance and command state.",
+                        "schema": {
+                            "$ref": "#/definitions/model.CommandDesiredDelta"
+                        }
+                    },
+                    "400": {
+                        "description": "Bad Request: missing Client-ID or invalid command.",
+                        "schema": {
+                            "type": "string"
+                        }
+                    },
+                    "409": {
+                        "description": "Conflict: resolution receipt or terminal desired intent is unavailable; inspect data.Code and data.Reason.",
+                        "schema": {
+                            "$ref": "#/definitions/model.ErrorResponse-model_DriftResolutionError"
+                        }
+                    },
+                    "500": {
+                        "description": "Internal Server Error: command lookup or extraction failed.",
+                        "schema": {
+                            "type": "string"
+                        }
+                    },
+                    "501": {
+                        "description": "Not Implemented: shared drift resolution unavailable.",
+                        "schema": {
+                            "type": "string"
+                        }
+                    }
+                }
+            }
+        },
+        "/generators": {
+            "get": {
+                "description": "Retrieves all live generators with their cadence, the instant of their last committed rotation, and the resources bound to them",
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "generators"
+                ],
+                "summary": "List generators",
+                "responses": {
+                    "200": {
+                        "description": "OK: List of generators.",
+                        "schema": {
+                            "type": "array",
+                            "items": {
+                                "$ref": "#/definitions/model.GeneratorInventoryItem"
+                            }
+                        }
+                    },
+                    "404": {
+                        "description": "Not Found: No generators found.",
+                        "schema": {
+                            "type": "string"
+                        }
+                    },
+                    "500": {
+                        "description": "Internal Server Error.",
+                        "schema": {
+                            "type": "string"
+                        }
+                    }
+                }
+            }
+        },
+        "/health": {
+            "get": {
+                "description": "A simple health check endpoint to verify that the API server is running.",
+                "tags": [
+                    "health"
+                ],
+                "summary": "Health Check",
+                "responses": {
+                    "200": {
+                        "description": "OK"
+                    }
+                }
+            }
+        },
+        "/policies": {
+            "get": {
+                "description": "Retrieves all standalone policies with their attached stacks",
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "policies"
+                ],
+                "summary": "List standalone policies",
+                "responses": {
+                    "200": {
+                        "description": "OK: List of standalone policies.",
+                        "schema": {
+                            "type": "array",
+                            "items": {
+                                "$ref": "#/definitions/model.PolicyInventoryItem"
+                            }
+                        }
+                    },
+                    "404": {
+                        "description": "Not Found: No policies found.",
+                        "schema": {
+                            "type": "string"
+                        }
+                    },
+                    "500": {
+                        "description": "Internal Server Error.",
+                        "schema": {
+                            "type": "string"
+                        }
+                    }
+                }
+            }
+        },
+        "/resources": {
+            "get": {
+                "description": "Extracts and lists resources based on a provided query string.",
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "resources"
+                ],
+                "summary": "List resources",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "Unique identifier for the client.",
+                        "name": "Client-ID",
+                        "in": "header",
+                        "required": true
+                    },
+                    {
+                        "type": "string",
+                        "description": "The query string to select the resources.",
+                        "name": "query",
+                        "in": "query",
+                        "required": true
+                    },
+                    {
+                        "enum": [
+                            "actual",
+                            "desired"
+                        ],
+                        "type": "string",
+                        "description": "Extraction state. desired requires desired-stack-extraction capability and complete stack selectors; returns accepted declarations including complete empty stacks. Defaults to actual inventory.",
+                        "name": "state",
+                        "in": "query"
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": ": OK: The extracted resources.",
+                        "schema": {
+                            "$ref": "#/definitions/model.Forma"
+                        }
+                    },
+                    "400": {
+                        "description": "Bad Request: Invalid query.",
+                        "schema": {
+                            "type": "string"
+                        }
+                    },
+                    "404": {
+                        "description": "Not Found: No resources found matching the query.",
+                        "schema": {
+                            "type": "string"
+                        }
+                    },
+                    "406": {
+                        "description": "Not Acceptable: The request is not supported.",
+                        "schema": {
+                            "type": "string"
+                        }
+                    },
+                    "500": {
+                        "description": "Internal Server Error.",
+                        "schema": {
+                            "type": "string"
+                        }
+                    }
+                }
+            }
+        },
+        "/resources/by-ksuid/{ksuid}": {
+            "get": {
+                "description": "Retrieves a single resource by its ksuid identifier.",
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "resources"
+                ],
+                "summary": "Get a resource by ksuid",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "The ksuid of the resource.",
+                        "name": "ksuid",
+                        "in": "path",
+                        "required": true
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK: The resource.",
+                        "schema": {
+                            "$ref": "#/definitions/model.Resource"
+                        }
+                    },
+                    "400": {
+                        "description": "Bad Request: Malformed ksuid.",
+                        "schema": {
+                            "type": "string"
+                        }
+                    },
+                    "404": {
+                        "description": "Not Found: No resource found for the given ksuid.",
+                        "schema": {
+                            "type": "string"
+                        }
+                    },
+                    "500": {
+                        "description": "Internal Server Error.",
+                        "schema": {
+                            "type": "string"
+                        }
+                    }
+                }
+            }
+        },
+        "/resources/summary": {
+            "get": {
+                "description": "Lists lightweight resource summaries (label, stack, type, native ID, ksuid) based on an optional query string.",
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "resources"
+                ],
+                "summary": "List resource summaries",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "The query string to filter resources.",
+                        "name": "query",
+                        "in": "query"
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK: The resource summaries.",
+                        "schema": {
+                            "type": "array",
+                            "items": {
+                                "$ref": "#/definitions/model.ResourceSummary"
+                            }
+                        }
+                    },
+                    "400": {
+                        "description": "Bad Request: Invalid query.",
+                        "schema": {
+                            "type": "string"
+                        }
+                    },
+                    "500": {
+                        "description": "Internal Server Error.",
+                        "schema": {
+                            "type": "string"
+                        }
+                    }
+                }
+            }
+        },
+        "/stacks": {
+            "get": {
+                "description": "Retrieves all stack metadata",
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "stacks"
+                ],
+                "summary": "List stacks",
+                "responses": {
+                    "200": {
+                        "description": "OK: List of stacks.",
+                        "schema": {
+                            "type": "array",
+                            "items": {
+                                "$ref": "#/definitions/model.Stack"
+                            }
+                        }
+                    },
+                    "404": {
+                        "description": "Not Found: No stacks found.",
+                        "schema": {
+                            "type": "string"
+                        }
+                    },
+                    "500": {
+                        "description": "Internal Server Error.",
+                        "schema": {
+                            "type": "string"
+                        }
+                    }
+                }
+            }
+        },
+        "/stacks/{stack}/changes-since-last-reconcile": {
+            "get": {
+                "description": "Retrieves resource modifications (drift) detected since the last reconcile for a given stack.",
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "stacks"
+                ],
+                "summary": "List drift for a stack",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "The stack label to check for drift.",
+                        "name": "stack",
+                        "in": "path",
+                        "required": true
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK: Drift report for the stack.",
+                        "schema": {
+                            "$ref": "#/definitions/model.ModifiedStack"
+                        }
+                    },
+                    "500": {
+                        "description": "Internal Server Error.",
+                        "schema": {
+                            "type": "string"
+                        }
+                    }
+                }
+            }
+        },
+        "/stacks/{stack}/drift": {
+            "get": {
+                "description": "Retrieves resource modifications (drift) detected since the last reconcile for a given stack.",
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "stacks"
+                ],
+                "summary": "List drift for a stack",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "The stack label to check for drift.",
+                        "name": "stack",
+                        "in": "path",
+                        "required": true
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK: Drift report for the stack.",
+                        "schema": {
+                            "$ref": "#/definitions/model.ModifiedStack"
+                        }
+                    },
+                    "500": {
+                        "description": "Internal Server Error.",
+                        "schema": {
+                            "type": "string"
+                        }
+                    }
+                }
+            }
+        },
+        "/stacks/{stack}/reconcile": {
+            "post": {
+                "description": "Triggers a one-shot reconcile for a specific stack. This creates and executes a\nreconcile command that reverts any out-of-band changes to managed resources on the\nstack back to their last-known desired state. The reconcile is equivalent to\nre-applying the last reconcile snapshot. The command executes asynchronously —\nuse the returned command_id to poll for completion via GET /commands/:id/status.\n\nSide effects: This endpoint creates real infrastructure changes. Any resources that\nhave been modified outside of formae since the last reconcile will be reverted to\ntheir managed state. This is a destructive operation for out-of-band changes.",
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "stacks"
+                ],
+                "summary": "Force stack reconcile",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "The stack label to reconcile.",
+                        "name": "stack",
+                        "in": "path",
+                        "required": true
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK: No drift detected, nothing to reconcile.",
+                        "schema": {
+                            "$ref": "#/definitions/model.ForceReconcileResponse"
+                        }
+                    },
+                    "202": {
+                        "description": "Accepted: Reconcile command created and executing.",
+                        "schema": {
+                            "$ref": "#/definitions/model.ForceReconcileResponse"
+                        }
+                    },
+                    "403": {
+                        "description": "Forbidden: Stack does not have an auto-reconcile policy.",
+                        "schema": {
+                            "$ref": "#/definitions/model.ReconcilePolicyRequiredError"
+                        }
+                    },
+                    "409": {
+                        "description": "Conflict: Stack has active commands, reconcile skipped.",
+                        "schema": {
+                            "$ref": "#/definitions/model.ForceReconcileResponse"
+                        }
+                    },
+                    "500": {
+                        "description": "Internal Server Error.",
+                        "schema": {
+                            "type": "string"
+                        }
+                    }
+                }
+            }
+        },
+        "/stats": {
+            "get": {
+                "description": "Retrieves usage statistics of the Formae agent.",
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "stats"
+                ],
+                "summary": "Get usage statistics",
+                "responses": {
+                    "200": {
+                        "description": ": OK: The usage statistics.",
+                        "schema": {
+                            "$ref": "#/definitions/model.Stats"
+                        }
+                    },
+                    "500": {
+                        "description": "Internal Server Error.",
+                        "schema": {
+                            "type": "string"
+                        }
+                    }
+                }
+            }
+        },
+        "/targets": {
+            "get": {
+                "description": "Retrieves targets based on query parameters",
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "targets"
+                ],
+                "summary": "List targets",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "Query string to filter targets (e.g., 'namespace:aws discoverable:true')",
+                        "name": "query",
+                        "in": "query"
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK: List of targets.",
+                        "schema": {
+                            "type": "array",
+                            "items": {
+                                "$ref": "#/definitions/model.Target"
+                            }
+                        }
+                    },
+                    "404": {
+                        "description": "Not Found: No targets found.",
+                        "schema": {
+                            "type": "string"
+                        }
+                    },
+                    "500": {
+                        "description": "Internal Server Error.",
+                        "schema": {
+                            "type": "string"
+                        }
+                    }
+                }
+            }
+        }
+    },
+    "definitions": {
+        "github_com_platform-engineering-labs_formae_pkg_api_model.Command": {
+            "type": "object",
+            "properties": {
+                "Command": {
+                    "type": "string"
+                },
+                "CommandId": {
+                    "type": "string"
+                },
+                "EndTs": {
+                    "type": "string"
+                },
+                "GeneratorUpdates": {
+                    "type": "array",
+                    "items": {
+                        "$ref": "#/definitions/model.GeneratorUpdate"
+                    }
+                },
+                "InputProperties": {
+                    "type": "array",
+                    "items": {
+                        "type": "integer"
+                    }
+                },
+                "Message": {
+                    "type": "string"
+                },
+                "Mode": {
+                    "description": "\"reconcile\" | \"patch\"",
+                    "type": "string"
+                },
+                "PolicyUpdates": {
+                    "type": "array",
+                    "items": {
+                        "$ref": "#/definitions/model.PolicyUpdate"
+                    }
+                },
+                "Resolution": {
+                    "$ref": "#/definitions/model.DriftReview"
+                },
+                "ResourceUpdates": {
+                    "type": "array",
+                    "items": {
+                        "$ref": "#/definitions/model.ResourceUpdate"
+                    }
+                },
+                "Source": {
+                    "type": "string"
+                },
+                "StackUpdates": {
+                    "type": "array",
+                    "items": {
+                        "$ref": "#/definitions/model.StackUpdate"
+                    }
+                },
+                "StartTs": {
+                    "type": "string"
+                },
+                "State": {
+                    "type": "string"
+                },
+                "TargetUpdates": {
+                    "type": "array",
+                    "items": {
+                        "$ref": "#/definitions/model.TargetUpdate"
+                    }
+                },
+                "subject": {
+                    "type": "string"
+                },
+                "subjectName": {
+                    "type": "string"
+                }
+            }
+        },
+        "github_com_platform-engineering-labs_formae_pkg_api_model.Description": {
+            "type": "object",
+            "properties": {
+                "Confirm": {
+                    "type": "boolean"
+                },
+                "Text": {
+                    "type": "string"
+                }
+            }
+        },
+        "github_com_platform-engineering-labs_formae_pkg_model.Command": {
+            "type": "string",
+            "enum": [
+                "apply",
+                "eval",
+                "destroy",
+                "sync"
+            ],
+            "x-enum-varnames": [
+                "CommandApply",
+                "CommandEval",
+                "CommandDestroy",
+                "CommandSync"
+            ]
+        },
+        "github_com_platform-engineering-labs_formae_pkg_model.Description": {
+            "type": "object",
+            "properties": {
+                "Confirm": {
+                    "type": "boolean"
+                },
+                "Text": {
+                    "type": "string"
+                }
+            }
+        },
+        "model.APIError": {
+            "type": "string",
+            "enum": [
+                "DriftResolutionRejected",
+                "ConflictingCommands",
+                "PatchRejected",
+                "ReconcileRejected",
+                "CyclesDetected",
+                "EmptyStackRejected",
+                "TargetAlreadyExists",
+                "TargetReaped",
+                "ReferencedResourcesNotFound",
+                "ReferencedGeneratorsNotFound",
+                "RequiredFieldMissingOnCreate",
+                "StackReferenceNotFound",
+                "TargetReferenceNotFound",
+                "InvalidQueryError",
+                "StackDeletedDuringApply",
+                "ReconcilePolicyRequired",
+                "NonPortableResources",
+                "PluginNotFound",
+                "PluginVersionNotFound",
+                "PluginDependencyConflict",
+                "PluginRepositoryUnreachable",
+                "PluginSignatureInvalid",
+                "TargetHasDependents",
+                "ResourceHasDependents",
+                "GeneratorDestinationsUnreachable",
+                "GeneratorBoundToSetOnceField",
+                "GeneratorHasDependents"
+            ],
+            "x-enum-varnames": [
+                "DriftResolutionRejected",
+                "ConflictingCommands",
+                "PatchRejected",
+                "ReconcileRejected",
+                "CyclesDetected",
+                "EmptyStackRejected",
+                "TargetAlreadyExists",
+                "TargetReaped",
+                "ReferencedResourcesNotFound",
+                "ReferencedGeneratorsNotFound",
+                "RequiredFieldMissingOnCreate",
+                "StackReferenceNotFound",
+                "TargetReferenceNotFound",
+                "InvalidQuery",
+                "StackDeletedDuringApply",
+                "ReconcilePolicyRequired",
+                "NonPortableResources",
+                "PluginNotFound",
+                "PluginVersionNotFound",
+                "PluginDependencyConflict",
+                "PluginRepositoryUnreachable",
+                "PluginSignatureInvalid",
+                "TargetHasDependents",
+                "ResourceHasDependents",
+                "GeneratorDestinationsUnreachable",
+                "GeneratorBoundToSetOnceField",
+                "GeneratorHasDependents"
+            ]
+        },
+        "model.CancelCommandResponse": {
+            "type": "object",
+            "properties": {
+                "CommandIds": {
+                    "type": "array",
+                    "items": {
+                        "type": "string"
+                    }
+                },
+                "Forced": {
+                    "description": "Forced is true when the cancellation was requested with --force. The CLI\nuses this to surface the force-cancel warning and the list of resources\nthat were abandoned mid-operation.",
+                    "type": "boolean"
+                },
+                "ResourceUpdateStates": {
+                    "type": "object",
+                    "additionalProperties": {
+                        "$ref": "#/definitions/model.CancelResourceState"
+                    }
+                }
+            }
+        },
+        "model.CancelResourceState": {
+            "type": "object",
+            "properties": {
+                "CommandId": {
+                    "description": "CommandID attributes this update to the canceled command it belongs to;\nthe ResourceUpdateStates map is flat across all canceled commands.",
+                    "type": "string"
+                },
+                "ForceCanceled": {
+                    "description": "ForceCanceled is true when this resource update was force-canceled while an\noperation was actually in progress (it carries an OperationStatusCanceled\nprogress entry). These are the resources whose cloud-side state may be\norphaned and need manual verification.",
+                    "type": "boolean"
+                },
+                "State": {
+                    "description": "\"Canceled\", \"InProgress\", \"Success\", \"Failed\"",
+                    "type": "string"
+                }
+            }
+        },
+        "model.CoOwnership": {
+            "type": "object",
+            "properties": {
+                "SystemPatterns": {
+                    "description": "SystemPatterns are glob patterns over member identities naming entries\ninjected by the platform itself. Consulted only by extract on resources\nwith no ownership record; never by plan or drift.",
+                    "type": "array",
+                    "items": {
+                        "type": "string"
+                    }
+                }
+            }
+        },
+        "model.CommandDesiredDelta": {
+            "type": "object",
+            "properties": {
+                "CommandId": {
+                    "type": "string"
+                },
+                "DeletedResources": {
+                    "type": "array",
+                    "items": {
+                        "$ref": "#/definitions/model.DriftObservation"
+                    }
+                },
+                "Forma": {
+                    "$ref": "#/definitions/model.Forma"
+                },
+                "Partial": {
+                    "type": "boolean"
+                },
+                "Resolution": {
+                    "$ref": "#/definitions/model.DriftReview"
+                },
+                "State": {
+                    "type": "string"
+                }
+            }
+        },
+        "model.ConfigFieldHint": {
+            "type": "object",
+            "properties": {
+                "CreateOnly": {
+                    "type": "boolean"
+                }
+            }
+        },
+        "model.ConfigSchema": {
+            "type": "object",
+            "properties": {
+                "Hints": {
+                    "type": "object",
+                    "additionalProperties": {
+                        "$ref": "#/definitions/model.ConfigFieldHint"
+                    }
+                }
+            }
+        },
+        "model.DriftDecision": {
+            "type": "object",
+            "properties": {
+                "Action": {
+                    "description": "absorb or revert",
+                    "type": "string"
+                },
+                "ResourceID": {
+                    "type": "string"
+                }
+            }
+        },
+        "model.DriftObservation": {
+            "type": "object",
+            "properties": {
+                "BaselineCommandID": {
+                    "type": "string"
+                },
+                "Kind": {
+                    "description": "update, create, or delete",
+                    "type": "string"
+                },
+                "Label": {
+                    "type": "string"
+                },
+                "ObservedCommandID": {
+                    "type": "string"
+                },
+                "ObservedVersion": {
+                    "type": "string"
+                },
+                "ResourceID": {
+                    "type": "string"
+                },
+                "Stack": {
+                    "type": "string"
+                },
+                "StackID": {
+                    "type": "string"
+                },
+                "Type": {
+                    "type": "string"
+                }
+            }
+        },
+        "model.DriftResolutionError": {
+            "type": "object",
+            "properties": {
+                "Code": {
+                    "type": "string"
+                },
+                "CommandId": {
+                    "type": "string"
+                },
+                "Reason": {
+                    "type": "string"
+                },
+                "ResourceID": {
+                    "type": "string"
+                }
+            }
+        },
+        "model.DriftReview": {
+            "type": "object",
+            "properties": {
+                "Decisions": {
+                    "type": "array",
+                    "items": {
+                        "$ref": "#/definitions/model.DriftDecision"
+                    }
+                },
+                "ObservationID": {
+                    "type": "string"
+                },
+                "Observations": {
+                    "type": "array",
+                    "items": {
+                        "$ref": "#/definitions/model.DriftObservation"
+                    }
+                },
+                "ReviewID": {
+                    "type": "string"
+                }
+            }
+        },
+        "model.EdgeKind": {
+            "type": "string",
+            "enum": [
+                "default",
+                "attachesTo",
+                "runtimeDependency"
+            ],
+            "x-enum-varnames": [
+                "EdgeKindDefault",
+                "EdgeKindAttachesTo",
+                "EdgeKindRuntimeDependency"
+            ]
+        },
+        "model.ErrorResponse-model_DriftResolutionError": {
+            "type": "object",
+            "properties": {
+                "data": {
+                    "$ref": "#/definitions/model.DriftResolutionError"
+                },
+                "error": {
+                    "$ref": "#/definitions/model.APIError"
+                }
+            }
+        },
+        "model.ExtractionContext": {
+            "type": "object",
+            "properties": {
+                "CompleteStacks": {
+                    "type": "array",
+                    "items": {
+                        "$ref": "#/definitions/model.Stack"
+                    }
+                },
+                "ReferenceGenerators": {
+                    "type": "array",
+                    "items": {
+                        "type": "array",
+                        "items": {
+                            "type": "integer"
+                        }
+                    }
+                }
+            }
+        },
+        "model.FieldHint": {
+            "type": "object",
+            "properties": {
+                "AttachesTo": {
+                    "description": "DEPRECATED: kept for one release; engine derives EdgeKind from this when set.",
+                    "type": "boolean"
+                },
+                "CoOwned": {
+                    "description": "CoOwned marks a collection field whose live content legitimately has\nwriters other than this forma. nil = not co-owned.",
+                    "allOf": [
+                        {
+                            "$ref": "#/definitions/model.CoOwnership"
+                        }
+                    ]
+                },
+                "CreateOnly": {
+                    "type": "boolean"
+                },
+                "EdgeKind": {
+                    "description": "NEW",
+                    "allOf": [
+                        {
+                            "$ref": "#/definitions/model.EdgeKind"
+                        }
+                    ]
+                },
+                "Format": {
+                    "description": "\"\" = opaque String; \"json\" = serialized JSON document",
+                    "type": "string"
+                },
+                "HasProviderDefault": {
+                    "type": "boolean"
+                },
+                "IndexField": {
+                    "type": "string"
+                },
+                "Opaque": {
+                    "description": "NEW: this property is the resource's secret value",
+                    "type": "boolean"
+                },
+                "PreserveEmptyValues": {
+                    "description": "PreserveEmptyValues opts a top-level field's subtree out of empty-value\nnormalization: empty collections inside it are values, preserved on both\ndiff sides, in op values, and in plugin-bound payloads. Orthogonal to\nUpdateMethod; typically paired with Atomic on opaque document fields.",
+                    "type": "boolean"
+                },
+                "Required": {
+                    "type": "boolean"
+                },
+                "RequiredOnCreate": {
+                    "type": "boolean"
+                },
+                "RequiredOnUpdate": {
+                    "type": "boolean"
+                },
+                "UpdateMethod": {
+                    "$ref": "#/definitions/model.FieldUpdateMethod"
+                },
+                "WriteOnly": {
+                    "type": "boolean"
+                }
+            }
+        },
+        "model.FieldUpdateMethod": {
+            "type": "string",
+            "enum": [
+                "Array",
+                "EntitySet",
+                "Set",
+                "Atomic",
+                ""
+            ],
+            "x-enum-varnames": [
+                "FieldUpdateMethodArray",
+                "FieldUpdateMethodEntitySet",
+                "FieldUpdateMethodSet",
+                "FieldUpdateMethodAtomic",
+                "FieldUpdateMethodNone"
+            ]
+        },
+        "model.FilterCondition": {
+            "type": "object",
+            "properties": {
+                "propertyPath": {
+                    "description": "PropertyPath is a JSONPath expression to query resource properties.\nExamples:\n  - \"$.Tags[?(@.Key=='Name')].Value\" - get value of tag with key \"Name\"\n  - \"$.Tags[?(@.Key=~'eks:automode:.*')]\" - check if any tag key matches regex\n  - \"$.SkipDiscovery\" - get top-level property value",
+                    "type": "string"
+                },
+                "propertyValue": {
+                    "description": "PropertyValue is the expected value to match.\nEmpty string means existence check (path returns any value = match).\nNon-empty means exact string match against the query result.",
+                    "type": "string"
+                }
+            }
+        },
+        "model.ForceCheckTTLResponse": {
+            "type": "object",
+            "properties": {
+                "command_ids": {
+                    "type": "array",
+                    "items": {
+                        "type": "string"
+                    }
+                },
+                "expired_stacks": {
+                    "type": "array",
+                    "items": {
+                        "type": "string"
+                    }
+                }
+            }
+        },
+        "model.ForceReconcileResponse": {
+            "type": "object",
+            "properties": {
+                "command_id": {
+                    "type": "string"
+                },
+                "message": {
+                    "type": "string"
+                }
+            }
+        },
+        "model.Forma": {
+            "type": "object",
+            "properties": {
+                "Description": {
+                    "$ref": "#/definitions/github_com_platform-engineering-labs_formae_pkg_model.Description"
+                },
+                "Extraction": {
+                    "$ref": "#/definitions/model.ExtractionContext"
+                },
+                "Generators": {
+                    "description": "Generators, keyed to a stack by their own Stack field",
+                    "type": "array",
+                    "items": {
+                        "type": "array",
+                        "items": {
+                            "type": "integer"
+                        }
+                    }
+                },
+                "Policies": {
+                    "description": "Standalone policies",
+                    "type": "array",
+                    "items": {
+                        "type": "array",
+                        "items": {
+                            "type": "integer"
+                        }
+                    }
+                },
+                "Properties": {
+                    "type": "object",
+                    "additionalProperties": {
+                        "$ref": "#/definitions/model.Prop"
+                    }
+                },
+                "Resources": {
+                    "type": "array",
+                    "items": {
+                        "$ref": "#/definitions/model.Resource"
+                    }
+                },
+                "Stacks": {
+                    "type": "array",
+                    "items": {
+                        "$ref": "#/definitions/model.Stack"
+                    }
+                },
+                "Targets": {
+                    "type": "array",
+                    "items": {
+                        "$ref": "#/definitions/model.Target"
+                    }
+                }
+            }
+        },
+        "model.FormaApplyMode": {
+            "type": "string",
+            "enum": [
+                "patch",
+                "reconcile",
+                "none",
+                "properties"
+            ],
+            "x-enum-varnames": [
+                "FormaApplyModePatch",
+                "FormaApplyModeReconcile",
+                "FormaApplyModeNone",
+                "FormaApplyModeProperties"
+            ]
+        },
+        "model.GeneratorDestination": {
+            "type": "object",
+            "properties": {
+                "ResourceLabel": {
+                    "type": "string"
+                },
+                "StackLabel": {
+                    "type": "string"
+                }
+            }
+        },
+        "model.GeneratorInventoryItem": {
+            "type": "object",
+            "properties": {
+                "Config": {
+                    "type": "array",
+                    "items": {
+                        "type": "integer"
+                    }
+                },
+                "Destinations": {
+                    "type": "array",
+                    "items": {
+                        "$ref": "#/definitions/model.GeneratorDestination"
+                    }
+                },
+                "EverySeconds": {
+                    "type": "integer"
+                },
+                "GenerationID": {
+                    "type": "string"
+                },
+                "Label": {
+                    "type": "string"
+                },
+                "LastRotatedAt": {
+                    "type": "string"
+                },
+                "Stack": {
+                    "type": "string"
+                },
+                "Type": {
+                    "type": "string"
+                }
+            }
+        },
+        "model.GeneratorUpdate": {
+            "type": "object",
+            "properties": {
+                "Duration": {
+                    "description": "milliseconds",
+                    "type": "integer"
+                },
+                "ErrorMessage": {
+                    "type": "string"
+                },
+                "GeneratorConfig": {
+                    "description": "Current generator configuration",
+                    "type": "array",
+                    "items": {
+                        "type": "integer"
+                    }
+                },
+                "GeneratorLabel": {
+                    "type": "string"
+                },
+                "GeneratorType": {
+                    "description": "\"password\", etc.",
+                    "type": "string"
+                },
+                "ModifiedTs": {
+                    "type": "string"
+                },
+                "OldGeneratorConfig": {
+                    "description": "Previous generator configuration (for updates)",
+                    "type": "array",
+                    "items": {
+                        "type": "integer"
+                    }
+                },
+                "Operation": {
+                    "type": "string"
+                },
+                "StackLabel": {
+                    "type": "string"
+                },
+                "StartTs": {
+                    "type": "string"
+                },
+                "State": {
+                    "type": "string"
+                }
+            }
+        },
+        "model.LabelConfig": {
+            "type": "object",
+            "properties": {
+                "defaultQuery": {
+                    "description": "DefaultQuery is a JSONPath expression applied to all resources in this namespace.\nExample for AWS: `$.Tags[?(@.Key=='Name')].Value`\nIf empty, falls back to NativeID.",
+                    "type": "string"
+                },
+                "resourceOverrides": {
+                    "description": "ResourceOverrides provides JSONPath expressions for specific resource types,\noverriding the DefaultQuery. Use for resources without tags or with\nnon-standard label sources.\nKey: resource type (e.g., \"AWS::IAM::Policy\")\nValue: JSONPath expression (e.g., \"$.PolicyName\")",
+                    "type": "object",
+                    "additionalProperties": {
+                        "type": "string"
+                    }
+                }
+            }
+        },
+        "model.ListCommandStatusResponse": {
+            "type": "object",
+            "properties": {
+                "Commands": {
+                    "type": "array",
+                    "items": {
+                        "$ref": "#/definitions/github_com_platform-engineering-labs_formae_pkg_api_model.Command"
+                    }
+                }
+            }
+        },
+        "model.MatchFilter": {
+            "type": "object",
+            "properties": {
+                "conditions": {
+                    "description": "All conditions must match (AND logic) to exclude",
+                    "type": "array",
+                    "items": {
+                        "$ref": "#/definitions/model.FilterCondition"
+                    }
+                },
+                "resourceTypes": {
+                    "description": "Resource types this filter applies to; empty means every type",
+                    "type": "array",
+                    "items": {
+                        "type": "string"
+                    }
+                }
+            }
+        },
+        "model.ModifiedStack": {
+            "type": "object",
+            "properties": {
+                "ModifiedResources": {
+                    "type": "array",
+                    "items": {
+                        "$ref": "#/definitions/model.ResourceModification"
+                    }
+                }
+            }
+        },
+        "model.OwnedMembers": {
+            "type": "object",
+            "additionalProperties": {
+                "$ref": "#/definitions/model.OwnedPathRecord"
+            }
+        },
+        "model.OwnedPathRecord": {
+            "type": "object",
+            "properties": {
+                "Members": {
+                    "description": "Members are member identities, sorted, in provider spelling.",
+                    "type": "array",
+                    "items": {
+                        "type": "string"
+                    }
+                },
+                "Rule": {
+                    "description": "Rule is the record-compatibility rule the members were computed under\n(see IdentityRule). A stored record whose Rule no longer matches the\nfield's current hint is stale and must not be trusted for comparison.",
+                    "type": "string"
+                }
+            }
+        },
+        "model.ParentMapping": {
+            "type": "object",
+            "properties": {
+                "childProperty": {
+                    "type": "string"
+                },
+                "parentProperty": {
+                    "type": "string"
+                }
+            }
+        },
+        "model.PluginInfo": {
+            "type": "object",
+            "properties": {
+                "DiscoveryFilters": {
+                    "type": "array",
+                    "items": {
+                        "$ref": "#/definitions/model.MatchFilter"
+                    }
+                },
+                "LabelConfig": {
+                    "$ref": "#/definitions/model.LabelConfig"
+                },
+                "MaxRequestsPerSecond": {
+                    "type": "integer"
+                },
+                "Namespace": {
+                    "type": "string"
+                },
+                "NodeName": {
+                    "type": "string"
+                },
+                "ResourceCount": {
+                    "type": "integer"
+                },
+                "ResourceTypesToDiscover": {
+                    "type": "array",
+                    "items": {
+                        "type": "string"
+                    }
+                },
+                "RetryConfig": {
+                    "$ref": "#/definitions/model.RetryConfig"
+                },
+                "Version": {
+                    "type": "string"
+                }
+            }
+        },
+        "model.PolicyInventoryItem": {
+            "type": "object",
+            "properties": {
+                "AttachedStacks": {
+                    "type": "array",
+                    "items": {
+                        "type": "string"
+                    }
+                },
+                "Config": {
+                    "type": "array",
+                    "items": {
+                        "type": "integer"
+                    }
+                },
+                "Label": {
+                    "type": "string"
+                },
+                "Type": {
+                    "type": "string"
+                }
+            }
+        },
+        "model.PolicyUpdate": {
+            "type": "object",
+            "properties": {
+                "Duration": {
+                    "description": "milliseconds",
+                    "type": "integer"
+                },
+                "ErrorMessage": {
+                    "type": "string"
+                },
+                "ModifiedTs": {
+                    "type": "string"
+                },
+                "OldPolicyConfig": {
+                    "description": "Previous policy configuration (for updates)",
+                    "type": "array",
+                    "items": {
+                        "type": "integer"
+                    }
+                },
+                "Operation": {
+                    "type": "string"
+                },
+                "PolicyConfig": {
+                    "description": "Current policy configuration",
+                    "type": "array",
+                    "items": {
+                        "type": "integer"
+                    }
+                },
+                "PolicyLabel": {
+                    "type": "string"
+                },
+                "PolicyType": {
+                    "description": "\"ttl\", etc.",
+                    "type": "string"
+                },
+                "ReferencingStacks": {
+                    "description": "For skip operations - stacks still referencing this policy",
+                    "type": "array",
+                    "items": {
+                        "type": "string"
+                    }
+                },
+                "StackLabel": {
+                    "type": "string"
+                },
+                "StartTs": {
+                    "type": "string"
+                },
+                "State": {
+                    "type": "string"
+                }
+            }
+        },
+        "model.Prop": {
+            "type": "object",
+            "properties": {
+                "Default": {},
+                "Flag": {
+                    "type": "string"
+                },
+                "Sensitive": {
+                    "type": "boolean"
+                },
+                "Source": {
+                    "type": "string"
+                },
+                "Type": {
+                    "type": "string"
+                },
+                "Value": {}
+            }
+        },
+        "model.ReconcilePolicyRequiredError": {
+            "type": "object",
+            "properties": {
+                "StackLabel": {
+                    "type": "string"
+                }
+            }
+        },
+        "model.Resource": {
+            "type": "object",
+            "properties": {
+                "Alias": {
+                    "description": "previous label, used to rename in place",
+                    "type": "string"
+                },
+                "Group": {
+                    "type": "string"
+                },
+                "Ksuid": {
+                    "type": "string"
+                },
+                "Label": {
+                    "type": "string"
+                },
+                "Managed": {
+                    "description": "Whether the resource is managed by Formae or not",
+                    "type": "boolean"
+                },
+                "NativeID": {
+                    "type": "string"
+                },
+                "OwnedMembers": {
+                    "description": "OwnedMembers records, per co-owned collection field, the set of member\nidentities this forma last declared. Absent (nil) means no field on\nthis resource carries a declared ownership record.",
+                    "allOf": [
+                        {
+                            "$ref": "#/definitions/model.OwnedMembers"
+                        }
+                    ]
+                },
+                "PatchDocument": {
+                    "description": "Need this for CLI patch display",
+                    "type": "array",
+                    "items": {
+                        "type": "integer"
+                    }
+                },
+                "Properties": {
+                    "type": "array",
+                    "items": {
+                        "type": "integer"
+                    }
+                },
+                "ReadOnlyProperties": {
+                    "type": "array",
+                    "items": {
+                        "type": "integer"
+                    }
+                },
+                "Schema": {
+                    "$ref": "#/definitions/model.Schema"
+                },
+                "Stack": {
+                    "type": "string"
+                },
+                "Target": {
+                    "type": "string"
+                },
+                "Type": {
+                    "type": "string"
+                }
+            }
+        },
+        "model.ResourceModification": {
+            "type": "object",
+            "properties": {
+                "Label": {
+                    "type": "string"
+                },
+                "ObservedCommand": {
+                    "$ref": "#/definitions/github_com_platform-engineering-labs_formae_pkg_model.Command"
+                },
+                "ObservedCommandID": {
+                    "type": "string"
+                },
+                "ObservedMode": {
+                    "$ref": "#/definitions/model.FormaApplyMode"
+                },
+                "ObservedSource": {
+                    "type": "string"
+                },
+                "ObservedVersion": {
+                    "type": "string"
+                },
+                "OldProperties": {
+                    "description": "properties at last reconcile — update ops only",
+                    "type": "array",
+                    "items": {
+                        "type": "integer"
+                    }
+                },
+                "Operation": {
+                    "type": "string"
+                },
+                "PatchDocument": {
+                    "description": "JSON-patch diff between OldProperties and Properties — update ops only",
+                    "type": "array",
+                    "items": {
+                        "type": "integer"
+                    }
+                },
+                "Properties": {
+                    "description": "current (cloud) properties — update ops only",
+                    "type": "array",
+                    "items": {
+                        "type": "integer"
+                    }
+                },
+                "ResourceID": {
+                    "type": "string"
+                },
+                "Stack": {
+                    "type": "string"
+                },
+                "StackID": {
+                    "type": "string"
+                },
+                "Type": {
+                    "type": "string"
+                }
+            }
+        },
+        "model.ResourceSummary": {
+            "type": "object",
+            "properties": {
+                "Ksuid": {
+                    "type": "string"
+                },
+                "Label": {
+                    "type": "string"
+                },
+                "NativeID": {
+                    "type": "string"
+                },
+                "Stack": {
+                    "type": "string"
+                },
+                "Type": {
+                    "type": "string"
+                }
+            }
+        },
+        "model.ResourceUpdate": {
+            "type": "object",
+            "properties": {
+                "CascadeSource": {
+                    "type": "string"
+                },
+                "CreateOnlyPatch": {
+                    "description": "CreateOnlyPatch is a JSON-patch document (same format as PatchDocument)\nlisting only the ops against createOnly fields that triggered a\nresource replacement. Populated on the delete half of a replace pair\nso the CLI can render which immutable properties forced the replace.\nNever sent to resource plugins — the replace executes as a plain\ndestroy + create.",
+                    "type": "array",
+                    "items": {
+                        "type": "integer"
+                    }
+                },
+                "CurrentAttempt": {
+                    "type": "integer"
+                },
+                "Duration": {
+                    "description": "milliseconds (final, set on completion)",
+                    "type": "integer"
+                },
+                "ErrorMessage": {
+                    "type": "string"
+                },
+                "GroupId": {
+                    "type": "string"
+                },
+                "IsCascade": {
+                    "type": "boolean"
+                },
+                "MaxAttempts": {
+                    "type": "integer"
+                },
+                "NativeId": {
+                    "type": "string"
+                },
+                "OldLabel": {
+                    "description": "OldLabel is the resource's previous label. Populated only when a\nlabel rename is part of this update (via the alias path); empty\notherwise. The renderer uses it to surface the rename to the user.",
+                    "type": "string"
+                },
+                "OldProperties": {
+                    "type": "array",
+                    "items": {
+                        "type": "integer"
+                    }
+                },
+                "OldStackName": {
+                    "type": "string"
+                },
+                "Operation": {
+                    "type": "string"
+                },
+                "PatchDocument": {
+                    "type": "array",
+                    "items": {
+                        "type": "integer"
+                    }
+                },
+                "Properties": {
+                    "type": "array",
+                    "items": {
+                        "type": "integer"
+                    }
+                },
+                "ReferenceLabels": {
+                    "type": "object",
+                    "additionalProperties": {
+                        "type": "string"
+                    }
+                },
+                "ResourceId": {
+                    "type": "string"
+                },
+                "ResourceLabel": {
+                    "type": "string"
+                },
+                "ResourceType": {
+                    "type": "string"
+                },
+                "StackName": {
+                    "type": "string"
+                },
+                "StartedAt": {
+                    "description": "when the update began (for live elapsed)",
+                    "type": "string"
+                },
+                "State": {
+                    "type": "string"
+                },
+                "StateMessage": {
+                    "type": "string"
+                }
+            }
+        },
+        "model.RetryConfig": {
+            "type": "object",
+            "properties": {
+                "maxRetries": {
+                    "type": "integer"
+                },
+                "retryDelay": {
+                    "$ref": "#/definitions/time.Duration"
+                },
+                "statusCheckInterval": {
+                    "$ref": "#/definitions/time.Duration"
+                }
+            }
+        },
+        "model.Schema": {
+            "type": "object",
+            "properties": {
+                "Discoverable": {
+                    "type": "boolean"
+                },
+                "Extractable": {
+                    "type": "boolean"
+                },
+                "Fields": {
+                    "type": "array",
+                    "items": {
+                        "type": "string"
+                    }
+                },
+                "Hints": {
+                    "type": "object",
+                    "additionalProperties": {
+                        "$ref": "#/definitions/model.FieldHint"
+                    }
+                },
+                "Identifier": {
+                    "type": "string"
+                },
+                "Parent": {
+                    "description": "NEW: from ResourceHint.parent; \"\" when unset.",
+                    "type": "string"
+                },
+                "ParentMappings": {
+                    "description": "NEW: from ResourceHint.parentRefs[*]; nil when unset.",
+                    "type": "array",
+                    "items": {
+                        "$ref": "#/definitions/model.ParentMapping"
+                    }
+                },
+                "Portable": {
+                    "type": "boolean"
+                }
+            }
+        },
+        "model.Simulation": {
+            "type": "object",
+            "properties": {
+                "ChangesRequired": {
+                    "type": "boolean"
+                },
+                "Command": {
+                    "$ref": "#/definitions/github_com_platform-engineering-labs_formae_pkg_api_model.Command"
+                },
+                "Warnings": {
+                    "type": "array",
+                    "items": {
+                        "type": "string"
+                    }
+                }
+            }
+        },
+        "model.Stack": {
+            "type": "object",
+            "properties": {
+                "CreatedAt": {
+                    "type": "string"
+                },
+                "Description": {
+                    "description": "optional; empty means \"unset\" (never overwrites a stored description)",
+                    "type": "string"
+                },
+                "ID": {
+                    "type": "string"
+                },
+                "Label": {
+                    "type": "string"
+                },
+                "Policies": {
+                    "description": "Inline policies from PKL",
+                    "type": "array",
+                    "items": {
+                        "type": "array",
+                        "items": {
+                            "type": "integer"
+                        }
+                    }
+                }
+            }
+        },
+        "model.StackUpdate": {
+            "type": "object",
+            "properties": {
+                "Description": {
+                    "type": "string"
+                },
+                "Duration": {
+                    "description": "milliseconds",
+                    "type": "integer"
+                },
+                "ErrorMessage": {
+                    "type": "string"
+                },
+                "ModifiedTs": {
+                    "type": "string"
+                },
+                "Operation": {
+                    "type": "string"
+                },
+                "StackLabel": {
+                    "type": "string"
+                },
+                "StartTs": {
+                    "type": "string"
+                },
+                "State": {
+                    "type": "string"
+                }
+            }
+        },
+        "model.Stats": {
+            "type": "object",
+            "properties": {
+                "AgentId": {
+                    "type": "string"
+                },
+                "Capabilities": {
+                    "type": "array",
+                    "items": {
+                        "type": "string"
+                    }
+                },
+                "Clients": {
+                    "type": "integer"
+                },
+                "Commands": {
+                    "type": "object",
+                    "additionalProperties": {
+                        "type": "integer"
+                    }
+                },
+                "Plugins": {
+                    "type": "array",
+                    "items": {
+                        "$ref": "#/definitions/model.PluginInfo"
+                    }
+                },
+                "ReapPendingTargets": {
+                    "description": "ReapPendingTargets counts targets that are still 'unreachable' but have\nalready accrued at least their configured reap-after duration — they\nare due to be reaped (on an upcoming reaper tick, or held back by the\nrate cap or an in-flight command). Surfaced so an over-threshold target\nis visible before any tombstone.",
+                    "type": "integer"
+                },
+                "ReapedTargets": {
+                    "description": "ReapedTargets counts targets whose current health state is 'reaped'.",
+                    "type": "integer"
+                },
+                "ResourceTypes": {
+                    "description": "key: resource type (e.g., \"AWS::S3::Bucket\")",
+                    "type": "object",
+                    "additionalProperties": {
+                        "type": "integer"
+                    }
+                },
+                "Resources": {
+                    "description": "key: namespace (e.g., \"AWS\", \"Azure\")",
+                    "type": "object",
+                    "additionalProperties": {
+                        "type": "integer"
+                    }
+                },
+                "Stacks": {
+                    "type": "integer"
+                },
+                "States": {
+                    "type": "object",
+                    "additionalProperties": {
+                        "type": "integer"
+                    }
+                },
+                "Targets": {
+                    "description": "key: namespace",
+                    "type": "object",
+                    "additionalProperties": {
+                        "type": "integer"
+                    }
+                },
+                "UnmanagedResources": {
+                    "description": "key: namespace",
+                    "type": "object",
+                    "additionalProperties": {
+                        "type": "integer"
+                    }
+                },
+                "Version": {
+                    "type": "string"
+                }
+            }
+        },
+        "model.SubmitCommandResponse": {
+            "type": "object",
+            "properties": {
+                "CommandId": {
+                    "type": "string"
+                },
+                "Description": {
+                    "$ref": "#/definitions/github_com_platform-engineering-labs_formae_pkg_api_model.Description"
+                },
+                "Review": {
+                    "$ref": "#/definitions/model.DriftReview"
+                },
+                "Simulation": {
+                    "$ref": "#/definitions/model.Simulation"
+                }
+            }
+        },
+        "model.Target": {
+            "type": "object",
+            "properties": {
+                "Config": {
+                    "type": "array",
+                    "items": {
+                        "type": "integer"
+                    }
+                },
+                "ConfigSchema": {
+                    "$ref": "#/definitions/model.ConfigSchema"
+                },
+                "Discoverable": {
+                    "type": "boolean"
+                },
+                "ExecutionIncarnation": {
+                    "description": "ExecutionIncarnation is nonsecret internal resource-update provenance.\nApply planning discards client supplied values and pins datastore evidence.",
+                    "type": "string"
+                },
+                "Label": {
+                    "type": "string"
+                },
+                "Namespace": {
+                    "type": "string"
+                },
+                "Reaping": {
+                    "description": "Reaping holds the target's reaping behaviour. It is stored as a raw\nJSON message (not the ReapingBehaviour interface) because Target is\nembedded in structs that round-trip through json.Marshal/Unmarshal for\npersistence, and encoding/json cannot unmarshal a present JSON object\ninto a nil interface field. Use ParseReaping to decode it.",
+                    "type": "array",
+                    "items": {
+                        "type": "integer"
+                    }
+                },
+                "Version": {
+                    "type": "integer"
+                }
+            }
+        },
+        "model.TargetUpdate": {
+            "type": "object",
+            "properties": {
+                "CascadeSource": {
+                    "type": "string"
+                },
+                "DesiredConfig": {
+                    "type": "array",
+                    "items": {
+                        "type": "integer"
+                    }
+                },
+                "Discoverable": {
+                    "type": "boolean"
+                },
+                "Duration": {
+                    "description": "milliseconds",
+                    "type": "integer"
+                },
+                "ErrorMessage": {
+                    "type": "string"
+                },
+                "ExistingConfig": {
+                    "type": "array",
+                    "items": {
+                        "type": "integer"
+                    }
+                },
+                "IsCascade": {
+                    "type": "boolean"
+                },
+                "ModifiedTs": {
+                    "type": "string"
+                },
+                "Operation": {
+                    "type": "string"
+                },
+                "StartTs": {
+                    "type": "string"
+                },
+                "State": {
+                    "type": "string"
+                },
+                "TargetLabel": {
+                    "type": "string"
+                }
+            }
+        },
+        "time.Duration": {
+            "type": "integer",
+            "format": "int64",
+            "enum": [
+                -9223372036854775808,
+                9223372036854775807,
+                1,
+                1000,
+                1000000,
+                1000000000,
+                60000000000,
+                3600000000000
+            ],
+            "x-enum-varnames": [
+                "minDuration",
+                "maxDuration",
+                "Nanosecond",
+                "Microsecond",
+                "Millisecond",
+                "Second",
+                "Minute",
+                "Hour"
+            ]
+        }
+    }
+}

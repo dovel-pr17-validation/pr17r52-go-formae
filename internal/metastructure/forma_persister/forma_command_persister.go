@@ -1,0 +1,1796 @@
+// © 2025 Platform Engineering Labs Inc.
+//
+// SPDX-License-Identifier: FSL-1.1-ALv2
+
+package forma_persister
+
+import (
+	"bytes"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"log/slog"
+	"slices"
+	"time"
+
+	"ergo.services/ergo/act"
+	"ergo.services/ergo/gen"
+	"github.com/platform-engineering-labs/formae/internal/datastore"
+	"github.com/platform-engineering-labs/formae/internal/metastructure/actornames"
+	"github.com/platform-engineering-labs/formae/internal/metastructure/forma_command"
+	"github.com/platform-engineering-labs/formae/internal/metastructure/generator_update"
+	"github.com/platform-engineering-labs/formae/internal/metastructure/messages"
+	"github.com/platform-engineering-labs/formae/internal/metastructure/resource_update"
+	"github.com/platform-engineering-labs/formae/internal/metastructure/target_update"
+	"github.com/platform-engineering-labs/formae/internal/metastructure/transformations"
+	"github.com/platform-engineering-labs/formae/internal/metastructure/types"
+	"github.com/platform-engineering-labs/formae/internal/metastructure/util"
+	pkgmodel "github.com/platform-engineering-labs/formae/pkg/model"
+	"github.com/platform-engineering-labs/formae/pkg/plugin"
+	"github.com/platform-engineering-labs/formae/pkg/plugin/resource"
+)
+
+type FormaCommandPersister struct {
+	act.Actor
+
+	datastore datastore.Datastore
+
+	// activeCommands caches in-flight FormaCommands to avoid repeated JSON unmarshaling.
+	// Commands are evicted when they reach a final state (Success, Failed, Canceled).
+	activeCommands map[string]*cachedCommand
+}
+
+// cachedCommand holds an in-memory FormaCommand with optimized lookup structures.
+type cachedCommand struct {
+	command            *forma_command.FormaCommand
+	ksuidOpToIndex     map[string]int  // O(1) lookup: "ksuid:operation" -> ResourceUpdates index
+	pendingCompletions int             // Number of MarkResourceUpdateAsComplete messages expected
+	terminalizedByBulk map[string]bool // Resources terminalized by bulkUpdateResourceState (counter already decremented)
+	// dirty marks a command whose cached state a DATASTORE WRITE failed to
+	// make durable: the cache is ahead of the datastore. The next request
+	// touching the command flushes the cached state before being served, so
+	// a failed final write cannot leave the stored command non-terminal
+	// until an agent restart. Only actual write failures set it — an arm
+	// that fails before writing (validation, hashing) must NOT, or the
+	// flush would persist the partial mutation that arm rejected.
+	dirty bool
+}
+
+// resourceUpdateKey creates a composite key for looking up a ResourceUpdate by ksuid and operation.
+// Replace operations are stored as two separate entries (delete + create) with the same ksuid,
+// so we need both ksuid and operation to uniquely identify an entry.
+func resourceUpdateKey(ksuid string, operation types.OperationType) string {
+	return ksuid + ":" + string(operation)
+}
+
+// buildResourceUpdateIndex creates a lookup map for O(1) access to ResourceUpdates.
+// Uses composite key "ksuid:operation" since Replace operations store two entries
+// (delete + create) with the same ksuid.
+func buildResourceUpdateIndex(cmd *forma_command.FormaCommand) map[string]int {
+	ksuidOpToIndex := make(map[string]int, len(cmd.ResourceUpdates))
+	for i, ru := range cmd.ResourceUpdates {
+		key := resourceUpdateKey(ru.DesiredState.Ksuid, types.OperationType(ru.Operation))
+		if existingIdx, collision := ksuidOpToIndex[key]; collision {
+			slog.Error("BUG: buildResourceUpdateIndex collision — two resource updates share the same ksuid:operation key",
+				"commandID", cmd.ID,
+				"key", key,
+				"existingIdx", existingIdx,
+				"existingLabel", cmd.ResourceUpdates[existingIdx].DesiredState.Label,
+				"existingStack", cmd.ResourceUpdates[existingIdx].DesiredState.Stack,
+				"newIdx", i,
+				"newLabel", ru.DesiredState.Label,
+				"newStack", ru.DesiredState.Stack)
+		}
+		ksuidOpToIndex[key] = i
+	}
+	return ksuidOpToIndex
+}
+
+// countNonFinalResources returns the number of resource updates not yet in final state.
+// Used when loading a command from DB to initialize the pending completions counter.
+func countNonFinalResources(cmd *forma_command.FormaCommand) int {
+	count := 0
+	for _, ru := range cmd.ResourceUpdates {
+		if !ru.IsAcceptance() && !isResourceInFinalState(ru.State) {
+			count++
+		}
+	}
+	return count
+}
+
+// buildTerminalizedByBulkIndex builds a set of resource update keys that are already
+// in a terminal state when loading from the database. This ensures that any late
+// MarkResourceUpdateAsComplete messages for these resources are treated as no-ops,
+// guarding against pendingCompletions underflow.
+func buildTerminalizedByBulkIndex(cmd *forma_command.FormaCommand) map[string]bool {
+	m := make(map[string]bool)
+	for _, ru := range cmd.ResourceUpdates {
+		if isResourceInFinalState(ru.State) {
+			m[resourceUpdateKey(ru.DesiredState.Ksuid, types.OperationType(ru.Operation))] = true
+		}
+	}
+	return m
+}
+
+// isResourceInFinalState checks if a resource update is in a final state.
+func isResourceInFinalState(state types.ResourceUpdateState) bool {
+	return state == types.ResourceUpdateStateSuccess ||
+		state == types.ResourceUpdateStateFailed ||
+		state == types.ResourceUpdateStateRejected ||
+		state == types.ResourceUpdateStateCanceled
+}
+
+// isTargetInFinalState checks if a target update is in a final state.
+func isTargetInFinalState(state types.TargetUpdateState) bool {
+	return state == types.TargetUpdateStateSuccess ||
+		state == types.TargetUpdateStateFailed ||
+		state == types.TargetUpdateStateCanceled
+}
+
+// findResourceUpdateIndex returns the index of the ResourceUpdate with the given ksuid and operation.
+// Returns -1 if not found.
+func (c *cachedCommand) findResourceUpdateIndex(ksuid string, operation types.OperationType) int {
+	key := resourceUpdateKey(ksuid, operation)
+	if idx, ok := c.ksuidOpToIndex[key]; ok {
+		return idx
+	}
+	return -1
+}
+
+func NewFormaCommandPersister() gen.ProcessBehavior {
+	return &FormaCommandPersister{}
+}
+
+func (f *FormaCommandPersister) Init(args ...any) error {
+	ds, ok := f.Env("Datastore")
+	if !ok {
+		f.Log().Error("FormaCommandPersister: missing 'Datastore' environment variable")
+		return fmt.Errorf("formaCommandPersister: missing 'Datastore' environment variable")
+	}
+	f.datastore = ds.(datastore.Datastore)
+	f.activeCommands = make(map[string]*cachedCommand)
+
+	f.Log().Debug("FormaCommandPersister initialized: datastoreType=%s", fmt.Sprintf("%T", f.datastore))
+
+	return nil
+}
+
+// getOrLoadCommand retrieves a command from cache or loads it from the database.
+// The command is cached for subsequent accesses until it reaches a final state.
+func (f *FormaCommandPersister) getOrLoadCommand(commandID string) (*cachedCommand, error) {
+	// Check cache first. A dirty entry holds mutations an earlier failed
+	// write never made durable; flush it before serving anything from it. A
+	// terminal command flushes through finalizeAndPersist so the original
+	// finalization semantics are preserved: an empty sync command is deleted
+	// rather than stored, and a completed command is evicted rather than
+	// retained. A failed flush fails the request — acknowledging work
+	// against state the datastore does not hold would let a retried request
+	// hit a no-op guard and report success for a command that was never
+	// made durable. The entry stays dirty and the next touch retries.
+	if cached, ok := f.activeCommands[commandID]; ok {
+		if cached.dirty {
+			var err error
+			if cached.command.IsInFinalState() {
+				err = f.finalizeAndPersist(cached)
+			} else {
+				err = f.persistCommand(cached)
+			}
+			if err != nil {
+				return nil, fmt.Errorf("cannot serve command %s: flushing earlier unpersisted state failed: %w", commandID, err)
+			}
+			// finalizeAndPersist may have evicted (or deleted) the entry;
+			// fall through to a fresh load when it is gone.
+			if again, stillCached := f.activeCommands[commandID]; stillCached {
+				return again, nil
+			}
+		} else {
+			return cached, nil
+		}
+	}
+
+	// Load from DB
+	cmd, err := f.datastore.GetFormaCommandByCommandID(commandID)
+	if err != nil {
+		return nil, err
+	}
+
+	// Build cache entry
+	cached := &cachedCommand{
+		command:            cmd,
+		ksuidOpToIndex:     buildResourceUpdateIndex(cmd),
+		pendingCompletions: countNonFinalResources(cmd),
+		terminalizedByBulk: buildTerminalizedByBulkIndex(cmd),
+	}
+	if !cmd.IsInFinalState() {
+		f.activeCommands[commandID] = cached
+	}
+
+	return cached, nil
+}
+
+// persistCommand writes the command to the database.
+// For simple progress updates, use this directly.
+func (f *FormaCommandPersister) persistCommand(cached *cachedCommand) error {
+	cmd := cached.command
+	// Legacy metadata completion can terminalize acceptance without any later
+	// provider completion. Use the same finalization boundary as admission.
+	if cmd.IsInFinalState() && !cmd.HasExecutableChanges() {
+		return f.finalizeAndPersist(cached)
+	}
+
+	if err := f.datastore.StoreFormaCommand(cmd, cmd.ID); err != nil {
+		f.Log().Error("Failed to store command commandID=%s: %v", cmd.ID, err)
+		cached.dirty = true
+		return fmt.Errorf("failed to store command: %w", err)
+	}
+	cached.dirty = false
+
+	return nil
+}
+
+// finalizeAndPersist handles finalization logic after a command completes:
+// hashes sensitive data, deletes empty sync commands, and evicts from cache.
+// Use this for markResourceUpdateAsComplete and bulkUpdateResourceState.
+func (f *FormaCommandPersister) finalizeAndPersist(cached *cachedCommand) error {
+	cmd := cached.command
+
+	if _, err := f.hashSensitiveDataIfComplete(cmd); err != nil {
+		f.Log().Error("Failed to hash sensitive data commandID=%s: %v", cmd.ID, err)
+		return fmt.Errorf("failed to hash sensitive data: %w", err)
+	}
+
+	shouldDelete := shouldDeleteSyncCommand(cmd, cached)
+	if shouldDelete {
+		if err := f.datastore.DeleteFormaCommand(cmd, cmd.ID); err != nil {
+			f.Log().Error("Failed to delete sync command commandID=%s: %v", cmd.ID, err)
+			cached.dirty = true
+			return fmt.Errorf("failed to delete sync command: %w", err)
+		}
+		if err := f.Send(gen.ProcessID{Name: actornames.ChangesetSupervisor, Node: f.Node().Name()}, messages.RetireAdmittedDispatch{CommandID: cmd.ID}); err != nil {
+			f.Log().Debug("Failed to retire terminal dispatch commandID=%s: %v", cmd.ID, err)
+		}
+		delete(f.activeCommands, cmd.ID)
+		return nil
+	}
+
+	if err := f.datastore.StoreFormaCommand(cmd, cmd.ID); err != nil {
+		f.Log().Error("Failed to store command commandID=%s: %v", cmd.ID, err)
+		cached.dirty = true
+		return fmt.Errorf("failed to store command: %w", err)
+	}
+	cached.dirty = false
+
+	// Evict from cache if command is complete.
+	// We must wait for all completion messages before evicting because
+	// evicting early causes getOrLoadCommand to reload from DB where
+	// countNonFinalResources returns 0 (resources already in final state
+	// from UpdateResourceProgress), leading to pendingCompletions underflow.
+	if cmd.IsInFinalState() {
+		if cached.pendingCompletions > 0 {
+			return nil
+		}
+		if err := f.Send(gen.ProcessID{Name: actornames.ChangesetSupervisor, Node: f.Node().Name()}, messages.RetireAdmittedDispatch{CommandID: cmd.ID}); err != nil {
+			f.Log().Debug("Failed to retire terminal dispatch commandID=%s: %v", cmd.ID, err)
+		}
+		delete(f.activeCommands, cmd.ID)
+	}
+
+	return nil
+}
+
+type StoreNewFormaCommand struct {
+	Command   forma_command.FormaCommand
+	Admission *datastore.CommandAdmission
+}
+
+type LoadFormaCommand struct {
+	CommandID string
+}
+
+// ResourceUpdateRef identifies a specific ResourceUpdate by URI and operation.
+// This is needed because Replace operations create two entries (delete + create)
+// with the same KSUID, so URI alone is not sufficient.
+type ResourceUpdateRef struct {
+	URI       pkgmodel.FormaeURI
+	Operation types.OperationType
+}
+
+type MarkResourcesAsRejected struct {
+	CommandID          string
+	Resources          []ResourceUpdateRef
+	ResourceModifiedTs time.Time
+}
+
+// MarkResourcesAsFailed is sent by the changeset executor when resource
+// updates are cascade-failed by a dependency's failure.
+//
+// FailureReason is the operator-facing explanation from the node that failed,
+// stamped on every resource in the batch. These resources never ran, so they
+// have no plugin progress of their own to explain them, and without it the
+// apply reports them failed with nothing said about why. It is empty when the
+// failing node offered no reason.
+type MarkResourcesAsFailed struct {
+	CommandID          string
+	Resources          []ResourceUpdateRef
+	ResourceModifiedTs time.Time
+	FailureReason      string
+}
+
+type MarkResourcesAsCanceled struct {
+	CommandID string
+	Resources []ResourceUpdateRef
+}
+
+// MarkCommandResourcesAsCanceled cancels every still-non-terminal resource
+// update of a command without the caller having to enumerate them. It is used
+// when a command is canceled before its ChangesetExecutor has built the DAG
+// (cancel arrives while the executor is still in its not-started state), so the
+// executor has no resource references of its own to pass.
+type MarkCommandResourcesAsCanceled struct {
+	CommandID string
+}
+
+// TargetUpdateRef identifies a specific TargetUpdate by label and operation.
+type TargetUpdateRef struct {
+	Label     string
+	Operation types.OperationType
+}
+
+// BulkForceCancel terminalizes all still-in-flight resource and target updates for a command
+// in one persister turn. Used by the force-cancel flow.
+type BulkForceCancel struct {
+	CommandID string
+	Resources []ResourceUpdateRef
+	Targets   []TargetUpdateRef
+}
+
+// BulkForceCancelResponse reports the outcome of a BulkForceCancel.
+//
+// A persistence failure is reported in-band via ErrorMessage rather than as a Go error
+// from HandleCall: returning a non-nil error from a persister HandleCall terminates the
+// persister actor and leaves the caller timing out. The force-cancel contract is
+// persist-before-terminate — the caller must learn the persist failed (and terminate no
+// actors) without crashing the persister. An empty ErrorMessage means success.
+type BulkForceCancelResponse struct {
+	Skipped                 []ResourceUpdateRef // rows that were already terminal (no-op)
+	ForceCanceledInProgress []ResourceUpdateRef // rows that were InProgress (got force-cancel progress entries)
+	ErrorMessage            string              // non-empty if the force-cancel persist failed
+}
+
+// MarkTargetsAsFailed is sent by the changeset executor when target updates
+// are cascade-failed due to a dependency failure in the DAG.
+type MarkTargetsAsFailed struct {
+	CommandID        string
+	Targets          []TargetUpdateRef
+	TargetModifiedTs time.Time
+}
+
+// FinalizeIncompleteCommand is sent when every resource update in a command
+// has reached a terminal state but the command itself was never marked
+// complete. Two callers:
+//
+//   - crash recovery, where the agent went down between the last resource
+//     completion and the command state transition;
+//   - a submitted command with no changeset work at all, whose updates were
+//     applied synchronously during submission (generator work) and which
+//     therefore has nothing left to report its completion.
+//
+// A command with no resource updates satisfies the terminality guard
+// trivially, which is what makes the second caller work.
+type FinalizeIncompleteCommand struct {
+	CommandID string
+}
+
+// CommandPersistResult is the reply to the command-mutation requests: OK
+// carries the handler's boolean outcome, Error the failure that refused the
+// request.
+type CommandPersistResult struct {
+	OK                 bool
+	Error              string
+	Admission          *datastore.AdmissionResult
+	AdmissionErrorCode string
+}
+
+func (r CommandPersistResult) CallError() string { return r.Error }
+func (r CommandPersistResult) CallFailure() error {
+	if r.Error == "" {
+		return nil
+	}
+	var cause error
+	switch r.AdmissionErrorCode {
+	case "stale":
+		cause = datastore.ErrStaleAdmission
+	case "conflict":
+		cause = datastore.ErrAdmissionConflict
+	case "invalid":
+		cause = datastore.ErrInvalidAdmission
+	case "command-conflict":
+		cause = datastore.ErrCommandConflict
+	}
+	if cause != nil {
+		return fmt.Errorf("%s: %w", r.Error, cause)
+	}
+	return errors.New(r.Error)
+}
+
+// LoadFormaCommandResult is the reply to a LoadFormaCommand call.
+type LoadFormaCommandResult struct {
+	Command *forma_command.FormaCommand
+	Error   string
+}
+
+func (r LoadFormaCommandResult) CallError() string { return r.Error }
+
+// errInvariantViolation marks a failure that indicates a programming error
+// rather than a request-scoped outcome. Handlers wrap such failures with it,
+// and HandleCall lets them terminate the actor: a violated invariant means
+// the in-memory state cannot be trusted, and a supervised restart that
+// rebuilds it from the datastore is the right medicine.
+var errInvariantViolation = errors.New("invariant violation")
+
+// HandleCall answers every request with a typed result carrying its own
+// success/failure status. Returning an error here would terminate the actor
+// without a reply: the caller times out, every request queued in the mailbox
+// dies with it, and the supervisor respawns the actor only for the next bad
+// request to repeat the cycle. The error return keeps the meaning ergo
+// assigns to it — terminate — and is reserved for genuine faults: invariant
+// violations and unknown request types. The activeCommands cache deliberately
+// survives a failed store: it accumulates progress write-through, so after a
+// failure it is ahead of the datastore, marked dirty at the failed write, and
+// flushed by the next request that touches the command.
+func (f *FormaCommandPersister) HandleCall(from gen.PID, ref gen.Ref, message any) (any, error) {
+	start := time.Now()
+	defer func() {
+		f.Log().Debug("FormaCommandPersister HandleCall timing messageType=%T duration=%v", message, time.Since(start))
+	}()
+	switch msg := message.(type) {
+	case StoreNewFormaCommand:
+		result, err := f.storeNewFormaCommandWithAdmission(&msg.Command, msg.Admission)
+		if err != nil {
+			return f.ack(false, err)
+		}
+		return result, nil
+	case LoadFormaCommand:
+		cmd, err := f.loadFormaCommand(msg.CommandID)
+		if err != nil {
+			f.Log().Error("FormaCommandPersister: request %T failed: %s", message, err)
+			return LoadFormaCommandResult{Error: err.Error()}, nil
+		}
+		return LoadFormaCommandResult{Command: cmd}, nil
+	case messages.UpdateResourceProgress:
+		return f.ack(f.updateCommandFromProgress(&msg))
+	case target_update.UpdateTargetStates:
+		return f.ack(f.updateTargetStates(&msg))
+	case messages.UpdateStackStates:
+		return f.ack(f.updateStackStates(&msg))
+	case messages.UpdatePolicyStates:
+		return f.ack(f.updatePolicyStates(&msg))
+	case generator_update.UpdateGeneratorStates:
+		return f.ack(f.updateGeneratorStates(&msg))
+	case MarkResourcesAsRejected:
+		return f.ack(f.markResourcesAsRejected(&msg))
+	case MarkResourcesAsFailed:
+		return f.ack(f.markResourcesAsFailed(&msg))
+	case MarkTargetsAsFailed:
+		return f.ack(f.markTargetsAsFailed(&msg))
+	case MarkResourcesAsCanceled:
+		return f.ack(f.markResourcesAsCanceled(&msg))
+	case MarkCommandResourcesAsCanceled:
+		return f.ack(f.markCommandResourcesAsCanceled(&msg))
+	case BulkForceCancel:
+		// BulkForceCancel carries failures in its own response envelope so the
+		// executor can apply its persist-before-terminate retry semantics; a
+		// handler error is folded into that envelope, never a termination.
+		resp, err := f.bulkForceCancel(&msg)
+		if err != nil {
+			f.Log().Error("FormaCommandPersister: request %T failed: %s", message, err)
+			return BulkForceCancelResponse{ErrorMessage: err.Error()}, nil
+		}
+		return resp, nil
+	case messages.MarkResourceUpdateAsComplete:
+		return f.ack(f.markResourceUpdateAsComplete(&msg))
+	case FinalizeIncompleteCommand:
+		return f.ack(f.finalizeIncompleteCommand(&msg))
+	case messages.PinTargetExecutionIdentity:
+		cached, err := f.getOrLoadCommand(msg.CommandID)
+		if err != nil {
+			return messages.PersistVersionsResult{Error: err.Error()}, nil
+		}
+		writer, ok := f.datastore.(datastore.CommandTargetIdentityWriter)
+		if !ok {
+			return messages.PersistVersionsResult{Error: "datastore lacks target execution identity persistence"}, nil
+		}
+		refs := []datastore.ResourceUpdateRef{}
+		indices := []int{}
+		for _, requested := range msg.Resources {
+			found := false
+			for i, ru := range cached.command.ResourceUpdates {
+				if ru.DesiredState.Ksuid == requested.KSUID && ru.Operation == requested.Operation && ru.ResourceTarget.Label == msg.TargetLabel {
+					refs = append(refs, datastore.ResourceUpdateRef{KSUID: requested.KSUID, Operation: requested.Operation})
+					indices = append(indices, i)
+					found = true
+					break
+				}
+			}
+			if !found {
+				return messages.PersistVersionsResult{Error: "target execution resource identity mismatch"}, nil
+			}
+		}
+		if err = writer.PinCommandTargetIncarnation(msg.CommandID, msg.TargetLabel, msg.Incarnation, refs); err != nil {
+			return messages.PersistVersionsResult{Error: err.Error()}, nil
+		}
+		for _, i := range indices {
+			cached.command.ResourceUpdates[i].ResourceTarget.ExecutionIncarnation = msg.Incarnation
+		}
+
+		return messages.PersistVersionsResult{}, nil
+	case messages.MarkTargetUpdateAsComplete:
+		return f.ack(f.markTargetUpdateAsComplete(&msg))
+	default:
+		f.Log().Error("FormaCommandPersister: unhandled message type %T", msg)
+		return nil, fmt.Errorf("unhandled message type: %T", msg)
+	}
+}
+
+// ack folds a command-mutation outcome into its reply, letting invariant
+// violations terminate the actor.
+func (f *FormaCommandPersister) ack(ok bool, err error) (any, error) {
+	result := CommandPersistResult{OK: ok}
+	if err != nil {
+		if errors.Is(err, errInvariantViolation) {
+			return nil, err
+		}
+		if errors.Is(err, datastore.ErrStaleAdmission) || errors.Is(err, datastore.ErrAdmissionConflict) ||
+			errors.Is(err, datastore.ErrInvalidAdmission) || errors.Is(err, datastore.ErrCommandConflict) {
+			f.Log().Debug("FormaCommandPersister: request refused: %s", err)
+		} else {
+			f.Log().Error("FormaCommandPersister: request failed: %s", err)
+		}
+		result.Error = err.Error()
+		switch {
+		case errors.Is(err, datastore.ErrStaleAdmission):
+			result.AdmissionErrorCode = "stale"
+		case errors.Is(err, datastore.ErrAdmissionConflict):
+			result.AdmissionErrorCode = "conflict"
+		case errors.Is(err, datastore.ErrInvalidAdmission):
+			result.AdmissionErrorCode = "invalid"
+		case errors.Is(err, datastore.ErrCommandConflict):
+			result.AdmissionErrorCode = "command-conflict"
+		}
+	}
+	return result, nil
+}
+
+func (f *FormaCommandPersister) storeNewFormaCommandWithAdmission(command *forma_command.FormaCommand, admission *datastore.CommandAdmission) (CommandPersistResult, error) {
+	result := CommandPersistResult{OK: true}
+	f.Log().Debug("Storing new Forma command commandID=%s commandType=%s", command.ID, command.Command)
+
+	// DesiredState plaintext must survive pending execution/resume. Commands
+	// that complete at admission instead need hashing before their first write.
+
+	// Guarded callers resolved identity during their protected planning pass.
+	// Resolving it again here could silently rebind a reviewed incarnation.
+	if admission == nil {
+		if err := command.ResolveStackIdentities(f.datastore); err != nil {
+			return CommandPersistResult{}, err
+		}
+	}
+	readOnlySync := command.Command == pkgmodel.CommandSync &&
+		(command.Source == forma_command.SourceSynchronizer || command.Source == forma_command.SourceDiscovery)
+	scheduledGuarded := admission != nil && (admission.PrincipalScope == "stack-expirer" ||
+		admission.PrincipalScope == "auto-reconciler" || admission.PrincipalScope == "generator-rotator")
+	if !readOnlySync && (admission == nil || scheduledGuarded) {
+		conflict, err := f.datastore.HasConflictingCommandForStacks(command.GetStackLabels())
+		if err != nil {
+			return CommandPersistResult{}, fmt.Errorf("check conflicting commands: %w", err)
+		}
+		if conflict {
+			return CommandPersistResult{}, datastore.ErrCommandConflict
+		}
+	}
+	for i := range command.ResourceUpdates {
+		if command.ResourceUpdates[i].IsAcceptance() {
+			command.ResourceUpdates[i].State = types.ResourceUpdateStateSuccess
+		}
+	}
+	// Acceptance with metadata also has no later executor completion: guarded
+	// admission commits that metadata and marks any non-executable command Success.
+	if len(command.ResourceUpdates) > 0 && !command.HasExecutableChanges() {
+		command.State = overallCommandState(command)
+		if admission != nil {
+			command.State = forma_command.CommandStateSuccess
+		}
+		if _, err := f.hashSensitiveDataIfComplete(command); err != nil {
+			return CommandPersistResult{}, err
+		}
+	}
+	// Store the command metadata and ResourceUpdates (StoreFormaCommand handles both)
+	if admission != nil {
+		admitter, ok := f.datastore.(datastore.CommandAdmitter)
+		if !ok {
+			return CommandPersistResult{}, fmt.Errorf("datastore does not support guarded admission")
+		}
+		accepted, err := admitter.AdmitFormaCommand(command, *admission)
+		if err != nil {
+			return CommandPersistResult{}, err
+		}
+		if accepted.Replayed {
+			result.Admission = &accepted
+			return result, nil
+		}
+		command = accepted.Command
+		if command == nil {
+			return CommandPersistResult{}, fmt.Errorf("admission did not return committed command")
+		}
+		reply, err := snapshotFormaCommand(command)
+		if err != nil {
+			// Admission is already committed. Caller-key resolutions can retry the
+			// receipt; legacy Apply uses a fresh key, so restart recovery relies on
+			// ReRunIncompleteCommands. Do not cache a partial snapshot here.
+			return CommandPersistResult{}, fmt.Errorf("snapshot admitted command: %w", err)
+		}
+		accepted.Command = reply
+		result.Admission = &accepted
+		// Refresh is a postcommit hint; startup also reloads effective policies.
+		if len(command.StackUpdates) > 0 || len(command.PolicyUpdates) > 0 {
+			if err := f.Send(gen.ProcessID{Name: actornames.AutoReconciler, Node: f.Node().Name()}, messages.RefreshEffectivePolicies{}); err != nil {
+				f.Log().Warning("Failed to refresh committed policies: %v", err)
+			}
+		}
+	} else {
+		// The mailbox message owns only a shallow copy of the caller's command.
+		// Take ownership after synchronous normalization and before the durable
+		// write, so later progress cannot mutate caller memory and a snapshot
+		// failure cannot leave an unowned committed command.
+		owned, err := snapshotFormaCommand(command)
+		if err != nil {
+			return CommandPersistResult{}, fmt.Errorf("snapshot unguarded command: %w", err)
+		}
+		command = owned
+		if err = f.datastore.StoreFormaCommand(command, command.ID); err != nil {
+			return CommandPersistResult{}, fmt.Errorf("failed to store new Forma command: %w", err)
+		}
+	}
+
+	if command.IsInFinalState() {
+		return result, nil
+	}
+
+	// Cache the command to avoid immediate database reload on next message
+	f.activeCommands[command.ID] = &cachedCommand{
+		command:            command,
+		ksuidOpToIndex:     buildResourceUpdateIndex(command),
+		pendingCompletions: countExecutionResources(command),
+		terminalizedByBulk: acceptanceIndex(command),
+	}
+
+	f.Log().Debug("Stored and cached new Forma command commandID=%s", command.ID)
+
+	return result, nil
+}
+
+func (f *FormaCommandPersister) loadFormaCommand(commandID string) (*forma_command.FormaCommand, error) {
+	cached, err := f.getOrLoadCommand(commandID)
+	if err != nil {
+		f.Log().Error("Failed to load Forma command commandID=%s: %v", commandID, err)
+		return nil, fmt.Errorf("failed to load Forma command: %w", err)
+	}
+	command, err := snapshotFormaCommand(cached.command)
+	if err != nil {
+		return nil, fmt.Errorf("snapshot Forma command: %w", err)
+	}
+	return command, nil
+}
+
+// snapshotFormaCommand transfers command ownership out of the persister
+// mailbox. Ordinary JSON owns all public nested values; setup metadata restores
+// the hidden draw intent and generator identities that execution needs.
+func snapshotFormaCommand(command *forma_command.FormaCommand) (*forma_command.FormaCommand, error) {
+	data, err := json.Marshal(command)
+	if err != nil {
+		return nil, err
+	}
+	var snapshot forma_command.FormaCommand
+	if err = json.Unmarshal(data, &snapshot); err != nil {
+		return nil, err
+	}
+	setup, err := command.MarshalSetupMetadata(true)
+	if err != nil {
+		return nil, err
+	}
+	if err = snapshot.UnmarshalSetupMetadata(setup); err != nil {
+		return nil, err
+	}
+	return &snapshot, nil
+}
+
+func (f *FormaCommandPersister) updateCommandFromProgress(progress *messages.UpdateResourceProgress) (bool, error) {
+	cached, err := f.getOrLoadCommand(progress.CommandID)
+	if err != nil {
+		f.Log().Error("Failed to load Forma command for progress update commandID=%s: %v", progress.CommandID, err)
+		return false, fmt.Errorf("failed to load Forma command for progress update: %w", err)
+	}
+
+	command := cached.command
+
+	// Don't update if command is already canceled
+	if command.State == forma_command.CommandStateCanceled {
+		f.Log().Debug("Ignoring progress update for canceled command commandID=%s", progress.CommandID)
+		return true, nil
+	}
+
+	// Find matching ResourceUpdate by KSUID and operation
+	idx := cached.findResourceUpdateIndex(progress.ResourceURI.KSUID(), progress.Operation)
+	if idx != -1 {
+		res := &command.ResourceUpdates[idx]
+
+		// Monotonic terminality guard: once a resource update is in a final state it must
+		// not be overwritten by a late progress message from a still-running actor.
+		if isResourceInFinalState(res.State) {
+			f.Log().Debug("Ignoring late progress update for already-terminal resource commandID=%s ksuid=%s operation=%s currentState=%s incomingState=%s",
+				progress.CommandID, progress.ResourceURI.KSUID(), progress.Operation, res.State, progress.ResourceState)
+			return true, nil
+		}
+
+		// progress.Progress is already a TrackedProgress from the PluginOperator
+		tracked := progress.Progress
+		tracked.StartTs = progress.ResourceStartTs
+		tracked.ModifiedTs = progress.ResourceModifiedTs
+
+		// The progress copy is a read/actual-state snapshot (e.g. from a plugin poll or
+		// Read). It must be hashed schema-keyed before it is persisted (ProgressResult /
+		// MostRecentProgressResult, and the normalized resource_updates columns below).
+		// The in-memory res.DesiredState.Properties below stays plaintext — it is only
+		// hashed at final state (hashSensitiveDataIfComplete) so a resumed command can
+		// still execute with the real secret value.
+		//
+		// Hashing runs BEFORE any cached state is mutated: this arm answers its
+		// failures instead of terminating, and a half-applied mutation would make
+		// a retried update hit the terminality guard above and be dropped
+		// without ever becoming durable.
+		if tracked.ResourceProperties != nil {
+			hashedProps, diagnostics, err := hashReadActualProps(tracked.ResourceProperties, res.DesiredState.Schema, res.DesiredState.Type)
+			if err != nil {
+				return false, fmt.Errorf("failed to hash progress properties commandID=%s: %w", progress.CommandID, err)
+			}
+			f.logOpaqueDiagnostics(progress.CommandID, &res.DesiredState, diagnostics)
+			tracked.ResourceProperties = hashedProps
+		}
+
+		res.State = progress.ResourceState
+		res.StartTs = progress.ResourceStartTs
+		res.ModifiedTs = progress.ResourceModifiedTs
+
+		// NOTE: Do NOT decrement pendingCompletions here!
+		// pendingCompletions tracks expected MarkResourceUpdateAsComplete messages, not state transitions.
+		// Progress updates can set state to Success, but completion messages arrive separately.
+
+		index := slices.IndexFunc(res.ProgressResult, func(p plugin.TrackedProgress) bool {
+			return p.Operation == progress.Progress.Operation
+		})
+		if index == -1 {
+			res.ProgressResult = append(res.ProgressResult, tracked)
+		} else {
+			res.ProgressResult = slices.Replace(res.ProgressResult, index, index+1, tracked)
+		}
+		res.MostRecentProgressResult = tracked
+
+		if progress.ResourceProperties != nil {
+			res.DesiredState.Properties = progress.ResourceProperties
+		}
+
+		if progress.ResourceReadOnlyProperties != nil {
+			res.DesiredState.ReadOnlyProperties = progress.ResourceReadOnlyProperties
+		}
+
+		if progress.Version != "" {
+			res.Version = progress.Version
+		}
+		if len(progress.ResolvedRootDigests) > 0 {
+			res.ResolvedRootDigests = progress.ResolvedRootDigests
+		}
+
+		// Update the normalized resource_updates table
+		// Skip for sync commands: resource updates are not stored upfront, progress tracked in-memory only
+		if command.Command != pkgmodel.CommandSync {
+			if err := f.datastore.UpdateResourceUpdateProgress(
+				progress.CommandID,
+				progress.ResourceURI.KSUID(),
+				progress.Operation,
+				progress.ResourceState,
+				progress.ResourceStartTs,
+				progress.ResourceModifiedTs,
+				tracked,
+				progress.ResolvedRootDigests,
+			); err != nil {
+				f.Log().Error("Failed to update resource update progress in normalized table commandID=%s: %v", progress.CommandID, err)
+				// Continue with command meta update even if normalized update fails
+			}
+		}
+	}
+
+	// The first resource update reporting progress sets the start timestamp for the command
+	if command.StartTs.IsZero() {
+		command.StartTs = progress.ResourceStartTs
+	}
+	command.ModifiedTs = progress.ResourceModifiedTs
+
+	// Only transition NotStarted → InProgress here. Do NOT compute overallCommandState:
+	// the command must not reach a terminal state (Success/Failed) until markResourceUpdateAsComplete
+	// runs, which happens AFTER the ResourcePersister has stored the resource. Computing
+	// overallCommandState here would race with concurrent ResourceUpdaters — the last one's
+	// progress update could mark the command as Success before its resource is persisted,
+	// causing subsequent commands to miss the resource during KSUID assignment.
+	if command.State == forma_command.CommandStateNotStarted {
+		command.State = forma_command.CommandStateInProgress
+	}
+
+	// Only update command-level metadata (state, modified_ts)
+	// ResourceUpdates are already persisted via UpdateResourceUpdateProgress above
+	if err := f.datastore.UpdateFormaCommandProgress(command.ID, command.State, command.ModifiedTs); err != nil {
+		f.Log().Error("Failed to update Forma command meta from resource progress commandID=%s: %v", progress.CommandID, err)
+		cached.dirty = true
+		return false, fmt.Errorf("failed to update Forma command meta from resource progress: %w", err)
+	}
+
+	return true, nil
+}
+
+func (f *FormaCommandPersister) updateTargetStates(msg *target_update.UpdateTargetStates) (bool, error) {
+	f.Log().Debug("Updating Forma command with target states commandID=%s targetCount=%d", msg.CommandID, len(msg.TargetUpdates))
+
+	cached, err := f.getOrLoadCommand(msg.CommandID)
+	if err != nil {
+		f.Log().Error("Failed to load Forma command for target state update commandID=%s: %v", msg.CommandID, err)
+		return false, fmt.Errorf("failed to load Forma command for target state update: %w", err)
+	}
+
+	command := cached.command
+
+	// Merge incoming target updates with the cached state, preserving any target that has
+	// already reached a terminal state. A late UpdateTargetStates (e.g. from a TargetUpdater
+	// that raced with a cancel) must not clobber a Canceled/Failed/Success target.
+	if len(command.TargetUpdates) == 0 {
+		// No existing targets in cache — safe to replace wholesale.
+		command.TargetUpdates = msg.TargetUpdates
+	} else {
+		// Build a label+operation index into the existing (cached) slice for O(1) lookup.
+		type tuKey struct {
+			label     string
+			operation types.OperationType
+		}
+		existingIdx := make(map[tuKey]int, len(command.TargetUpdates))
+		for i, tu := range command.TargetUpdates {
+			existingIdx[tuKey{tu.Target.Label, tu.Operation}] = i
+		}
+
+		for _, incoming := range msg.TargetUpdates {
+			key := tuKey{incoming.Target.Label, incoming.Operation}
+			if idx, ok := existingIdx[key]; ok {
+				existing := &command.TargetUpdates[idx]
+				if isTargetInFinalState(existing.State) {
+					// Terminal state wins — drop the incoming non-terminal update.
+					f.Log().Debug("Ignoring late UpdateTargetStates for already-terminal target commandID=%s targetLabel=%s operation=%s currentState=%s incomingState=%s",
+						msg.CommandID, incoming.Target.Label, incoming.Operation, existing.State, incoming.State)
+					continue
+				}
+				// Non-terminal existing state: accept the incoming update.
+				*existing = incoming
+			} else {
+				// New target not previously seen — append it.
+				command.TargetUpdates = append(command.TargetUpdates, incoming)
+				existingIdx[key] = len(command.TargetUpdates) - 1
+			}
+		}
+	}
+
+	command.State = overallCommandState(command)
+
+	if err := f.persistCommand(cached); err != nil {
+		f.Log().Error("Failed to update Forma command with target states commandID=%s: %v", msg.CommandID, err)
+		return false, fmt.Errorf("failed to update Forma command with target states: %w", err)
+	}
+
+	f.Log().Debug("Successfully updated Forma command with target states commandID=%s", msg.CommandID)
+	return true, nil
+}
+
+func (f *FormaCommandPersister) markTargetUpdateAsComplete(msg *messages.MarkTargetUpdateAsComplete) (bool, error) {
+	f.Log().Debug("Marking target update as complete commandID=%s target=%s operation=%s state=%s", msg.CommandID, msg.TargetLabel, msg.TargetOperation, msg.FinalState)
+
+	cached, err := f.getOrLoadCommand(msg.CommandID)
+	if err != nil {
+		f.Log().Error("Failed to load Forma command for target completion commandID=%s: %v", msg.CommandID, err)
+		return false, fmt.Errorf("failed to load Forma command for target completion: %w", err)
+	}
+
+	command := cached.command
+	for i := range command.TargetUpdates {
+		tu := &command.TargetUpdates[i]
+		if tu.Target.Label != msg.TargetLabel {
+			continue
+		}
+
+		// Monotonic terminality guard: once a target update is in a final state it must
+		// not be overwritten by a late completion message.
+		if isTargetInFinalState(tu.State) {
+			f.Log().Debug("Ignoring late MarkTargetUpdateAsComplete for already-terminal target commandID=%s targetLabel=%s operation=%s currentState=%s incomingFinalState=%s",
+				msg.CommandID, msg.TargetLabel, msg.TargetOperation, tu.State, msg.FinalState)
+			return true, nil
+		}
+
+		if msg.FailureReason != "" {
+			tu.ErrorMessage = msg.FailureReason
+		}
+		if string(tu.Operation) == msg.TargetOperation {
+			// Direct match (e.g., standalone delete or create)
+			tu.State = msg.FinalState
+			tu.ModifiedTs = msg.ModifiedTs
+			break
+		}
+
+		// Handle replace: the DAG splits replace into delete + create.
+		// The delete phase succeeding moves replace to InProgress;
+		// the delete phase failing propagates the failure (create won't fire).
+		// The create phase completing moves it to the final state.
+		if string(tu.Operation) == "replace" {
+			if msg.TargetOperation == "delete" {
+				if msg.FinalState == types.TargetUpdateStateSuccess {
+					tu.State = types.TargetUpdateStateInProgress
+				} else {
+					tu.State = msg.FinalState
+				}
+			} else if msg.TargetOperation == "create" {
+				tu.State = msg.FinalState
+			}
+			tu.ModifiedTs = msg.ModifiedTs
+			break
+		}
+	}
+
+	command.State = overallCommandState(command)
+
+	if command.IsInFinalState() {
+		if err := f.finalizeAndPersist(cached); err != nil {
+			return false, err
+		}
+	} else {
+		// Use UpdateFormaCommandTargetUpdates instead of UpdateFormaCommandProgress
+		// because target update states are stored in the target_updates JSON blob, which
+		// UpdateFormaCommandProgress does not write — it only updates state + modified_ts.
+		// Without persisting target_updates, a persister restart loses the target state
+		// from the in-memory cache, causing the command to be stuck at InProgress forever.
+		targetUpdatesJSON, err := json.Marshal(command.TargetUpdates)
+		if err != nil {
+			return false, fmt.Errorf("failed to marshal target updates: %w", err)
+		}
+		if err := f.datastore.UpdateFormaCommandTargetUpdates(command.ID, targetUpdatesJSON, command.State, command.ModifiedTs); err != nil {
+			f.Log().Error("Failed to update Forma command target updates commandID=%s: %v", msg.CommandID, err)
+			cached.dirty = true
+			return false, fmt.Errorf("failed to update Forma command target updates: %w", err)
+		}
+	}
+
+	return true, nil
+}
+
+func (f *FormaCommandPersister) updateStackStates(msg *messages.UpdateStackStates) (bool, error) {
+	f.Log().Debug("Updating Forma command with stack states commandID=%s stackCount=%d", msg.CommandID, len(msg.StackUpdates))
+
+	cached, err := f.getOrLoadCommand(msg.CommandID)
+	if err != nil {
+		f.Log().Error("Failed to load Forma command for stack state update commandID=%s: %v", msg.CommandID, err)
+		return false, fmt.Errorf("failed to load Forma command for stack state update: %w", err)
+	}
+
+	command := cached.command
+	if command.Setup != nil && command.Setup.Committed {
+		return true, nil
+	}
+	command.StackUpdates = msg.StackUpdates
+	command.State = overallCommandState(command)
+
+	if err := f.persistCommand(cached); err != nil {
+		f.Log().Error("Failed to update Forma command with stack states commandID=%s: %v", msg.CommandID, err)
+		return false, fmt.Errorf("failed to update Forma command with stack states: %w", err)
+	}
+
+	f.Log().Debug("Successfully updated Forma command with stack states commandID=%s", msg.CommandID)
+	return true, nil
+}
+
+func (f *FormaCommandPersister) updatePolicyStates(msg *messages.UpdatePolicyStates) (bool, error) {
+	f.Log().Debug("Updating Forma command with policy states commandID=%s policyCount=%d", msg.CommandID, len(msg.PolicyUpdates))
+
+	cached, err := f.getOrLoadCommand(msg.CommandID)
+	if err != nil {
+		f.Log().Error("Failed to load Forma command for policy state update commandID=%s: %v", msg.CommandID, err)
+		return false, fmt.Errorf("failed to load Forma command for policy state update: %w", err)
+	}
+
+	command := cached.command
+	if command.Setup != nil && command.Setup.Committed {
+		return true, nil
+	}
+	command.PolicyUpdates = msg.PolicyUpdates
+	command.State = overallCommandState(command)
+
+	if err := f.persistCommand(cached); err != nil {
+		f.Log().Error("Failed to update Forma command with policy states commandID=%s: %v", msg.CommandID, err)
+		return false, fmt.Errorf("failed to update Forma command with policy states: %w", err)
+	}
+
+	f.Log().Debug("Successfully updated Forma command with policy states commandID=%s", msg.CommandID)
+	return true, nil
+}
+
+func (f *FormaCommandPersister) updateGeneratorStates(msg *generator_update.UpdateGeneratorStates) (bool, error) {
+	f.Log().Debug("Updating Forma command with generator states commandID=%s generatorCount=%d", msg.CommandID, len(msg.GeneratorUpdates))
+
+	cached, err := f.getOrLoadCommand(msg.CommandID)
+	if err != nil {
+		return false, fmt.Errorf("failed to load Forma command for generator state update: %w", err)
+	}
+
+	updates, err := snapshotGeneratorUpdates(msg.GeneratorUpdates)
+	if err != nil {
+		return false, fmt.Errorf("snapshot generator state update: %w", err)
+	}
+	cached.command.GeneratorUpdates = updates
+	cached.command.State = overallCommandState(cached.command)
+
+	if err = f.persistCommand(cached); err != nil {
+		return false, fmt.Errorf("failed to update Forma command with generator states: %w", err)
+	}
+
+	return true, nil
+}
+
+func snapshotGeneratorUpdates(updates []generator_update.GeneratorUpdate) ([]generator_update.GeneratorUpdate, error) {
+	data, err := json.Marshal(updates)
+	if err != nil {
+		return nil, err
+	}
+	var snapshot []generator_update.GeneratorUpdate
+	if err = json.Unmarshal(data, &snapshot); err != nil {
+		return nil, err
+	}
+	return snapshot, nil
+}
+
+func (f *FormaCommandPersister) markResourcesAsRejected(msg *MarkResourcesAsRejected) (bool, error) {
+	return f.bulkUpdateResourceState(msg.CommandID, msg.Resources, types.ResourceUpdateStateRejected, msg.ResourceModifiedTs, "")
+}
+
+func (f *FormaCommandPersister) markResourcesAsFailed(msg *MarkResourcesAsFailed) (bool, error) {
+	return f.bulkUpdateResourceState(msg.CommandID, msg.Resources, types.ResourceUpdateStateFailed, msg.ResourceModifiedTs, msg.FailureReason)
+}
+
+func (f *FormaCommandPersister) markTargetsAsFailed(msg *MarkTargetsAsFailed) (bool, error) {
+	cached, err := f.getOrLoadCommand(msg.CommandID)
+	if err != nil {
+		f.Log().Error("Failed to load Forma command for target cascade failure commandID=%s: %v", msg.CommandID, err)
+		return false, fmt.Errorf("failed to load Forma command for target cascade failure: %w", err)
+	}
+
+	command := cached.command
+	for _, ref := range msg.Targets {
+		for i := range command.TargetUpdates {
+			tu := &command.TargetUpdates[i]
+			if tu.Target.Label == ref.Label && tu.Operation == ref.Operation {
+				// Monotonic terminality guard: never overwrite a target already in final state.
+				if isTargetInFinalState(tu.State) {
+					f.Log().Debug("Ignoring cascade failure for already-terminal target commandID=%s targetLabel=%s operation=%s currentState=%s",
+						msg.CommandID, ref.Label, ref.Operation, tu.State)
+					break
+				}
+				tu.State = types.TargetUpdateStateFailed
+				tu.ModifiedTs = msg.TargetModifiedTs
+				break
+			}
+		}
+	}
+
+	command.ModifiedTs = msg.TargetModifiedTs
+	command.State = overallCommandState(command)
+
+	if command.IsInFinalState() {
+		if err := f.finalizeAndPersist(cached); err != nil {
+			return false, err
+		}
+	} else {
+		if err := f.datastore.UpdateFormaCommandProgress(command.ID, command.State, command.ModifiedTs); err != nil {
+			f.Log().Error("Failed to update Forma command meta commandID=%s: %v", msg.CommandID, err)
+			cached.dirty = true
+			return false, fmt.Errorf("failed to update Forma command meta: %w", err)
+		}
+	}
+
+	return true, nil
+}
+
+func (f *FormaCommandPersister) markResourcesAsCanceled(msg *MarkResourcesAsCanceled) (bool, error) {
+	return f.bulkUpdateResourceState(msg.CommandID, msg.Resources, types.ResourceUpdateStateCanceled, util.TimeNow(), "")
+}
+
+func (f *FormaCommandPersister) markCommandResourcesAsCanceled(msg *MarkCommandResourcesAsCanceled) (bool, error) {
+	cached, err := f.getOrLoadCommand(msg.CommandID)
+	if err != nil {
+		return false, fmt.Errorf("failed to load command for cancellation: %w", err)
+	}
+
+	var refs []ResourceUpdateRef
+	for i := range cached.command.ResourceUpdates {
+		ru := &cached.command.ResourceUpdates[i]
+		if isResourceInFinalState(ru.State) {
+			continue
+		}
+		refs = append(refs, ResourceUpdateRef{URI: ru.URI(), Operation: ru.Operation})
+	}
+
+	if len(refs) == 0 {
+		return true, nil
+	}
+	return f.bulkUpdateResourceState(msg.CommandID, refs, types.ResourceUpdateStateCanceled, util.TimeNow(), "")
+}
+
+// plannedForceCancel describes one in-memory resource-update mutation to apply ONLY
+// after the durable resource-row CAS has succeeded. We compute the plan first, persist,
+// and apply in-memory afterward so that a persistence failure leaves the in-memory cache
+// (which is authoritative) untouched — no split-brain, terminate-no-actors holds.
+type plannedForceCancel struct {
+	idx           int
+	ref           ResourceUpdateRef
+	wasInProgress bool
+	progress      plugin.TrackedProgress
+}
+
+func (f *FormaCommandPersister) bulkForceCancel(msg *BulkForceCancel) (BulkForceCancelResponse, error) {
+	ts := util.TimeNow()
+	resp := BulkForceCancelResponse{}
+
+	cached, err := f.getOrLoadCommand(msg.CommandID)
+	if err != nil {
+		// A load failure means we never touched in-memory state; report it in-band so
+		// the persister stays alive and the caller terminates no actors.
+		resp.ErrorMessage = fmt.Sprintf("failed to load command for BulkForceCancel: %v", err)
+		return resp, nil
+	}
+	command := cached.command
+
+	var inProgressRows []datastore.ForceCancelRow
+	var notStartedRefs []datastore.ResourceUpdateRef
+	var plan []plannedForceCancel
+
+	// Pass 1: plan only — build the DB CAS args and the in-memory mutation plan WITHOUT
+	// mutating the authoritative in-memory cache yet.
+	for _, ref := range msg.Resources {
+		idx := cached.findResourceUpdateIndex(ref.URI.KSUID(), ref.Operation)
+		if idx == -1 {
+			continue
+		}
+		res := &command.ResourceUpdates[idx]
+
+		if isResourceInFinalState(res.State) {
+			resp.Skipped = append(resp.Skipped, ref)
+			continue
+		}
+
+		forceCancelProgress := plugin.TrackedProgress{
+			ProgressResult: resource.ProgressResult{
+				Operation:       resource.Operation(res.Operation),
+				OperationStatus: resource.OperationStatusCanceled,
+				StatusMessage:   "force-canceled",
+			},
+		}
+
+		p := plannedForceCancel{idx: idx, ref: ref, progress: forceCancelProgress}
+
+		if res.State == types.ResourceUpdateStateInProgress {
+			p.wasInProgress = true
+			// Build the progress list: copy existing + append force-cancel entry
+			newProgressList := append(append([]plugin.TrackedProgress{}, res.ProgressResult...), forceCancelProgress)
+			progressJSON, merr := json.Marshal(newProgressList)
+			if merr != nil {
+				resp.ErrorMessage = fmt.Sprintf("failed to marshal progress for BulkForceCancel: %v", merr)
+				return resp, nil
+			}
+			mostRecentJSON, merr := json.Marshal(forceCancelProgress)
+			if merr != nil {
+				resp.ErrorMessage = fmt.Sprintf("failed to marshal most-recent progress for BulkForceCancel: %v", merr)
+				return resp, nil
+			}
+			inProgressRows = append(inProgressRows, datastore.ForceCancelRow{
+				KSUID:                  res.DesiredState.Ksuid,
+				Operation:              ref.Operation,
+				ProgressJSON:           progressJSON,
+				MostRecentProgressJSON: mostRecentJSON,
+			})
+			resp.ForceCanceledInProgress = append(resp.ForceCanceledInProgress, ref)
+		} else {
+			// NotStarted or any other non-final state
+			notStartedRefs = append(notStartedRefs, datastore.ResourceUpdateRef{
+				KSUID:     res.DesiredState.Ksuid,
+				Operation: ref.Operation,
+			})
+		}
+
+		plan = append(plan, p)
+	}
+
+	// Persist FIRST. The resource-row CAS is the durable terminal write. If it fails we
+	// have NOT mutated the in-memory cache, so the command stays non-terminal and the
+	// caller (the changeset executor) terminates no actors.
+	result, err := f.datastore.ForceCancelResourceUpdates(msg.CommandID, inProgressRows, notStartedRefs, ts)
+	if err != nil {
+		resp.ErrorMessage = fmt.Sprintf("ForceCancelResourceUpdates failed for command %s: %v", msg.CommandID, err)
+		// Clear the partially-built response lists: nothing was actually canceled.
+		resp.ForceCanceledInProgress = nil
+		resp.Skipped = nil
+		return resp, nil
+	}
+
+	// Pass 2: the durable resource CAS succeeded. Now apply the in-memory mutations.
+	for _, p := range plan {
+		res := &command.ResourceUpdates[p.idx]
+		if p.wasInProgress {
+			res.ProgressResult = append(res.ProgressResult, p.progress)
+			res.MostRecentProgressResult = p.progress
+		}
+		res.State = types.ResourceUpdateStateCanceled
+		res.ModifiedTs = ts
+		cached.pendingCompletions--
+		if cached.pendingCompletions < 0 {
+			cached.pendingCompletions = 0
+			f.Log().Error("BulkForceCancel: pendingCompletions went below zero for command %s, clamped to zero", msg.CommandID)
+		}
+		key := resourceUpdateKey(p.ref.URI.KSUID(), p.ref.Operation)
+		if cached.terminalizedByBulk == nil {
+			cached.terminalizedByBulk = make(map[string]bool)
+		}
+		cached.terminalizedByBulk[key] = true
+	}
+
+	// Merge DB-reported skipped (already-terminal) into response
+	for _, r := range result.Skipped {
+		resp.Skipped = append(resp.Skipped, ResourceUpdateRef{
+			URI:       pkgmodel.NewFormaeURI(r.KSUID, ""),
+			Operation: r.Operation,
+		})
+	}
+
+	// Terminalize in-flight targets in-memory
+	for _, ref := range msg.Targets {
+		for i := range command.TargetUpdates {
+			tu := &command.TargetUpdates[i]
+			if tu.Target.Label != ref.Label || tu.Operation != ref.Operation {
+				continue
+			}
+			if isTargetInFinalState(tu.State) {
+				break
+			}
+			tu.State = types.TargetUpdateStateCanceled
+			tu.ModifiedTs = ts
+			break
+		}
+	}
+
+	command.ModifiedTs = ts
+	command.State = overallCommandState(command)
+
+	// Authoritative durable terminality write. The resource rows were already durably
+	// terminalized by the CAS above, so the only durable state left to advance is the
+	// command row: its overall state and the terminalized target updates (which live
+	// only in the command blob). Use the single-statement update so this is ATOMIC — it
+	// either commits the terminal state or leaves the row untouched. Gating retryability
+	// on an atomic write is what makes "surface error → retry" safe: a failure here
+	// cannot partially advance the command, so the retry still sees InProgress (and
+	// CancelCommandsByQuery finds it), re-runs the CAS (resources report Skipped), and
+	// converges. We deliberately do NOT gate on StoreFormaCommand: it advances the
+	// command row and re-stores the resource rows in separate, non-atomic writes, so a
+	// mid-failure could leave the command durably terminal while we report a retryable
+	// error — stranding the still-live actor tree against a terminal command.
+	targetUpdatesJSON, merr := json.Marshal(command.TargetUpdates)
+	if merr != nil {
+		f.Log().Error("Failed to marshal target updates for BulkForceCancel commandID=%s: %v", msg.CommandID, merr)
+		resp.ErrorMessage = fmt.Sprintf("force-cancel: failed to encode terminal command state: %v", merr)
+		return resp, nil
+	}
+	if merr := f.datastore.UpdateFormaCommandTargetUpdates(command.ID, targetUpdatesJSON, command.State, ts); merr != nil {
+		f.Log().Error("Failed to persist terminal command state for BulkForceCancel commandID=%s: %v", msg.CommandID, merr)
+		resp.ErrorMessage = fmt.Sprintf("force-cancel: failed to persist terminal command state: %v", merr)
+		// Pass 2 above has already advanced the in-memory cache, but that is safe and the
+		// command still converges. The resource mutations (state, pendingCompletions,
+		// terminalizedByBulk) mirror the resource-row CAS, which DID commit durably — so
+		// the cache matches the durable resource rows, and dropping a late completion for
+		// a durably-Canceled resource is the intended write-fence, not lost work. Only the
+		// command row stayed InProgress (this atomic write committed nothing). A retry is
+		// idempotent: the now-final in-memory resources report Skipped, so pendingCompletions
+		// is not decremented again, and the retry's atomic write persists the terminal state.
+		// If the agent crashes before a retry, the recovery backstop converges the command
+		// because the resource rows are already durably terminal. So we do not roll the cache
+		// back here — doing so would break retry idempotency for no gain.
+		return resp, nil
+	}
+
+	// Durable terminality is now committed (resource rows via the CAS, command row +
+	// target updates via the atomic write above). The remaining finalize work —
+	// sensitive-data hashing, a full-command re-store, and cache eviction — is
+	// best-effort local bookkeeping that does NOT affect durable terminality. Its
+	// StoreFormaCommand is non-atomic, so it must NOT gate retryability: the command is
+	// already durably Canceled, so on failure we log and still let the executor tear down
+	// the actors rather than falsely telling the caller to retry a terminal command.
+	if err := f.finalizeAndPersist(cached); err != nil {
+		f.Log().Error("Best-effort finalize after BulkForceCancel failed (durable terminal state already committed) commandID=%s: %v", msg.CommandID, err)
+	}
+
+	return resp, nil
+}
+
+func (f *FormaCommandPersister) markResourceUpdateAsComplete(msg *messages.MarkResourceUpdateAsComplete) (bool, error) {
+	cached, err := f.getOrLoadCommand(msg.CommandID)
+	if err != nil {
+		f.Log().Error("Failed to load Forma command for complete update commandID=%s: %v", msg.CommandID, err)
+		return false, fmt.Errorf("failed to load Forma command for complete update: %w", err)
+	}
+
+	cmd := cached.command
+
+	// O(1) lookup by KSUID and operation
+	idx := cached.findResourceUpdateIndex(msg.ResourceURI.KSUID(), msg.Operation)
+	if idx != -1 {
+		res := &cmd.ResourceUpdates[idx]
+
+		// Monotonic terminality guard: if this resource was already finalized via
+		// bulkUpdateResourceState (e.g. markResourcesAsCanceled ran before the
+		// ResourceUpdater's completion arrived), or if it was already terminal when the
+		// command was loaded from the database, the late completion message must be
+		// silently dropped. We must NOT decrement pendingCompletions here — the counter
+		// was already decremented when the terminal state was first assigned.
+		//
+		// Note: we intentionally do NOT guard solely on res.State here, because
+		// updateCommandFromProgress can set state to a terminal value (e.g. Success)
+		// without decrementing pendingCompletions. In that case markResourceUpdateAsComplete
+		// must still run to close out the resource and decrement the counter.
+		key := resourceUpdateKey(msg.ResourceURI.KSUID(), msg.Operation)
+		if cached.terminalizedByBulk[key] {
+			f.Log().Debug("Ignoring late MarkResourceUpdateAsComplete for already-terminalized resource commandID=%s ksuid=%s operation=%s currentState=%s incomingFinalState=%s",
+				msg.CommandID, msg.ResourceURI.KSUID(), msg.Operation, res.State, msg.FinalState)
+			return true, nil
+		}
+
+		res.State = msg.FinalState
+		res.StartTs = msg.ResourceStartTs
+		res.ModifiedTs = msg.ResourceModifiedTs
+		// Unconditional copy: the updater owns the reason's lifecycle (it
+		// records one per failing pass and clears it on success), so the
+		// completion's value is authoritative either way. An empty value on a
+		// successful retry MUST overwrite a reason persisted by an earlier
+		// failed attempt, or a succeeded update keeps reporting an obsolete
+		// error.
+		res.FailureReason = msg.FailureReason
+
+		// Hash read/actual-state properties at this write choke point, same as
+		// updateCommandFromProgress does for intermediate progress. This matters most
+		// for sync commands: their BulkStoreResourceUpdates call below writes straight
+		// to the resource_updates table BEFORE finalizeAndPersist's end-of-command
+		// hashSensitiveDataIfComplete ever runs, so without hashing here a schema-opaque
+		// field's live (Read-enriched) value would be persisted as plaintext.
+		if msg.ResourceProperties != nil {
+			hashedProps, diagnostics, hashErr := hashReadActualProps(msg.ResourceProperties, res.DesiredState.Schema, res.DesiredState.Type)
+			if hashErr != nil {
+				f.Log().Error("Failed to hash resource properties on completion commandID=%s: %v", msg.CommandID, hashErr)
+				return false, fmt.Errorf("failed to hash resource properties on completion: %w", hashErr)
+			}
+			f.logOpaqueDiagnostics(msg.CommandID, &res.DesiredState, diagnostics)
+			res.DesiredState.Properties = hashedProps
+		}
+		if msg.ResourceReadOnlyProperties != nil {
+			hashedReadOnly, diagnostics, hashErr := hashReadActualProps(msg.ResourceReadOnlyProperties, res.DesiredState.Schema, res.DesiredState.Type)
+			if hashErr != nil {
+				f.Log().Error("Failed to hash resource read-only properties on completion commandID=%s: %v", msg.CommandID, hashErr)
+				return false, fmt.Errorf("failed to hash resource read-only properties on completion: %w", hashErr)
+			}
+			f.logOpaqueDiagnostics(msg.CommandID, &res.DesiredState, diagnostics)
+			res.DesiredState.ReadOnlyProperties = hashedReadOnly
+		}
+		if msg.Version != "" {
+			res.Version = msg.Version
+		}
+
+		// Persist the resource update to the normalized table
+		// For sync commands: resource updates were not stored upfront, so INSERT only if change detected (Version set)
+		// For non-sync commands: resource updates exist in DB, so UPDATE the state
+		if cmd.Command == pkgmodel.CommandSync {
+			// Sync commands only persist resource updates that detected changes
+			if msg.Version != "" {
+				if err := f.datastore.BulkStoreResourceUpdates(msg.CommandID, []resource_update.ResourceUpdate{*res}); err != nil {
+					f.Log().Error("Failed to insert sync resource update with change commandID=%s: %v", msg.CommandID, err)
+					// Continue with command meta update even if insert fails
+				}
+			}
+			// If no version (no change), nothing to persist - that's the optimization
+		} else {
+			// Non-sync commands: update the existing resource update state
+			if err := f.datastore.UpdateResourceUpdateState(
+				msg.CommandID,
+				msg.ResourceURI.KSUID(),
+				msg.Operation,
+				msg.FinalState,
+				msg.ResourceModifiedTs,
+			); err != nil {
+				f.Log().Error("Failed to update resource update state in normalized table commandID=%s: %v", msg.CommandID, err)
+				// Continue with command meta update even if normalized update fails
+			}
+		}
+
+		// Always decrement pending completions counter when we receive a completion message.
+		// This counter tracks the number of expected MarkResourceUpdateAsComplete messages,
+		// NOT the number of resources in non-final state (which can be set by UpdateResourceProgress).
+		cached.pendingCompletions--
+		f.Log().Debug("MarkResourceUpdateAsComplete: decremented pendingCompletions commandID=%s ksuid=%s operation=%s finalState=%s pendingCompletions=%d totalResourceUpdates=%d",
+			msg.CommandID, msg.ResourceURI.KSUID(), msg.Operation, msg.FinalState, cached.pendingCompletions, len(cmd.ResourceUpdates))
+		if cached.pendingCompletions < 0 {
+			return false, fmt.Errorf("%w: unexpected completion for command %s resource %s: pendingCompletions went below zero, this indicates a programming error", errInvariantViolation, msg.CommandID, msg.ResourceURI.KSUID())
+		}
+
+		cmd.ModifiedTs = msg.ResourceModifiedTs
+
+		// Calculate new command state
+		cmd.State = overallCommandState(cmd)
+		f.Log().Debug("MarkResourceUpdateAsComplete: computed overallCommandState",
+			commandStateLogFields(cmd, cached.pendingCompletions)...)
+
+		// If command is in final state, do full finalization (hash sensitive data, potentially delete, etc.)
+		// Otherwise just update command meta for performance
+		if cmd.IsInFinalState() {
+			if err := f.finalizeAndPersist(cached); err != nil {
+				return false, err
+			}
+		} else {
+			// Only update command-level metadata (state, modified_ts)
+			// ResourceUpdate is already persisted via UpdateResourceUpdateState above
+			if err := f.datastore.UpdateFormaCommandProgress(cmd.ID, cmd.State, cmd.ModifiedTs); err != nil {
+				f.Log().Error("Failed to update Forma command meta commandID=%s: %v", msg.CommandID, err)
+				cached.dirty = true
+				return false, fmt.Errorf("failed to update Forma command meta: %w", err)
+			}
+		}
+	} else {
+		// Resource not found in this command - this indicates a bug or unexpected race condition.
+		// Log as error but return success to avoid actor crash.
+		f.Log().Error("Received completion for resource not in command commandID=%s resource=%s operation=%s",
+			msg.CommandID, msg.ResourceURI.KSUID(), msg.Operation)
+	}
+
+	return true, nil
+}
+
+// finalizeIncompleteCommand handles crash recovery for commands where all
+// resource updates reached a terminal state but the command itself never
+// transitioned, whether because the agent crashed or because the command
+// carried no changeset work to report it. It computes the final command state
+// and persists it through the normal finalization path (hashing, cache
+// eviction, etc.).
+func (f *FormaCommandPersister) finalizeIncompleteCommand(msg *FinalizeIncompleteCommand) (bool, error) {
+	cached, err := f.getOrLoadCommand(msg.CommandID)
+	if err != nil {
+		return false, fmt.Errorf("failed to load command for finalization: %w", err)
+	}
+
+	cmd := cached.command
+
+	// Guard: all resource updates must be in a terminal state.
+	if nonFinal := countNonFinalResources(cmd); nonFinal > 0 {
+		return false, fmt.Errorf("cannot finalize command %s: %d resource updates still non-terminal", msg.CommandID, nonFinal)
+	}
+
+	cmd.State = overallCommandState(cmd)
+	cmd.ModifiedTs = time.Now()
+
+	f.Log().Info("Finalizing incomplete command after crash recovery commandID=%s finalState=%s", msg.CommandID, cmd.State)
+
+	if err := f.finalizeAndPersist(cached); err != nil {
+		return false, fmt.Errorf("failed to finalize incomplete command: %w", err)
+	}
+
+	return true, nil
+}
+
+// bulkUpdateResourceState terminalizes a batch of resource updates in one
+// persister turn.
+//
+// failureReason explains a failure that the resource update itself could not
+// record, because it never ran: a cascade from another node. It is stamped on
+// every row in the batch and is empty for the transitions that have no such
+// explanation. It reaches the database with the rest of the command at
+// finalization (BatchUpdateResourceUpdateState below writes state only), which
+// is where every terminalized command lands.
+func (f *FormaCommandPersister) bulkUpdateResourceState(
+	commandID string,
+	resources []ResourceUpdateRef,
+	state types.ResourceUpdateState,
+	modifiedTs time.Time,
+	failureReason string,
+) (bool, error) {
+	cached, err := f.getOrLoadCommand(commandID)
+	if err != nil {
+		f.Log().Error("Failed to load Forma command for bulk update commandID=%s: %v", commandID, err)
+		return false, fmt.Errorf("failed to load Forma command for bulk update: %w", err)
+	}
+
+	command := cached.command
+
+	// O(1) lookup by KSUID and operation for each resource
+	for _, ref := range resources {
+		idx := cached.findResourceUpdateIndex(ref.URI.KSUID(), ref.Operation)
+		if idx != -1 {
+			res := &command.ResourceUpdates[idx]
+
+			// Monotonic terminality guard: never reassign a resource update that is already
+			// in a final state. This prevents double-decrement of pendingCompletions and
+			// state regression (e.g. re-canceling a resource that already succeeded).
+			if isResourceInFinalState(res.State) {
+				f.Log().Debug("Ignoring bulk state update for already-terminal resource commandID=%s ksuid=%s operation=%s currentState=%s incomingState=%s",
+					commandID, ref.URI.KSUID(), ref.Operation, res.State, state)
+				continue
+			}
+
+			// If transitioning to final state, decrement counter and record in the
+			// terminalizedByBulk set so that a late MarkResourceUpdateAsComplete for
+			// this resource can be detected and ignored without underflowing the counter.
+			if isResourceInFinalState(state) {
+				cached.pendingCompletions--
+				if cached.pendingCompletions < 0 {
+					return false, fmt.Errorf("%w: unexpected state transition for command %s: pendingCompletions went below zero, this indicates a programming error", errInvariantViolation, commandID)
+				}
+				key := resourceUpdateKey(ref.URI.KSUID(), ref.Operation)
+				if cached.terminalizedByBulk == nil {
+					cached.terminalizedByBulk = make(map[string]bool)
+				}
+				cached.terminalizedByBulk[key] = true
+			}
+
+			res.State = state
+			res.ModifiedTs = modifiedTs
+			if failureReason != "" {
+				res.FailureReason = failureReason
+			}
+		}
+	}
+
+	// Update the normalized resource_updates table in batch
+	if len(resources) > 0 {
+		datastoreRefs := make([]datastore.ResourceUpdateRef, len(resources))
+		for i, ref := range resources {
+			datastoreRefs[i] = datastore.ResourceUpdateRef{
+				KSUID:     ref.URI.KSUID(),
+				Operation: ref.Operation,
+			}
+		}
+		if err := f.datastore.BatchUpdateResourceUpdateState(commandID, datastoreRefs, state, modifiedTs); err != nil {
+			f.Log().Error("Failed to batch update resource states in normalized table commandID=%s: %v", commandID, err)
+			// Continue with command meta update even if normalized update fails
+		}
+	}
+
+	command.ModifiedTs = modifiedTs
+	command.State = overallCommandState(command)
+
+	// If command is in final state, do full finalization (hash sensitive data, potentially delete, etc.)
+	// Otherwise just update command meta for performance
+	if command.IsInFinalState() {
+		if err := f.finalizeAndPersist(cached); err != nil {
+			return false, err
+		}
+	} else {
+		// Only update command-level metadata (state, modified_ts)
+		// ResourceUpdates are already persisted via BatchUpdateResourceUpdateState above
+		if err := f.datastore.UpdateFormaCommandProgress(command.ID, command.State, command.ModifiedTs); err != nil {
+			f.Log().Error("Failed to update Forma command meta commandID=%s: %v", commandID, err)
+			cached.dirty = true
+			return false, fmt.Errorf("failed to update Forma command meta: %w", err)
+		}
+	}
+
+	return true, nil
+}
+
+// commandStateLogFields returns the structured fields logged when a command's
+// overall state is recomputed. Source is included so consumers can tell user
+// commands from scheduler bookkeeping.
+func commandStateLogFields(cmd *forma_command.FormaCommand, pending int) []any {
+	return []any{
+		"commandID", cmd.ID,
+		"newState", cmd.State,
+		"pendingCompletions", pending,
+		"source", cmd.Source,
+	}
+}
+
+func overallCommandState(command *forma_command.FormaCommand) forma_command.CommandState {
+	var states []types.ResourceUpdateState
+	metadataPending := false
+	var metadataStates []string
+	for _, u := range command.StackUpdates {
+		metadataStates = append(metadataStates, string(u.State))
+	}
+	for _, u := range command.PolicyUpdates {
+		metadataStates = append(metadataStates, string(u.State))
+	}
+	for _, u := range command.GeneratorUpdates {
+		metadataStates = append(metadataStates, string(u.State))
+	}
+	for _, state := range metadataStates {
+		if state == "Failed" {
+			states = append(states, types.ResourceUpdateStateFailed)
+		} else if state != "Success" {
+			metadataPending = true
+		}
+	}
+	if metadataPending {
+		return forma_command.CommandStateInProgress
+	}
+	for _, res := range command.ResourceUpdates {
+		states = append(states, res.State)
+	}
+
+	// Check if any target updates are not in a final state
+	for _, tu := range command.TargetUpdates {
+		switch tu.State {
+		case types.TargetUpdateStateNotStarted, types.TargetUpdateStateInProgress:
+			return forma_command.CommandStateInProgress
+		case types.TargetUpdateStateFailed:
+			states = append(states, types.ResourceUpdateStateFailed)
+		case types.TargetUpdateStateCanceled:
+			states = append(states, types.ResourceUpdateStateCanceled)
+		}
+		// Success targets don't affect overall state
+	}
+
+	// Check if any resources are not in a final state
+	hasNonFinalState := slices.ContainsFunc(states, func(s types.ResourceUpdateState) bool {
+		return s != types.ResourceUpdateStateSuccess &&
+			s != types.ResourceUpdateStateFailed &&
+			s != types.ResourceUpdateStateRejected &&
+			s != types.ResourceUpdateStateCanceled
+	})
+
+	if hasNonFinalState {
+		return forma_command.CommandStateInProgress
+	}
+
+	// All resources are in final state, determine which final state
+	hasCanceled := slices.ContainsFunc(states, func(s types.ResourceUpdateState) bool {
+		return s == types.ResourceUpdateStateCanceled
+	})
+
+	// Check if any resources were canceled
+	if hasCanceled {
+		return forma_command.CommandStateCanceled
+	}
+
+	hasFailedOrRejected := slices.ContainsFunc(states, func(s types.ResourceUpdateState) bool {
+		return s == types.ResourceUpdateStateFailed || s == types.ResourceUpdateStateRejected
+	})
+
+	// Check if any resources failed or were rejected
+	if hasFailedOrRejected {
+		return forma_command.CommandStateFailed
+	}
+
+	return forma_command.CommandStateSuccess
+}
+
+// shouldDeleteSyncCommand determines if a sync command should be deleted because it has no resource versions.
+// This helps keep the database clean by not retaining sync commands that resulted in no changes.
+// The cached parameter is used to ensure all completion messages have been processed before deletion.
+func shouldDeleteSyncCommand(command *forma_command.FormaCommand, cached *cachedCommand) bool {
+	isSync := command.Command == pkgmodel.CommandSync
+	isFinal := command.IsInFinalState()
+	hasVersions := command.HasResourceVersions()
+	allCompleted := cached.pendingCompletions == 0
+	return isSync && isFinal && !hasVersions && allCompleted
+}
+
+func hasOpaqueValues(props json.RawMessage) bool {
+	return bytes.Contains(props, []byte(`"$visibility"`)) &&
+		bytes.Contains(props, []byte(`"Opaque"`))
+}
+
+// hashReadActualProps returns a schema-keyed hashed copy of props for a resource of the
+// given schema. Used to sanitize read-back/actual-state values (e.g. progress reported by
+// a plugin poll or Read) before they are persisted. Unlike DesiredState input, these
+// values are not needed in plaintext to resume execution, so they are hashed immediately
+// at their write choke point rather than deferred to final state.
+func hashReadActualProps(props json.RawMessage, schema pkgmodel.Schema, resourceType string) (json.RawMessage, []transformations.Diagnostic, error) {
+	if len(props) == 0 {
+		return props, nil, nil
+	}
+	// Type is set so the transformer's known-opaque table fires for plugins whose
+	// schema drops FieldHint.Opaque — otherwise a Read-enriched secret persists plaintext.
+	tmp := &pkgmodel.Resource{Type: resourceType, Schema: schema, Properties: props}
+	out, diagnostics, err := transformations.NewPersistValueTransformer().ApplyToResource(tmp)
+	if err != nil {
+		return nil, nil, err
+	}
+	return out.Properties, diagnostics, nil
+}
+
+// logOpaqueDiagnostics surfaces what the opaque-path match could not resolve
+// cleanly, with the resource identity the transformer does not have. A dotted
+// hint name is ambiguous between a structural path and a key that genuinely
+// contains a dot; matching every reading keeps secrets from leaking, at the cost
+// of possibly hashing a value that is not one. That cost is only actionable if
+// it is reported, so these are never dropped.
+func (f *FormaCommandPersister) logOpaqueDiagnostics(commandID string, resource *pkgmodel.Resource, diagnostics []transformations.Diagnostic) {
+	for _, d := range diagnostics {
+		f.Log().Warning("Ambiguous opaque field hint commandID=%s resourceLabel=%s resourceType=%s: %s",
+			commandID, resource.Label, resource.Type, d.String())
+	}
+}
+
+// hashSensitiveDataIfComplete checks if the command is in a final state and hashes sensitive data if so.
+// This should be called after updating resource states to ensure opaque values are hashed when the command completes.
+func (f *FormaCommandPersister) hashSensitiveDataIfComplete(command *forma_command.FormaCommand) (bool, error) {
+	// Only hash if the command is in a final state
+	if !command.IsInFinalState() {
+		return false, nil
+	}
+
+	t := transformations.NewPersistValueTransformer()
+	hashedCount := 0
+
+	// Hash opaque vals in ResourceUpdates array (Resources are stored in resource_updates table, not forma.Resources)
+	// Schema-keyed: a resource update needs hashing if its schema declares any opaque
+	// field, or if its properties already carry an opaque envelope (e.g. round-tripped
+	// from a prior hash, or a resource loaded without its schema populated).
+	for i, resourceUpdate := range command.ResourceUpdates {
+		// Decide "is anything opaque here?" using the schema-declared fields UNION
+		// the hard-coded known-opaque table (keyed on Type) — otherwise a plugin
+		// whose schema drops FieldHint.Opaque (SDK gap) would make this gate skip
+		// hashing and persist the final DesiredState secret in cleartext.
+		if len(transformations.OpaqueFields(resourceUpdate.DesiredState.Schema, resourceUpdate.DesiredState.Type)) == 0 &&
+			!hasOpaqueValues(resourceUpdate.DesiredState.Properties) {
+			continue
+		}
+		transformed, diagnostics, err := t.ApplyToResource(&resourceUpdate.DesiredState)
+		if err != nil {
+			f.Log().Error("Failed to hash resource update during final cleanup commandID=%s resourceLabel=%s: %v",
+				command.ID, resourceUpdate.DesiredState.Label, err)
+			return false, fmt.Errorf("failed to hash resource update %s during final cleanup: %w", resourceUpdate.DesiredState.Label, err)
+		}
+		f.logOpaqueDiagnostics(command.ID, &resourceUpdate.DesiredState, diagnostics)
+		command.ResourceUpdates[i].DesiredState = *transformed
+		hashedCount++
+	}
+
+	if hashedCount > 0 {
+		f.Log().Debug("Hashed sensitive data for completed command commandID=%s state=%s hashedResourceCount=%d",
+			command.ID, command.State, hashedCount)
+	}
+
+	return hashedCount > 0, nil
+}
+
+// Newly admitted ordinary work still owes a completion event even if progress
+// already says Success. Acceptance never emits one.
+func countExecutionResources(cmd *forma_command.FormaCommand) int {
+	count := 0
+	for _, ru := range cmd.ResourceUpdates {
+		if !ru.IsAcceptance() {
+			count++
+		}
+	}
+	return count
+}
+
+func acceptanceIndex(cmd *forma_command.FormaCommand) map[string]bool {
+	index := make(map[string]bool)
+	for _, ru := range cmd.ResourceUpdates {
+		if ru.IsAcceptance() {
+			index[resourceUpdateKey(ru.DesiredState.Ksuid, ru.Operation)] = true
+		}
+	}
+	return index
+}

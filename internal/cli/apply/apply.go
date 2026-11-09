@@ -1,0 +1,472 @@
+// © 2025 Platform Engineering Labs Inc.
+//
+// SPDX-License-Identifier: FSL-1.1-ALv2
+
+package apply
+
+import (
+	"bytes"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"os"
+
+	"github.com/spf13/cobra"
+	"golang.org/x/term"
+
+	"github.com/charmbracelet/lipgloss"
+	"github.com/platform-engineering-labs/formae/internal/cli/app"
+	"github.com/platform-engineering-labs/formae/internal/cli/cmd"
+	"github.com/platform-engineering-labs/formae/internal/cli/nag"
+	"github.com/platform-engineering-labs/formae/internal/cli/printer"
+	"github.com/platform-engineering-labs/formae/internal/cli/status"
+	"github.com/platform-engineering-labs/formae/internal/cli/tui"
+	"github.com/platform-engineering-labs/formae/internal/cli/tui/components"
+	"github.com/platform-engineering-labs/formae/internal/cli/tui/errfmt"
+	"github.com/platform-engineering-labs/formae/internal/cli/tui/simview"
+	"github.com/platform-engineering-labs/formae/internal/cli/tui/statuswatch"
+	"github.com/platform-engineering-labs/formae/internal/cli/tui/theme"
+	"github.com/platform-engineering-labs/formae/internal/metastructure/util"
+	apimodel "github.com/platform-engineering-labs/formae/pkg/api/model"
+	pkgmodel "github.com/platform-engineering-labs/formae/pkg/model"
+)
+
+// Package-level seams — replaced in tests to avoid TTY / network calls.
+var (
+	isInteractive = tui.IsInteractive
+	runConfirm    = components.RunConfirm
+)
+
+// errDescriptionAborted is a sentinel returned by maybePrintDescription when
+// the user declines the R3 acknowledgment. The call site converts this to a
+// clean nil return (matching the operation-confirm decline behaviour).
+var errDescriptionAborted = errors.New("description acknowledgment declined")
+
+// printBanner is a seam so tests can assert the banner is/isn't called.
+var printBanner = func(a *app.App) { a.PrintBanner() }
+
+// isTerminal, launchSimView, launchWatch, and applyFn are package-level vars so tests can stub them.
+var (
+	isTerminal = tui.IsTerminal
+
+	launchSimView = func(th *theme.Theme, sim *apimodel.Simulation, opts simview.Options) (simview.Decision, error) {
+		model := simview.New(th, sim, opts)
+		final, err := tui.Run(model, tui.DefaultRunOptions())
+		if err != nil {
+			return simview.DecisionAborted, err
+		}
+		decision := final.(simview.Model).Decision()
+		if decision == simview.DecisionConfirmed && opts.Message != nil && !opts.SimulateOnly {
+			ok, err := components.RunConfirmWithMessage(th, components.PromptForOperations(th, &sim.Command), opts.Message)
+			if err != nil {
+				return simview.DecisionAborted, err
+			}
+			if !ok {
+				return simview.DecisionAborted, nil
+			}
+		}
+		return decision, nil
+	}
+
+	launchWatch = func(a *app.App, commandID string) (bool, error) {
+		th := a.Theme()
+		model := statuswatch.New(th, a, statuswatch.Options{
+			Query:          "id:" + commandID,
+			FocusCommandID: commandID,
+			HeaderCommand:  "apply",
+			ExitWhenDone:   true,
+			SingleCommand:  true, // apply --watch is scoped to one command: no back-to-list nav
+		})
+		final, err := tui.Run(model, tui.DefaultRunOptions())
+		if err != nil {
+			return false, err
+		}
+		return final.(statuswatch.Model).Finished(), nil
+	}
+
+	applyFn = func(a *app.App, opts *ApplyOptions, simulate bool) (*apimodel.SubmitCommandResponse, []string, error) {
+		if opts.evaluated == nil {
+			forma, err := a.EvaluateApply(opts.FormaFile, opts.Properties, opts.Mode)
+			if err != nil {
+				return nil, nil, err
+			}
+			opts.evaluated = forma
+		}
+		return a.ApplyEvaluated(opts.evaluated, opts.Mode, simulate, opts.Force, opts.Resolution, opts.Message)
+	}
+)
+
+// legacyWidth is a package-level var so tests can stub it. Returns 100 for
+// non-TTY output (piped/redirected) or the real terminal width for TTY.
+var legacyWidth = func(w io.Writer) int {
+	if !isTerminal(w) {
+		return 100
+	}
+	if f, ok := w.(*os.File); ok {
+		if width, _, err := term.GetSize(int(f.Fd())); err == nil && width > 0 {
+			return width
+		}
+	}
+	return 100
+}
+
+// printAsyncNotice reminds the user how to check on a command that is still
+// running after the watch TUI has closed (the user detached early via
+// q/esc/ctrl+c). Not printed when the watch TUI closed because the command
+// already reached a terminal state.
+func printAsyncNotice(commandID string) {
+	fmt.Printf("\nStill running asynchronously on the agent. Check its status with:\n\n  formae command status %s\n", commandID)
+}
+
+type ApplyCommand struct {
+	FormaFile string
+}
+
+type ApplyOptions struct {
+	Message          string
+	MessageExplicit  bool
+	Resolution       *pkgmodel.DriftResolution
+	evaluated        *pkgmodel.Forma
+	suggestedMessage string
+	messageEdited    bool
+	OutputConsumer   printer.Consumer
+	FormaFile        string
+	Mode             pkgmodel.FormaApplyMode
+	Force            bool
+	Yes              bool
+	Simulate         bool
+	OutputSchema     string
+	StatusOutput     status.StatusOutput
+	Properties       map[string]string
+}
+
+func ApplyCmd() *cobra.Command {
+	command := &cobra.Command{
+		Use:   "apply",
+		Short: "Apply a forma",
+		RunE: func(command *cobra.Command, args []string) error {
+			opts := &ApplyOptions{}
+			consumer, _ := command.Flags().GetString("output-consumer")
+			opts.OutputConsumer = printer.Consumer(consumer)
+			opts.FormaFile = command.Flags().Arg(0)
+			mode, _ := command.Flags().GetString("mode")
+			opts.Mode = pkgmodel.FormaApplyMode(mode)
+			opts.Force, _ = command.Flags().GetBool("force")
+			opts.Message, _ = command.Flags().GetString("message")
+			opts.MessageExplicit = command.Flags().Changed("message")
+			resolutionPath, _ := command.Flags().GetString("resolution")
+			if resolutionPath != "" {
+				raw, err := os.ReadFile(resolutionPath)
+				if err != nil {
+					return err
+				}
+				decoder := json.NewDecoder(bytes.NewReader(raw))
+				decoder.DisallowUnknownFields()
+				if err = decoder.Decode(&opts.Resolution); err != nil {
+					return cmd.FlagErrorWrap(err)
+				}
+				if opts.Resolution == nil {
+					return cmd.FlagErrorf("resolution must be an object")
+				}
+				if err = decoder.Decode(new(any)); err != io.EOF {
+					return cmd.FlagErrorf("resolution must contain one JSON object")
+				}
+			}
+			opts.OutputSchema, _ = command.Flags().GetString("output-schema")
+			opts.Simulate, _ = command.Flags().GetBool("simulate")
+			statusOutput, _ := command.Flags().GetString("status-output-layout")
+			opts.StatusOutput = status.StatusOutput(statusOutput)
+			opts.Yes, _ = command.Flags().GetBool("yes")
+			opts.Properties = cmd.ExplicitPropertiesFromCmd(command)
+
+			configFile, _ := command.Flags().GetString("config")
+			app, err := cmd.AppFromContext(command.Context(), configFile, "", command)
+			if err != nil {
+				return err
+			}
+
+			return runApply(app, opts)
+		},
+		Annotations: map[string]string{
+			"type":     "Forma",
+			"examples": "{{.Name}} {{.Command}} --mode reconcile forma.pkl  |  {{.Name}} {{.Command}} --mode patch forma.pkl",
+			"args":     "<forma file>",
+		},
+		SilenceErrors: true,
+	}
+
+	command.SetUsageTemplate(cmd.SimpleCmdUsageTemplate)
+
+	command.Flags().String("resolution", "", "JSON resolution controls file (ObservationID, Decisions, optional ReviewID and IdempotencyKey)")
+	command.Flags().StringP("message", "m", "", "Optional intent message recorded with the command")
+	command.Flags().String("mode", "", "Apply mode (reconcile | patch). This flag is required.")
+	command.Flags().String("output-consumer", string(printer.ConsumerHuman), "Consumer of the command result (human | machine)")
+	command.Flags().String("output-schema", "json", "The schema to use for the result output (json | yaml)")
+	command.Flags().Bool("simulate", false, "Simulate the command rather than make actual changes")
+	command.Flags().Bool("force", false, "Overwrite any changes since the last reconcile without prompting. Only applicable in 'reconcile' mode.")
+	command.Flags().String("status-output-layout", string(status.StatusOutputSummary), fmt.Sprintf("What to print as status output (%s | %s)", status.StatusOutputSummary, status.StatusOutputDetailed))
+	command.Flags().Bool("yes", false, "Allow the command to run without any confirmations")
+	cmd.AddConfigFlags(command)
+
+	return command
+}
+
+func runApply(app *app.App, opts *ApplyOptions) error {
+	err := validateApplyOptions(opts)
+	if err != nil {
+		return err
+	}
+	if opts.OutputConsumer == printer.ConsumerHuman {
+		return runApplyForHumans(app, opts)
+	}
+	return runApplyForMachines(app, opts)
+}
+
+func validateApplyOptions(opts *ApplyOptions) error {
+	if opts.FormaFile == "" {
+		return cmd.FlagErrorf("forma file is required")
+	}
+	if opts.Mode == "" {
+		return cmd.FlagErrorf("the --mode flag is required")
+	}
+	if opts.Mode != pkgmodel.FormaApplyModeReconcile && opts.Mode != pkgmodel.FormaApplyModePatch {
+		return cmd.FlagErrorf("invalid mode: %s. Should be either reconcile or patch", opts.Mode)
+	}
+	if opts.Resolution != nil && (opts.Mode != pkgmodel.FormaApplyModeReconcile || opts.Force) {
+		return cmd.FlagErrorf("--resolution requires reconcile without --force")
+	}
+	if opts.OutputConsumer != printer.ConsumerHuman && opts.OutputConsumer != printer.ConsumerMachine {
+		return cmd.FlagErrorf("output consumer must be either 'human' or 'machine'")
+	}
+	if opts.OutputConsumer == printer.ConsumerMachine {
+		if opts.OutputSchema != "json" && opts.OutputSchema != "yaml" {
+			return cmd.FlagErrorf("output schema must be either 'json' or 'yaml' for machine consumer")
+		}
+	}
+
+	return nil
+}
+
+func runApplyForHumans(a *app.App, opts *ApplyOptions) error {
+	// Interactive path: human + TTY + no --yes flag → alt-screen TUI; suppress banner.
+	if !opts.Yes && isTerminal(os.Stdout) && isTerminal(os.Stdin) {
+		return runApplyInteractive(a, opts)
+	}
+	printBanner(a)
+	return runApplyLegacy(a, opts)
+}
+
+// runApplyInteractive implements the new TTY apply flow: simview preview → watch.
+func runApplyInteractive(a *app.App, opts *ApplyOptions) error {
+	th := a.Theme()
+
+	res, _, err := applyFn(a, opts, true)
+	if err != nil {
+		if resolutionStale(err) && opts.Resolution != nil {
+			opts.Resolution = nil
+			fmt.Println("The previous review is stale. Review the current plan again.")
+			return runApplyInteractive(a, opts)
+		}
+		if reconcileErr, ok := err.(*apimodel.ErrorResponse[apimodel.FormaReconcileRejectedError]); ok {
+			return runRecordedDriftFlow(a, th, opts, reconcileErr.Data)
+		}
+		msg, renderErr := errfmt.Render(err)
+		if renderErr != nil {
+			return fmt.Errorf("error rendering error message: %v", renderErr)
+		}
+		return fmt.Errorf("%s", msg)
+	}
+
+	if !res.Simulation.ChangesRequired {
+		// Plain logo + message (the banner is already printed above), matching the
+		// legacy path and how other outcomes/errors render — no box.
+		fmt.Printf("%s\n\n%s\n\n",
+			lipgloss.NewStyle().Foreground(th.Palette.Done).Render("No changes needed:"),
+			lipgloss.NewStyle().Foreground(th.Palette.TextSubtle).Render("The specified forma resources are up to date."))
+		return nil
+	}
+
+	return confirmAndSubmitResolution(a, th, opts, res)
+}
+
+// runApplyLegacy is the pre-existing human apply flow (non-TTY / --yes / legacy).
+// It also reports terminal acceptance-only commands immediately.
+func runApplyLegacy(a *app.App, opts *ApplyOptions) error {
+	// always simulate first for humans
+	res, _, err := applyFn(a, opts, true)
+	if err != nil {
+		msg, renderErr := errfmt.Render(err)
+		if renderErr != nil {
+			return fmt.Errorf("error rendering error message: %v", renderErr)
+		}
+		return fmt.Errorf("%s", msg)
+	}
+
+	if !res.Simulation.ChangesRequired {
+		fmt.Printf("%s\n\n%s\n\n",
+			lipgloss.NewStyle().Foreground(a.Theme().Palette.Done).Render("No changes needed:"),
+			lipgloss.NewStyle().Foreground(a.Theme().Palette.TextSubtle).Render("The specified forma resources are up to date."))
+		return nil
+	}
+
+	// don't show anything if --yes is specified
+	if !opts.Yes {
+		if err := maybePrintDescription(a.Theme(), res.Description); err != nil {
+			if errors.Is(err, errDescriptionAborted) {
+				fmt.Print(lipgloss.NewStyle().Foreground(a.Theme().Palette.Error).Render("\nCommand aborted") + "\n")
+				return nil
+			}
+			return err
+		}
+
+		th := a.Theme()
+		width := legacyWidth(os.Stdout)
+		_, _ = fmt.Print(simview.RenderSimulationPlain(th, &res.Simulation, width))
+	}
+
+	if opts.Simulate {
+		fmt.Print(lipgloss.NewStyle().Foreground(a.Theme().Palette.TextSubtle).Render("Command will not continue - simulation only") + "\n")
+		return nil
+	}
+
+	// confirm with the user before proceeding (unless --yes is specified)
+	if !opts.Yes {
+		if !isInteractive() {
+			return fmt.Errorf("interactive input requires a TTY — pass --yes")
+		}
+		prompt := components.PromptForOperations(a.Theme(), &res.Simulation.Command)
+		ok, err := runConfirm(a.Theme(), prompt, "")
+		if err != nil {
+			return err
+		}
+		if !ok {
+			fmt.Print(lipgloss.NewStyle().Foreground(a.Theme().Palette.Error).Render("\nCommand aborted") + "\n")
+			return nil
+		}
+	}
+
+	if opts.Resolution != nil {
+		if res.Review == nil || res.Review.ReviewID == "" {
+			return fmt.Errorf("agent returned no final resolution review; command was not submitted")
+		}
+		opts.Resolution.ReviewID = res.Review.ReviewID
+		if opts.Resolution.IdempotencyKey == "" {
+			opts.Resolution.IdempotencyKey = util.NewID()
+		}
+	}
+
+	var nags []string
+	res, nags, err = applyFn(a, opts, false)
+	if err != nil {
+		msg, renderErr := errfmt.Render(err)
+		if renderErr != nil {
+			return fmt.Errorf("error rendering error message: %v", renderErr)
+		}
+		return fmt.Errorf("%s", msg)
+	}
+
+	if res.Simulation.Command.State == "Success" || res.Simulation.Command.State == "Failed" {
+		fmt.Printf("Command %s: %s\n", res.CommandID, res.Simulation.Command.State)
+		if opts.Resolution != nil {
+			printRecordedGuidance(a, res.CommandID)
+		}
+		return nil
+	}
+	fmt.Printf("\n%s\n", lipgloss.NewStyle().Foreground(a.Theme().Palette.Warning).Render("The asynchronous command has started on the formae agent."))
+
+	// Watch by default on an interactive terminal (this path also serves --yes,
+	// which skips the confirmation but is still an interactive session). Off a
+	// TTY (piped/CI) stay fire-and-forget and print the status hint. Mirrors the
+	// interactive (non --yes) path, which always watches.
+	if isInteractive() {
+		finished, werr := launchWatch(a, res.CommandID)
+		if werr != nil {
+			return werr
+		}
+		if !finished {
+			printAsyncNotice(res.CommandID)
+		} else if opts.Resolution != nil {
+			printRecordedGuidance(a, res.CommandID)
+		}
+		return nil
+	}
+
+	fmt.Printf("\nRun the following command to check the status of this command:\n\n  %s%s\n",
+		lipgloss.NewStyle().Foreground(a.Theme().Palette.TextSubtle).Render("formae command status "),
+		lipgloss.NewStyle().Foreground(a.Theme().Palette.PrimaryAccent).Render(res.CommandID))
+
+	nag.MaybePrintNags(a.Theme(), nags)
+
+	return nil
+}
+
+func runApplyForMachines(app *app.App, opts *ApplyOptions) error {
+	if opts.Simulate {
+		res, _, err := applyFn(app, opts, true)
+		if err != nil {
+			return printMachineApplyError(opts, err)
+		}
+		if res.Review != nil {
+			return printer.NewMachineReadablePrinter[apimodel.SubmitCommandResponse](os.Stdout, opts.OutputSchema).Print(res)
+		}
+		printer := printer.NewMachineReadablePrinter[apimodel.Simulation](os.Stdout, opts.OutputSchema)
+
+		return printer.Print(&res.Simulation)
+	}
+	res, _, err := applyFn(app, opts, false)
+	if err != nil {
+		return printMachineApplyError(opts, err)
+	}
+	printer := printer.NewMachineReadablePrinter[apimodel.CommandID](os.Stdout, opts.OutputSchema)
+
+	return printer.Print(&apimodel.CommandID{CommandID: res.CommandID})
+}
+
+// maybePrintDescription prints description.Text (when non-empty) and, when
+// description.Confirm is set, requires an explicit user acknowledgment before
+// the operation confirm. This is the R3 safety gate: it must remain a DISTINCT
+// step that runs BEFORE the operation confirm.
+func maybePrintDescription(th *theme.Theme, description apimodel.Description) error {
+	if description.Text == "" {
+		return nil
+	}
+
+	// Print the description text styled via the theme's body role.
+	_, _ = fmt.Println(th.Styles.Body.Render(description.Text))
+
+	if !description.Confirm {
+		return nil
+	}
+
+	// Confirm==true: require an explicit acknowledgment.
+	// Note: --yes skips this entire function via the outer !opts.Yes guard.
+	if !isInteractive() {
+		return fmt.Errorf("interactive input requires a TTY — pass --yes")
+	}
+	ok, err := runConfirm(th, "Acknowledge and continue?", description.Text)
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return errDescriptionAborted
+	}
+	return nil
+}
+
+func printMachineApplyError(opts *ApplyOptions, err error) error {
+	var rejection *apimodel.ErrorResponse[apimodel.FormaReconcileRejectedError]
+	var resolution *apimodel.ErrorResponse[apimodel.DriftResolutionError]
+	var payload any
+	if errors.As(err, &rejection) {
+		payload = rejection
+	} else if errors.As(err, &resolution) {
+		payload = resolution
+	} else {
+		return err
+	}
+	if printErr := printer.NewMachineReadablePrinter[any](os.Stdout, opts.OutputSchema).Print(&payload); printErr != nil {
+		return printErr
+	}
+	return err
+}

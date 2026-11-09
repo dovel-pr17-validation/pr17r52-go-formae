@@ -1,0 +1,1219 @@
+// © 2025 Platform Engineering Labs Inc.
+//
+// SPDX-License-Identifier: FSL-1.1-ALv2
+
+package resource_update
+
+import (
+	"encoding/json"
+	"fmt"
+	"testing"
+	"time"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+
+	"github.com/platform-engineering-labs/formae/internal/metastructure/util"
+	pkgmodel "github.com/platform-engineering-labs/formae/pkg/model"
+	"github.com/platform-engineering-labs/formae/pkg/plugin"
+	"github.com/platform-engineering-labs/formae/pkg/plugin/resource"
+)
+
+func TestRecordResourceProgress_UpdatesResourceProgress_ForDeleteOperation(t *testing.T) {
+	now := time.Now()
+	resourceUpdate := &ResourceUpdate{
+		Operation: OperationDelete,
+		State:     ResourceUpdateStateNotStarted,
+	}
+	readProgress := &resource.ProgressResult{
+		Operation:       resource.OperationRead,
+		OperationStatus: resource.OperationStatusSuccess,
+		RequestID:       "test-request-id",
+	}
+
+	err := resourceUpdate.RecordProgress(&plugin.TrackedProgress{ProgressResult: *readProgress, Attempts: 1, MaxAttempts: 4})
+	assert.NoError(t, err)
+
+	assert.Equal(t, ResourceUpdateStateInProgress, resourceUpdate.State)
+	assert.WithinDuration(t, now, resourceUpdate.StartTs, 1*time.Second)
+	assert.WithinDuration(t, now, resourceUpdate.ModifiedTs, 1*time.Second)
+
+	firstDeleteProgress := &resource.ProgressResult{
+		Operation:       resource.OperationDelete,
+		OperationStatus: resource.OperationStatusInProgress,
+		RequestID:       "test-delete-request-id",
+	}
+
+	startTs := resourceUpdate.StartTs // Capture start timestamp
+	err = resourceUpdate.RecordProgress(&plugin.TrackedProgress{ProgressResult: *firstDeleteProgress, Attempts: 1, MaxAttempts: 4})
+	assert.NoError(t, err)
+
+	assert.Equal(t, ResourceUpdateStateInProgress, resourceUpdate.State)
+	assert.Equal(t, startTs, resourceUpdate.StartTs) // StartTs should not change
+	assert.WithinDuration(t, time.Now(), resourceUpdate.ModifiedTs, 1*time.Second)
+
+	secondDeleteProgress := &resource.ProgressResult{
+		Operation:       resource.OperationDelete,
+		OperationStatus: resource.OperationStatusSuccess,
+		RequestID:       "test-second-delete-request-id",
+	}
+
+	err = resourceUpdate.RecordProgress(&plugin.TrackedProgress{ProgressResult: *secondDeleteProgress, Attempts: 1, MaxAttempts: 4})
+	assert.NoError(t, err)
+	assert.Equal(t, ResourceUpdateStateSuccess, resourceUpdate.State)
+	assert.Equal(t, startTs, resourceUpdate.StartTs) // StartTs should not change
+	assert.WithinDuration(t, time.Now(), resourceUpdate.ModifiedTs, 1*time.Second)
+}
+
+func TestRecordResourceProgress_UpdatesResourceProgress_ForCreateOperation(t *testing.T) {
+	now := time.Now()
+	resourceUpdate := &ResourceUpdate{
+		Operation: OperationCreate,
+		State:     ResourceUpdateStateNotStarted,
+	}
+	firstCreateProgress := &resource.ProgressResult{
+		Operation:       resource.OperationCreate,
+		OperationStatus: resource.OperationStatusInProgress,
+		RequestID:       "test-create-request-id",
+	}
+
+	err := resourceUpdate.RecordProgress(&plugin.TrackedProgress{ProgressResult: *firstCreateProgress, Attempts: 1, MaxAttempts: 4})
+	assert.NoError(t, err)
+
+	assert.Equal(t, ResourceUpdateStateInProgress, resourceUpdate.State)
+	assert.WithinDuration(t, now, resourceUpdate.StartTs, 1*time.Second)
+	assert.WithinDuration(t, now, resourceUpdate.ModifiedTs, 1*time.Second)
+
+	startTs := resourceUpdate.StartTs // Capture start timestamp
+	secondCreateProgress := &resource.ProgressResult{
+		Operation:       resource.OperationCreate,
+		OperationStatus: resource.OperationStatusSuccess,
+		RequestID:       "test-second-create-request-id",
+	}
+
+	err = resourceUpdate.RecordProgress(&plugin.TrackedProgress{ProgressResult: *secondCreateProgress, Attempts: 1, MaxAttempts: 4})
+	assert.NoError(t, err)
+	assert.Equal(t, ResourceUpdateStateSuccess, resourceUpdate.State)
+	assert.Equal(t, startTs, resourceUpdate.StartTs) // StartTs should not change
+	assert.WithinDuration(t, time.Now(), resourceUpdate.ModifiedTs, 1*time.Second)
+}
+
+func TestRecordResourceProgress_UpdatesResourceProgress_ForUpdateOperation(t *testing.T) {
+	now := time.Now()
+	resourceUpdate := &ResourceUpdate{
+		Operation: OperationUpdate,
+		State:     ResourceUpdateStateNotStarted,
+	}
+	readProgress := &resource.ProgressResult{
+		Operation:       resource.OperationRead,
+		OperationStatus: resource.OperationStatusSuccess,
+		RequestID:       "test-request-id",
+	}
+
+	err := resourceUpdate.RecordProgress(&plugin.TrackedProgress{ProgressResult: *readProgress, Attempts: 1, MaxAttempts: 4})
+	assert.NoError(t, err)
+
+	assert.Equal(t, ResourceUpdateStateInProgress, resourceUpdate.State)
+	assert.WithinDuration(t, now, resourceUpdate.StartTs, 1*time.Second)
+	assert.WithinDuration(t, now, resourceUpdate.ModifiedTs, 1*time.Second)
+
+	startTs := resourceUpdate.StartTs // Capture start timestamp
+	firstUpdateProgress := &resource.ProgressResult{
+		Operation:       resource.OperationUpdate,
+		OperationStatus: resource.OperationStatusInProgress,
+		RequestID:       "test-update-request-id",
+	}
+
+	err = resourceUpdate.RecordProgress(&plugin.TrackedProgress{ProgressResult: *firstUpdateProgress, Attempts: 1, MaxAttempts: 4})
+	assert.NoError(t, err)
+
+	assert.Equal(t, ResourceUpdateStateInProgress, resourceUpdate.State)
+	assert.Equal(t, startTs, resourceUpdate.StartTs) // StartTs should not change
+	assert.WithinDuration(t, time.Now(), resourceUpdate.ModifiedTs, 1*time.Second)
+
+	secondUpdateProgress := &resource.ProgressResult{
+		Operation:       resource.OperationUpdate,
+		OperationStatus: resource.OperationStatusFailure,
+		RequestID:       "test-second-update-request-id",
+	}
+
+	err = resourceUpdate.RecordProgress(&plugin.TrackedProgress{ProgressResult: *secondUpdateProgress, Attempts: 1, MaxAttempts: 4})
+	assert.NoError(t, err)
+	assert.Equal(t, ResourceUpdateStateFailed, resourceUpdate.State)
+	assert.Equal(t, startTs, resourceUpdate.StartTs) // StartTs should not change
+	assert.WithinDuration(t, time.Now(), resourceUpdate.ModifiedTs, 1*time.Second)
+}
+
+func TestRecordResourceProgress_UpdatesResourceProgress_ForReplaceOperation(t *testing.T) {
+	now := time.Now()
+	resourceUpdate := &ResourceUpdate{
+		Operation: OperationReplace,
+		State:     ResourceUpdateStateNotStarted,
+	}
+	readProgress := &resource.ProgressResult{
+		Operation:       resource.OperationRead,
+		OperationStatus: resource.OperationStatusSuccess,
+		RequestID:       "test-request-id",
+	}
+
+	err := resourceUpdate.RecordProgress(&plugin.TrackedProgress{ProgressResult: *readProgress, Attempts: 1, MaxAttempts: 4})
+	assert.NoError(t, err)
+
+	assert.Equal(t, ResourceUpdateStateInProgress, resourceUpdate.State)
+	assert.WithinDuration(t, now, resourceUpdate.StartTs, 1*time.Second)
+	assert.WithinDuration(t, now, resourceUpdate.ModifiedTs, 1*time.Second)
+
+	startTs := resourceUpdate.StartTs // Capture start timestamp
+	firstDeleteProgress := &resource.ProgressResult{
+		Operation:       resource.OperationDelete,
+		OperationStatus: resource.OperationStatusInProgress,
+		RequestID:       "test-replace-request-id",
+	}
+
+	err = resourceUpdate.RecordProgress(&plugin.TrackedProgress{ProgressResult: *firstDeleteProgress, Attempts: 1, MaxAttempts: 4})
+	assert.NoError(t, err)
+
+	assert.Equal(t, ResourceUpdateStateInProgress, resourceUpdate.State)
+	assert.Equal(t, startTs, resourceUpdate.StartTs) // StartTs should not change
+	assert.WithinDuration(t, time.Now(), resourceUpdate.ModifiedTs, 1*time.Second)
+
+	secondDeleteProgress := &resource.ProgressResult{
+		Operation:       resource.OperationDelete,
+		OperationStatus: resource.OperationStatusSuccess,
+		RequestID:       "test-second-replace-request-id",
+	}
+
+	err = resourceUpdate.RecordProgress(&plugin.TrackedProgress{ProgressResult: *secondDeleteProgress, Attempts: 1, MaxAttempts: 4})
+	assert.NoError(t, err)
+	assert.Equal(t, ResourceUpdateStateInProgress, resourceUpdate.State)
+	assert.Equal(t, startTs, resourceUpdate.StartTs) // StartTs should not change
+	assert.WithinDuration(t, time.Now(), resourceUpdate.ModifiedTs, 1*time.Second)
+
+	firstCreateProgress := &resource.ProgressResult{
+		Operation:       resource.OperationCreate,
+		OperationStatus: resource.OperationStatusInProgress,
+		RequestID:       "test-create-request-id",
+	}
+
+	err = resourceUpdate.RecordProgress(&plugin.TrackedProgress{ProgressResult: *firstCreateProgress, Attempts: 1, MaxAttempts: 4})
+	assert.NoError(t, err)
+	assert.Equal(t, ResourceUpdateStateInProgress, resourceUpdate.State)
+	assert.Equal(t, startTs, resourceUpdate.StartTs) // StartTs should not change
+	assert.WithinDuration(t, time.Now(), resourceUpdate.ModifiedTs, 1*time.Second)
+
+	secondCreateProgress := &resource.ProgressResult{
+		Operation:       resource.OperationCreate,
+		OperationStatus: resource.OperationStatusSuccess,
+		RequestID:       "test-second-create-request-id",
+	}
+
+	err = resourceUpdate.RecordProgress(&plugin.TrackedProgress{ProgressResult: *secondCreateProgress, Attempts: 1, MaxAttempts: 4})
+	assert.NoError(t, err)
+	assert.Equal(t, ResourceUpdateStateSuccess, resourceUpdate.State)
+	assert.Equal(t, startTs, resourceUpdate.StartTs) // StartTs should not change
+	assert.WithinDuration(t, time.Now(), resourceUpdate.ModifiedTs, 1*time.Second)
+}
+
+func Test_mergeRefsPreservingUserRefs_preservesResolvableValues(t *testing.T) {
+	distributionKsuid := util.NewID()
+	hostedZoneKsuid := util.NewID()
+
+	userProps := fmt.Appendf(nil, `{
+        "AliasTarget": {
+            "DNSName": {
+                "$ref": "formae://%s#/DomainName",
+                "$value": "d28wbczi6hzqwy.cloudfront.net"
+            },
+            "EvaluateTargetHealth": false,
+            "HostedZoneId": "Z2FDTNDATAQYW2"
+        },
+        "HostedZoneId": {
+            "$ref": "formae://%s#/Id",
+            "$value": "Z09517633GCSHWAHAJZBF"
+        },
+        "Name": "aa.test.platform.engineering",
+        "TTL": "300",
+        "Type": "A"
+    }`, distributionKsuid, hostedZoneKsuid)
+
+	pluginProps := fmt.Appendf(nil, `{
+        "AliasTarget": {
+            "DNSName": {
+                "$ref": "formae://%s#/DomainName",
+                "$value": null
+            },
+            "EvaluateTargetHealth": false,
+            "HostedZoneId": "Z2FDTNDATAQYW2"
+        },
+        "HostedZoneId": {
+            "$ref": "formae://%s#/Id",
+            "$value": null
+        },
+        "Name": "aa.test.platform.engineering",
+        "TTL": "300",
+        "Type": "A"
+    }`, distributionKsuid, hostedZoneKsuid)
+
+	merged, err := mergeRefsPreservingUserRefs(userProps, pluginProps, pkgmodel.Schema{}, false, nil)
+	require.NoError(t, err)
+
+	var mergedMap map[string]any
+	err = json.Unmarshal(merged, &mergedMap)
+	require.NoError(t, err)
+
+	// Check that $value fields are preserved from userProps
+	aliasTarget := mergedMap["AliasTarget"].(map[string]any)
+	dnsName := aliasTarget["DNSName"].(map[string]any)
+	require.Equal(t, "d28wbczi6hzqwy.cloudfront.net", dnsName["$value"])
+
+	hostedZoneId := mergedMap["HostedZoneId"].(map[string]any)
+	require.Equal(t, "Z09517633GCSHWAHAJZBF", hostedZoneId["$value"])
+}
+
+func TestResolveValue_UpdatesResolvedValueInProperties(t *testing.T) {
+	resourceKsuid := util.NewID()
+	resolvableUri := pkgmodel.FormaeURI(fmt.Sprintf("formae://%s#/Id", resourceKsuid))
+	resourceUpdate := &ResourceUpdate{
+		DesiredState: pkgmodel.Resource{
+			Properties: json.RawMessage(fmt.Sprintf(`{"resolvable": {"$ref":"formae://%s#/Id"}}`, resourceKsuid)),
+		},
+	}
+	err := resourceUpdate.ResolveValue(resolvableUri, "12345", pkgmodel.FormaApplyModeReconcile)
+	assert.NoError(t, err)
+
+	expectedJson := fmt.Sprintf(`{"resolvable":{"$ref":"formae://%s#/Id","$value":"12345"}}`, resourceKsuid)
+	assert.JSONEq(t, expectedJson, string(resourceUpdate.DesiredState.Properties))
+}
+
+func TestUpdateState_InProgress(t *testing.T) {
+	resourceUpdate := &ResourceUpdate{
+		State: ResourceUpdateStateNotStarted,
+		ProgressResult: []plugin.TrackedProgress{
+			{
+				ProgressResult: resource.ProgressResult{
+					Operation:       resource.OperationCreate,
+					OperationStatus: resource.OperationStatusInProgress,
+				},
+			},
+		},
+	}
+	resourceUpdate.UpdateState()
+
+	assert.Equal(t, ResourceUpdateStateInProgress, resourceUpdate.State)
+}
+
+func TestUpdateState_FailedButIncomplete(t *testing.T) {
+	resourceUpdate := &ResourceUpdate{
+		Operation: OperationUpdate,
+		State:     ResourceUpdateStateNotStarted,
+		ProgressResult: []plugin.TrackedProgress{
+			{
+				ProgressResult: resource.ProgressResult{
+					Operation:       resource.OperationRead,
+					OperationStatus: resource.OperationStatusFailure,
+				},
+			},
+		},
+	}
+	resourceUpdate.UpdateState()
+
+	assert.Equal(t, ResourceUpdateStateFailed, resourceUpdate.State)
+}
+
+func TestUpdateState_FailedAndComplete(t *testing.T) {
+	resourceUpdate := &ResourceUpdate{
+		Operation: OperationDelete,
+		State:     ResourceUpdateStateNotStarted,
+		ProgressResult: []plugin.TrackedProgress{
+			{
+				ProgressResult: resource.ProgressResult{
+					Operation:       resource.OperationRead,
+					OperationStatus: resource.OperationStatusSuccess,
+				},
+			},
+			{
+				ProgressResult: resource.ProgressResult{
+					Operation:       resource.OperationDelete,
+					OperationStatus: resource.OperationStatusFailure,
+				},
+			},
+		},
+	}
+	resourceUpdate.UpdateState()
+
+	assert.Equal(t, ResourceUpdateStateFailed, resourceUpdate.State)
+}
+
+// TestUpdateState_RestartRecovery_SuccessProgressDerivesSuccessState tests the restart recovery
+// scenario where a ResourceUpdate has Success progress from before the restart, and UpdateState
+// should correctly derive the Success state.
+func TestUpdateState_RestartRecovery_SuccessProgressDerivesSuccessState(t *testing.T) {
+	// Simulate a CREATE operation that completed successfully before restart
+	// The state is NotStarted (as if it was reset), but progress shows Success
+	resourceUpdate := &ResourceUpdate{
+		Operation: OperationCreate,
+		State:     ResourceUpdateStateNotStarted, // State before UpdateState() is called
+		ProgressResult: []plugin.TrackedProgress{
+			{
+				ProgressResult: resource.ProgressResult{
+					Operation:       resource.OperationCreate,
+					OperationStatus: resource.OperationStatusSuccess,
+				},
+			},
+		},
+	}
+
+	// UpdateState should derive Success from the progress, not keep NotStarted
+	resourceUpdate.UpdateState()
+
+	assert.Equal(t, ResourceUpdateStateSuccess, resourceUpdate.State,
+		"UpdateState should derive Success state from Success progress, not keep NotStarted")
+}
+
+// TestUpdateState_RestartRecovery_NoProgressDerivesNotStarted tests that resources
+// without any progress are correctly set to NotStarted after restart.
+func TestUpdateState_RestartRecovery_NoProgressDerivesNotStarted(t *testing.T) {
+	resourceUpdate := &ResourceUpdate{
+		Operation:      OperationCreate,
+		State:          ResourceUpdateStateInProgress, // Some stale state
+		ProgressResult: nil,                           // No progress recorded
+	}
+
+	resourceUpdate.UpdateState()
+
+	assert.Equal(t, ResourceUpdateStateNotStarted, resourceUpdate.State,
+		"UpdateState should set NotStarted when there's no progress")
+}
+
+func Test_mergeRefsPreservingUserRefs_preservesResolvableValuesWithVisibilityWithoutValue(t *testing.T) {
+	hostedZoneKsuid := util.NewID()
+
+	userProps := fmt.Appendf(nil, `{
+        "HostedZoneId": {
+            "$ref": "formae://%s#/Id",
+            "$visibility": "Clear"
+        },
+        "Name": "a.snarf.platform.engineering",
+        "ResourceRecords": ["192.168.55.2"],
+        "TTL": 350,
+        "Type": "A"
+    }`, hostedZoneKsuid)
+
+	pluginProps := []byte(`{
+        "HostedZoneId": "Z087209931QU7X2Y9HBBG",
+        "Name": "a.snarf.platform.engineering",
+        "ResourceRecords": ["192.168.55.2"],
+        "TTL": 300,
+        "Type": "A"
+    }`)
+
+	merged, err := mergeRefsPreservingUserRefs(userProps, pluginProps, pkgmodel.Schema{}, false, nil)
+	require.NoError(t, err)
+
+	var mergedMap map[string]any
+	err = json.Unmarshal(merged, &mergedMap)
+	require.NoError(t, err)
+
+	// Check that HostedZoneId preserves the $ref structure from userProps
+	hostedZoneId := mergedMap["HostedZoneId"].(map[string]any)
+	require.Equal(t, fmt.Sprintf("formae://%s#/Id", hostedZoneKsuid), hostedZoneId["$ref"])
+	require.Equal(t, "Clear", hostedZoneId["$visibility"])
+
+	// Verify that the resolved value from pluginProps is merged in
+	require.Equal(t, "Z087209931QU7X2Y9HBBG", hostedZoneId["$value"])
+
+	// Check other properties are preserved correctly
+	require.Equal(t, "a.snarf.platform.engineering", mergedMap["Name"])
+	require.Equal(t, "A", mergedMap["Type"])
+
+	// Check ResourceRecords array
+	resourceRecords := mergedMap["ResourceRecords"].([]any)
+	require.Len(t, resourceRecords, 1)
+	require.Equal(t, "192.168.55.2", resourceRecords[0])
+
+	// Check TTL - since the plugin is returning 300 it will overwrite the user changes
+	require.Equal(t, float64(300), mergedMap["TTL"])
+}
+
+func Test_mergeRefsPreservingUserRefs_preservesResolvableValuesWithVisibilityAndValue(t *testing.T) {
+	hostedZoneKsuid := util.NewID()
+
+	userProps := fmt.Appendf(nil, `{
+        "HostedZoneId": {
+            "$ref": "formae://%s#/Id",
+            "$visibility": "Clear",
+            "$value": "Z0477298SEIH33ICWILW"
+        },
+        "Name": "a.snarf.platform.engineering",
+        "ResourceRecords": ["192.168.55.1"],
+        "TTL": 500,
+        "Type": "A"
+    }`, hostedZoneKsuid)
+
+	pluginProps := []byte(`{
+        "HostedZoneId": "Z0477298SEIH33ICWILW",
+        "Name": "a.snarf.platform.engineering",
+        "ResourceRecords": ["192.168.55.1"],
+        "TTL": 500,
+        "Type": "A"
+    }`)
+
+	merged, err := mergeRefsPreservingUserRefs(userProps, pluginProps, pkgmodel.Schema{}, false, nil)
+	require.NoError(t, err)
+
+	var mergedMap map[string]any
+	err = json.Unmarshal(merged, &mergedMap)
+	require.NoError(t, err)
+
+	// Check that HostedZoneId preserves the $ref structure from userProps
+	hostedZoneId := mergedMap["HostedZoneId"].(map[string]any)
+	require.Equal(t, fmt.Sprintf("formae://%s#/Id", hostedZoneKsuid), hostedZoneId["$ref"])
+	require.Equal(t, "Clear", hostedZoneId["$visibility"])
+
+	// Verify that the resolved value is preserved from userProps (since it already has a value)
+	require.Equal(t, "Z0477298SEIH33ICWILW", hostedZoneId["$value"])
+
+	// Check other properties are preserved correctly
+	require.Equal(t, "a.snarf.platform.engineering", mergedMap["Name"])
+	require.Equal(t, "A", mergedMap["Type"])
+
+	// Check ResourceRecords array
+	resourceRecords := mergedMap["ResourceRecords"].([]any)
+	require.Len(t, resourceRecords, 1)
+	require.Equal(t, "192.168.55.1", resourceRecords[0])
+
+	// Check TTL - should preserve the value from userProps/pluginProps (both are 500)
+	require.Equal(t, float64(500), mergedMap["TTL"])
+}
+
+// Test_mergeRefsPreservingUserRefs_OpaqueEnvelope_ReplacesHashWithLiveReadValue covers
+// the pre-update out-of-band-check merge: the stored ("user") side of an opaque field is
+// a hashed-at-rest envelope ({"$hashed":true,"$value":"<sha256>","$visibility":"Opaque"}),
+// while a live plugin Read always returns the underlying field as a bare scalar (secret
+// stores never re-wrap on read). Before this fix, mergeObject treated the envelope as a
+// generic object and recursed into its own keys ($hashed/$value/$visibility) against a
+// nonexistent plugin sub-object, which silently preserved the stored hash verbatim — the
+// live plaintext from the Read was discarded, so the PriorState fed into the next stage
+// (an actual Update call) still carried $hashed:true and was permanently rejected by the
+// plugin-boundary guard (resolver.ConvertToPluginFormat) for the rest of the
+// resource's life. The merge must instead adopt the plugin's live value and drop $hashed.
+func Test_mergeRefsPreservingUserRefs_OpaqueEnvelope_ReplacesHashWithLiveReadValue(t *testing.T) {
+	storedHash := pkgmodel.ComputeValueHash("super-secret-password")
+	userProps := []byte(`{
+        "Name": "my-secret",
+        "SecretString": {"$hashed":true,"$value":"` + storedHash + `","$visibility":"Opaque"}
+    }`)
+	pluginProps := []byte(`{
+        "Name": "my-secret",
+        "SecretString": "super-secret-password"
+    }`)
+
+	merged, err := mergeRefsPreservingUserRefs(userProps, pluginProps, pkgmodel.Schema{
+		Hints: map[string]pkgmodel.FieldHint{"SecretString": {Opaque: true}},
+	}, false, nil)
+	require.NoError(t, err)
+
+	var mergedMap map[string]any
+	require.NoError(t, json.Unmarshal(merged, &mergedMap))
+
+	secretString, ok := mergedMap["SecretString"].(map[string]any)
+	require.True(t, ok, "SecretString must remain an Opaque envelope, not a bare string")
+	assert.Equal(t, "Opaque", secretString["$visibility"])
+	assert.Equal(t, "super-secret-password", secretString["$value"],
+		"the envelope's $value must be replaced with the plugin's live read, not preserve the stale stored hash")
+	assert.NotContains(t, secretString, "$hashed", "a freshly-read live value is no longer a hash")
+	assert.Equal(t, "my-secret", mergedMap["Name"])
+}
+
+// Test_mergeRefsPreservingUserRefs_ResEnvelope_EmptyPluginEchoPreservesHash covers the $res
+// sibling of the opaque-envelope merge. A structured $res resolvable that points at another
+// resource's Opaque property survives at rest on non-translating paths as a $res envelope. If
+// the plugin round-trips the resolvable back as a $res object whose $value is absent/empty
+// (unresolved), the merge must KEEP the stored hash AND retain $hashed:true. Regression guard:
+// keptUserValue only unwraps $ref, so mergeResObject must feed it the unwrapped plugin value —
+// otherwise a non-empty $res echo object is mistaken for a fresh value, $hashed is deleted, and
+// the persist transformer hashes the already-hashed digest again (hash-of-hash corruption).
+func Test_mergeRefsPreservingUserRefs_ResEnvelope_EmptyPluginEchoPreservesHash(t *testing.T) {
+	storedHash := pkgmodel.ComputeValueHash("v1")
+	userProps := []byte(`{
+        "name": "the-consumer",
+        "consumes": {"$res":true,"$label":"the-secret","$type":"FakeAWS::Resource","$stack":"s","$property":"secret","$hashed":true,"$value":"` + storedHash + `","$visibility":"Opaque"}
+    }`)
+	// Plugin echoes the resolvable back as a $res object with NO resolved $value.
+	pluginProps := []byte(`{
+        "name": "the-consumer",
+        "consumes": {"$res":true,"$label":"the-secret","$type":"FakeAWS::Resource","$stack":"s","$property":"secret"}
+    }`)
+
+	merged, err := mergeRefsPreservingUserRefs(userProps, pluginProps, pkgmodel.Schema{}, false, nil)
+	require.NoError(t, err)
+
+	var mergedMap map[string]any
+	require.NoError(t, json.Unmarshal(merged, &mergedMap))
+
+	consumes, ok := mergedMap["consumes"].(map[string]any)
+	require.True(t, ok, "consumes must remain a $res envelope")
+	assert.Equal(t, true, consumes["$res"])
+	assert.Equal(t, "Opaque", consumes["$visibility"])
+	assert.Equal(t, storedHash, consumes["$value"],
+		"stored hash must be retained when the plugin echo carries no resolved value")
+	assert.Equal(t, true, consumes["$hashed"],
+		"$hashed must be retained (no hash-of-hash): $value is still the stored digest, not a fresh plaintext")
+}
+
+func Test_mergeRefsPreservingUserRefs_RemovesArrayElements(t *testing.T) {
+	hostedZoneKsuid := util.NewID()
+
+	userProps := fmt.Append(nil, `{
+        "HostedZoneId": "Z0477298SEIH33ICWILW",
+        "Name": "a.snarf.platform.engineering",
+        "ResourceRecords": ["192.168.55.1", "192.168.55.2", "192.168.55.3"],
+        "TTL": 500,
+        "Type": "A"
+    }`, hostedZoneKsuid)
+
+	pluginProps := []byte(`{
+        "HostedZoneId": "Z0477298SEIH33ICWILW",
+        "Name": "a.snarf.platform.engineering",
+        "ResourceRecords": ["192.168.55.1", "192.168.55.3"],
+        "TTL": 500,
+        "Type": "A"
+    }`)
+
+	merged, err := mergeRefsPreservingUserRefs(userProps, pluginProps, pkgmodel.Schema{}, false, nil)
+	require.NoError(t, err)
+
+	var mergedMap map[string]any
+	err = json.Unmarshal(merged, &mergedMap)
+	require.NoError(t, err)
+
+	resourceRecords := mergedMap["ResourceRecords"].([]any)
+	require.Len(t, resourceRecords, 2)
+	require.Equal(t, "192.168.55.1", resourceRecords[0])
+	require.Equal(t, "192.168.55.3", resourceRecords[1])
+}
+
+// TestRecordProgress_IntermediateProgressPreservesRefStructuresInArrays tests that $ref structures
+// in arrays are preserved when intermediate progress updates (InProgress status) have empty properties.
+// This prevents the "self-cannibalization" bug where:
+// 1. First progress (InProgress) has empty properties {}
+// 2. Merge would wipe out arrays because plugin arrays are empty
+// 3. User's $ref structures in arrays would be lost forever
+// 4. Final progress (Success) can't restore them because they're already gone
+func TestRecordProgress_IntermediateProgressPreservesRefStructuresInArrays(t *testing.T) {
+	diskKsuid := util.NewID()
+	networkKsuid := util.NewID()
+	subnetKsuid := util.NewID()
+
+	// Initial user properties with $ref structures in arrays (simulating a compute instance)
+	userProps := fmt.Sprintf(`{
+		"region": "us-east-1",
+		"name": "formae-demo-instance",
+		"instanceType": "small",
+		"disks": [{
+			"autoDelete": false,
+			"boot": true,
+			"source": {
+				"$ref": "formae://%s#/selfLink",
+				"$value": "arn:cloud:compute:us-east-1:123456789:disk/formae-demo-boot-disk"
+			}
+		}],
+		"networkInterfaces": [{
+			"network": {
+				"$ref": "formae://%s#/selfLink",
+				"$value": "arn:cloud:network:us-east-1:123456789:vpc/formae-demo-network"
+			},
+			"subnetwork": {
+				"$ref": "formae://%s#/selfLink",
+				"$value": "arn:cloud:network:us-east-1:123456789:subnet/public-subnet"
+			}
+		}],
+		"labels": {"environment": "demo"}
+	}`, diskKsuid, networkKsuid, subnetKsuid)
+
+	resourceUpdate := &ResourceUpdate{
+		Operation: OperationCreate,
+		State:     ResourceUpdateStateNotStarted,
+		DesiredState: pkgmodel.Resource{
+			Properties: json.RawMessage(userProps),
+			Schema: pkgmodel.Schema{
+				Fields: []string{"region", "name", "instanceType", "disks", "networkInterfaces", "labels"},
+			},
+		},
+	}
+
+	// First progress: InProgress with EMPTY properties (this is what the plugin returns during polling)
+	firstProgress := &plugin.TrackedProgress{
+		ProgressResult: resource.ProgressResult{
+			Operation:          resource.OperationCreate,
+			OperationStatus:    resource.OperationStatusInProgress,
+			RequestID:          "test-create-request-id",
+			ResourceProperties: json.RawMessage(`{}`), // Empty properties during intermediate polling
+		},
+		StartTs:     util.TimeNow(),
+		ModifiedTs:  util.TimeNow().Add(10 * time.Second),
+		MaxAttempts: 3,
+	}
+
+	err := resourceUpdate.RecordProgress(firstProgress)
+	require.NoError(t, err)
+
+	// Verify state is InProgress
+	assert.Equal(t, ResourceUpdateStateInProgress, resourceUpdate.State)
+
+	// CRITICAL: Verify that $ref structures in arrays are PRESERVED after intermediate progress
+	var propsAfterFirst map[string]any
+	err = json.Unmarshal(resourceUpdate.DesiredState.Properties, &propsAfterFirst)
+	require.NoError(t, err)
+
+	// Check disks array still has $ref
+	disks, ok := propsAfterFirst["disks"].([]any)
+	require.True(t, ok, "disks should still be an array")
+	require.Len(t, disks, 1, "disks array should have 1 element")
+
+	disk := disks[0].(map[string]any)
+	source, ok := disk["source"].(map[string]any)
+	require.True(t, ok, "source should be an object with $ref")
+	require.Equal(t, fmt.Sprintf("formae://%s#/selfLink", diskKsuid), source["$ref"],
+		"disk source $ref should be preserved after intermediate progress")
+
+	// Check networkInterfaces array still has $ref
+	networkInterfaces, ok := propsAfterFirst["networkInterfaces"].([]any)
+	require.True(t, ok, "networkInterfaces should still be an array")
+	require.Len(t, networkInterfaces, 1, "networkInterfaces array should have 1 element")
+
+	nic := networkInterfaces[0].(map[string]any)
+	network, ok := nic["network"].(map[string]any)
+	require.True(t, ok, "network should be an object with $ref")
+	require.Equal(t, fmt.Sprintf("formae://%s#/selfLink", networkKsuid), network["$ref"],
+		"network $ref should be preserved after intermediate progress")
+
+	subnetwork, ok := nic["subnetwork"].(map[string]any)
+	require.True(t, ok, "subnetwork should be an object with $ref")
+	require.Equal(t, fmt.Sprintf("formae://%s#/selfLink", subnetKsuid), subnetwork["$ref"],
+		"subnetwork $ref should be preserved after intermediate progress")
+
+	// Second progress: Success with FULL properties from the cloud provider
+	// The plugin returns $ref objects that match the user's $ref structures
+	finalPluginProps := fmt.Sprintf(`{
+		"deletionProtection": false,
+		"disks": [{
+			"architecture": "X86_64",
+			"autoDelete": false,
+			"boot": true,
+			"deviceName": "persistent-disk-0",
+			"diskSizeGb": "20",
+			"source": {
+				"$ref": "formae://%s#/selfLink",
+				"$value": "arn:cloud:compute:us-east-1:123456789:disk/formae-demo-boot-disk"
+			}
+		}],
+		"labels": {"environment": "demo"},
+		"instanceType": "arn:cloud:compute:us-east-1:123456789:instance-type/small",
+		"name": "formae-demo-instance",
+		"networkInterfaces": [{
+			"fingerprint": "inQ5pxBw2-M=",
+			"name": "nic0",
+			"network": {
+				"$ref": "formae://%s#/selfLink",
+				"$value": "arn:cloud:network:us-east-1:123456789:vpc/formae-demo-network"
+			},
+			"networkIP": "10.0.1.7",
+			"subnetwork": {
+				"$ref": "formae://%s#/selfLink",
+				"$value": "arn:cloud:network:us-east-1:123456789:subnet/public-subnet"
+			}
+		}],
+		"region": "us-east-1"
+	}`, diskKsuid, networkKsuid, subnetKsuid)
+
+	secondProgress := &plugin.TrackedProgress{
+		ProgressResult: resource.ProgressResult{
+			Operation:          resource.OperationCreate,
+			OperationStatus:    resource.OperationStatusSuccess,
+			RequestID:          "test-create-request-id-2",
+			ResourceProperties: json.RawMessage(finalPluginProps),
+		},
+		StartTs:     util.TimeNow().Add(120 * time.Second),
+		ModifiedTs:  util.TimeNow().Add(140 * time.Second),
+		MaxAttempts: 3,
+	}
+
+	err = resourceUpdate.RecordProgress(secondProgress)
+	require.NoError(t, err)
+
+	// Verify state is Success
+	assert.Equal(t, ResourceUpdateStateSuccess, resourceUpdate.State)
+
+	// Verify that $ref structures are STILL preserved after final merge
+	var propsAfterFinal map[string]any
+	err = json.Unmarshal(resourceUpdate.DesiredState.Properties, &propsAfterFinal)
+	require.NoError(t, err)
+
+	// Check disks array still has $ref after final merge
+	disksAfterFinal, ok := propsAfterFinal["disks"].([]any)
+	require.True(t, ok, "disks should still be an array after final merge")
+	require.Len(t, disksAfterFinal, 1, "disks array should have 1 element after final merge")
+
+	diskAfterFinal := disksAfterFinal[0].(map[string]any)
+	sourceAfterFinal, ok := diskAfterFinal["source"].(map[string]any)
+	require.True(t, ok, "source should be an object with $ref after final merge")
+	require.Equal(t, fmt.Sprintf("formae://%s#/selfLink", diskKsuid), sourceAfterFinal["$ref"],
+		"disk source $ref should be preserved after final merge")
+	require.Equal(t, "arn:cloud:compute:us-east-1:123456789:disk/formae-demo-boot-disk",
+		sourceAfterFinal["$value"], "disk source $value should be preserved")
+
+	// Check networkInterfaces array still has $ref after final merge
+	nicsAfterFinal, ok := propsAfterFinal["networkInterfaces"].([]any)
+	require.True(t, ok, "networkInterfaces should still be an array after final merge")
+	require.Len(t, nicsAfterFinal, 1, "networkInterfaces array should have 1 element after final merge")
+
+	nicAfterFinal := nicsAfterFinal[0].(map[string]any)
+	networkAfterFinal, ok := nicAfterFinal["network"].(map[string]any)
+	require.True(t, ok, "network should be an object with $ref after final merge")
+	require.Equal(t, fmt.Sprintf("formae://%s#/selfLink", networkKsuid), networkAfterFinal["$ref"],
+		"network $ref should be preserved after final merge")
+
+	subnetworkAfterFinal, ok := nicAfterFinal["subnetwork"].(map[string]any)
+	require.True(t, ok, "subnetwork should be an object with $ref after final merge")
+	require.Equal(t, fmt.Sprintf("formae://%s#/selfLink", subnetKsuid), subnetworkAfterFinal["$ref"],
+		"subnetwork $ref should be preserved after final merge")
+}
+
+// TestRecordProgress_MergePreservesRefStructuresInArrays tests that $ref structures
+// in arrays are preserved when plugin returns plain string values instead of $ref objects.
+func TestRecordProgress_MergePreservesRefStructuresInArrays(t *testing.T) {
+	// User properties with $ref structures in arrays
+	userProps := `{
+		"name": "my-instance",
+		"disks": [{"boot": true, "source": {"$ref": "formae://disk-ksuid#/selfLink", "$value": "disk-1"}}],
+		"networkInterfaces": [{"network": {"$ref": "formae://network-ksuid#/selfLink", "$value": "network-1"}, "subnetwork": {"$ref": "formae://subnet-ksuid#/selfLink", "$value": "subnet-1"}}]
+	}`
+
+	// Plugin returns PLAIN STRINGS, not $ref objects
+	pluginProps := `{
+		"name": "my-instance",
+		"disks": [{"boot": true, "size": "20GB", "source": "disk-1"}],
+		"networkInterfaces": [{"name": "nic0", "network": "network-1", "subnetwork": "subnet-1"}]
+	}`
+
+	// Expected: plugin fields merged with $ref structures preserved from user.
+	// Operation is Create, so this is a write-origin merge — each $ref's
+	// pre-merge $value (the resolution formae sent) is also kept as $applied.
+	expectedProps := `{
+		"name": "my-instance",
+		"disks": [{"boot": true, "size": "20GB", "source": {"$ref": "formae://disk-ksuid#/selfLink", "$value": "disk-1", "$applied": "disk-1"}}],
+		"networkInterfaces": [{"name": "nic0", "network": {"$ref": "formae://network-ksuid#/selfLink", "$value": "network-1", "$applied": "network-1"}, "subnetwork": {"$ref": "formae://subnet-ksuid#/selfLink", "$value": "subnet-1", "$applied": "subnet-1"}}]
+	}`
+
+	resourceUpdate := &ResourceUpdate{
+		Operation: OperationCreate,
+		State:     ResourceUpdateStateNotStarted,
+		DesiredState: pkgmodel.Resource{
+			Properties: json.RawMessage(userProps),
+			Schema:     pkgmodel.Schema{Fields: []string{"name", "disks", "networkInterfaces"}},
+		},
+	}
+
+	progress := &plugin.TrackedProgress{
+		ProgressResult: resource.ProgressResult{
+			Operation:          resource.OperationCreate,
+			OperationStatus:    resource.OperationStatusSuccess,
+			RequestID:          "test-request",
+			ResourceProperties: json.RawMessage(pluginProps),
+		},
+		StartTs:     util.TimeNow(),
+		ModifiedTs:  util.TimeNow().Add(10 * time.Second),
+		MaxAttempts: 3,
+	}
+
+	err := resourceUpdate.RecordProgress(progress)
+	require.NoError(t, err)
+	assert.Equal(t, ResourceUpdateStateSuccess, resourceUpdate.State)
+	assert.JSONEq(t, expectedProps, string(resourceUpdate.DesiredState.Properties))
+}
+
+// TestRecordProgress_MergeArrays_UserHasMoreElementsThanPlugin tests that when user properties
+// have more array elements than plugin returns, the merged result only contains the elements
+// that the plugin returned. This ensures we don't keep stale/removed elements.
+func TestRecordProgress_MergeArrays_UserHasMoreElementsThanPlugin(t *testing.T) {
+	// User has 2 networkInterfaces
+	userProps := `{
+		"name": "my-instance",
+		"networkInterfaces": [
+			{"network": {"$ref": "formae://network1-ksuid#/selfLink", "$value": "network-1"}, "subnetwork": {"$ref": "formae://subnet1-ksuid#/selfLink", "$value": "subnet-1"}},
+			{"network": {"$ref": "formae://network2-ksuid#/selfLink", "$value": "network-2"}, "subnetwork": {"$ref": "formae://subnet2-ksuid#/selfLink", "$value": "subnet-2"}}
+		]
+	}`
+
+	// Plugin returns only 1 networkInterface (the first one)
+	pluginProps := `{
+		"name": "my-instance",
+		"networkInterfaces": [{"name": "nic0", "network": "network-1", "subnetwork": "subnet-1"}]
+	}`
+
+	// Expected: only 1 networkInterface with $ref preserved from user's first
+	// element. Operation is Create, so this is a write-origin merge — each
+	// $ref's pre-merge $value is also kept as $applied.
+	expectedProps := `{
+		"name": "my-instance",
+		"networkInterfaces": [{"name": "nic0", "network": {"$ref": "formae://network1-ksuid#/selfLink", "$value": "network-1", "$applied": "network-1"}, "subnetwork": {"$ref": "formae://subnet1-ksuid#/selfLink", "$value": "subnet-1", "$applied": "subnet-1"}}]
+	}`
+
+	resourceUpdate := &ResourceUpdate{
+		Operation: OperationCreate,
+		State:     ResourceUpdateStateNotStarted,
+		DesiredState: pkgmodel.Resource{
+			Properties: json.RawMessage(userProps),
+			Schema:     pkgmodel.Schema{Fields: []string{"name", "networkInterfaces"}},
+		},
+	}
+
+	progress := &plugin.TrackedProgress{
+		ProgressResult: resource.ProgressResult{
+			Operation:          resource.OperationCreate,
+			OperationStatus:    resource.OperationStatusSuccess,
+			RequestID:          "test-request",
+			ResourceProperties: json.RawMessage(pluginProps),
+		},
+		StartTs:     util.TimeNow(),
+		ModifiedTs:  util.TimeNow().Add(10 * time.Second),
+		MaxAttempts: 3,
+	}
+
+	err := resourceUpdate.RecordProgress(progress)
+	require.NoError(t, err)
+	assert.Equal(t, ResourceUpdateStateSuccess, resourceUpdate.State)
+	assert.JSONEq(t, expectedProps, string(resourceUpdate.DesiredState.Properties))
+}
+
+// envByName unmarshals merged task-def properties and returns the first container's
+// Environment entries keyed by their Name, for per-entry assertions.
+func envByName(t *testing.T, merged json.RawMessage) map[string]any {
+	t.Helper()
+	var props map[string]any
+	require.NoError(t, json.Unmarshal(merged, &props))
+	containers := props["ContainerDefinitions"].([]any)
+	env := containers[0].(map[string]any)["Environment"].([]any)
+	byName := make(map[string]any, len(env))
+	for _, e := range env {
+		entry := e.(map[string]any)
+		byName[entry["Name"].(string)] = entry["Value"]
+	}
+	return byName
+}
+
+// A literal KeyValuePair nested in ContainerDefinitions[0].Environment must not inherit a
+// sibling's $ref. The nested Environment array must resolve its own (default/Set) hint by its
+// index-less full path, not inherit ContainerDefinitions' EntitySet/indexField="name" hint —
+// which would match env entries purely positionally (the index key is "" for every PascalCase
+// element) and, on a reordered plugin read, graft the cluster ref onto the literal.
+func Test_mergeRefsPreservingUserRefs_ECSEnvLiteralDoesNotInheritSiblingRef(t *testing.T) {
+	clusterKsuid := util.NewID()
+	clusterArn := "arn:aws:ecs:eu-west-1:174245935421:cluster/clanker"
+	repoMap := `{\"formae-hub\":\"clanker-runtask-hub\"}`
+
+	// Recorded (user) state: ECS_CLUSTER carries its own resolved cluster-Arn $ref;
+	// RUNTASK_DEF_BY_REPO is a plain literal.
+	userProps := fmt.Appendf(nil, `{
+		"Family": "clanker-bridge",
+		"ContainerDefinitions": [
+			{
+				"Name": "bridge",
+				"Environment": [
+					{"Name": "ECS_CLUSTER", "Value": {"$ref": "formae://%s#/Arn", "$value": "%s"}},
+					{"Name": "RUNTASK_DEF_BY_REPO", "Value": "%s"}
+				]
+			}
+		]
+	}`, clusterKsuid, clusterArn, repoMap)
+
+	// Plugin (AWS Read) returns both env entries as plain strings, in REVERSED order.
+	pluginProps := fmt.Appendf(nil, `{
+		"Family": "clanker-bridge",
+		"ContainerDefinitions": [
+			{
+				"Name": "bridge",
+				"Environment": [
+					{"Name": "RUNTASK_DEF_BY_REPO", "Value": "%s"},
+					{"Name": "ECS_CLUSTER", "Value": "%s"}
+				]
+			}
+		]
+	}`, repoMap, clusterArn)
+
+	// ContainerDefinitions carries the real ECS hint (EntitySet, indexField "name");
+	// the nested Environment array must NOT inherit it.
+	schema := pkgmodel.Schema{
+		Hints: map[string]pkgmodel.FieldHint{
+			"ContainerDefinitions": {UpdateMethod: pkgmodel.FieldUpdateMethodEntitySet, IndexField: "name"},
+		},
+	}
+
+	merged, err := mergeRefsPreservingUserRefs(userProps, pluginProps, schema, false, nil)
+	require.NoError(t, err)
+	byName := envByName(t, merged)
+
+	// The literal stays a plain string — never carrying a $ref.
+	assert.Equal(t, `{"formae-hub":"clanker-runtask-hub"}`, byName["RUNTASK_DEF_BY_REPO"],
+		"literal RUNTASK_DEF_BY_REPO must not inherit a sibling's $ref")
+
+	// ECS_CLUSTER keeps its OWN cluster-Arn ref.
+	cluster := byName["ECS_CLUSTER"].(map[string]any)
+	assert.Equal(t, fmt.Sprintf("formae://%s#/Arn", clusterKsuid), cluster["$ref"])
+	assert.Equal(t, clusterArn, cluster["$value"])
+}
+
+// On the default/Set path, a literal plugin element that misses phase-1 value matching must not
+// grab an unrelated sibling's unresolved $ref in phase 2. Phase-2 pairing is structural: a $ref
+// candidate is grafted only when its concrete identity field(s) uniquely match the plugin element.
+func Test_mergeRefsPreservingUserRefs_Phase2DoesNotGraftSiblingRefOntoLiteral(t *testing.T) {
+	clusterKsuid := util.NewID()
+
+	// User: ECS_CLUSTER as an UNRESOLVED $ref (no $value yet) + RUNTASK as a literal.
+	userProps := fmt.Appendf(nil, `{
+		"Environment": [
+			{"Name": "ECS_CLUSTER", "Value": {"$ref": "formae://%s#/Arn"}},
+			{"Name": "RUNTASK", "Value": "old-value"}
+		]
+	}`, clusterKsuid)
+
+	// Plugin returns only RUNTASK, with a CHANGED value so it misses phase-1 matching.
+	// ECS_CLUSTER is absent from this read.
+	pluginProps := json.RawMessage(`{
+		"Environment": [
+			{"Name": "RUNTASK", "Value": "new-value"}
+		]
+	}`)
+
+	// No hint on Environment → default/Set path.
+	merged, err := mergeRefsPreservingUserRefs(userProps, pluginProps, pkgmodel.Schema{}, false, nil)
+	require.NoError(t, err)
+
+	var props map[string]any
+	require.NoError(t, json.Unmarshal(merged, &props))
+	env := props["Environment"].([]any)
+	require.Len(t, env, 1)
+	runtask := env[0].(map[string]any)
+	assert.Equal(t, "RUNTASK", runtask["Name"])
+	// The literal must keep the plugin's plain value — it must NOT inherit ECS_CLUSTER's $ref.
+	assert.Equal(t, "new-value", runtask["Value"],
+		"literal RUNTASK must render plain, not graft the ECS_CLUSTER $ref")
+}
+
+// An ordered (UpdateMethodArray) array must pair plugin and user elements strictly by index, so
+// a literal at one position never inherits the $ref of an unresolved-$ref element at another
+// position. (Phase 1 never matches Array elements by value, so all pairing happens in phase 2.)
+func Test_mergeRefsPreservingUserRefs_OrderedArrayPairsByIndex(t *testing.T) {
+	refKsuid := util.NewID()
+
+	// index 0: literal; index 1: unresolved $ref.
+	userProps := fmt.Appendf(nil, `{
+		"Items": [
+			"literal-0",
+			{"$ref": "formae://%s#/Id"}
+		]
+	}`, refKsuid)
+
+	pluginProps := json.RawMessage(`{
+		"Items": [
+			"literal-0",
+			"resolved-1"
+		]
+	}`)
+
+	schema := pkgmodel.Schema{
+		Hints: map[string]pkgmodel.FieldHint{
+			"Items": {UpdateMethod: pkgmodel.FieldUpdateMethodArray},
+		},
+	}
+
+	merged, err := mergeRefsPreservingUserRefs(userProps, pluginProps, schema, false, nil)
+	require.NoError(t, err)
+
+	var props map[string]any
+	require.NoError(t, json.Unmarshal(merged, &props))
+	items := props["Items"].([]any)
+	require.Len(t, items, 2)
+
+	// index 0 stays the plain literal — it must NOT inherit index 1's $ref.
+	assert.Equal(t, "literal-0", items[0])
+	// index 1 keeps its own $ref, resolved against the plugin value.
+	ref := items[1].(map[string]any)
+	assert.Equal(t, fmt.Sprintf("formae://%s#/Id", refKsuid), ref["$ref"])
+	assert.Equal(t, "resolved-1", ref["$value"])
+}
+
+// TestRecordProgress_MergeArrays_PluginReturnsReorderedElements tests that when plugin returns
+// array elements in a different order than user provided, the correct $ref structures are
+// matched and preserved based on value matching, not index position.
+func TestRecordProgress_MergeArrays_PluginReturnsReorderedElements(t *testing.T) {
+	// User: network-1, network-2 (in that order)
+	userProps := `{
+		"name": "my-instance",
+		"networkInterfaces": [
+			{"network": {"$ref": "formae://network1-ksuid#/selfLink", "$value": "network-1"}, "subnetwork": {"$ref": "formae://subnet1-ksuid#/selfLink", "$value": "subnet-1"}},
+			{"network": {"$ref": "formae://network2-ksuid#/selfLink", "$value": "network-2"}, "subnetwork": {"$ref": "formae://subnet2-ksuid#/selfLink", "$value": "subnet-2"}}
+		]
+	}`
+
+	// Plugin returns REVERSED order: network-2 first, then network-1
+	pluginProps := `{
+		"name": "my-instance",
+		"networkInterfaces": [
+			{"name": "nic1", "network": "network-2", "subnetwork": "subnet-2"},
+			{"name": "nic0", "network": "network-1", "subnetwork": "subnet-1"}
+		]
+	}`
+
+	// Expected: plugin order preserved (2, 1) with correct $ref matched by
+	// value. Operation is Create, so this is a write-origin merge — each
+	// $ref's pre-merge $value is also kept as $applied.
+	expectedProps := `{
+		"name": "my-instance",
+		"networkInterfaces": [
+			{"name": "nic1", "network": {"$ref": "formae://network2-ksuid#/selfLink", "$value": "network-2", "$applied": "network-2"}, "subnetwork": {"$ref": "formae://subnet2-ksuid#/selfLink", "$value": "subnet-2", "$applied": "subnet-2"}},
+			{"name": "nic0", "network": {"$ref": "formae://network1-ksuid#/selfLink", "$value": "network-1", "$applied": "network-1"}, "subnetwork": {"$ref": "formae://subnet1-ksuid#/selfLink", "$value": "subnet-1", "$applied": "subnet-1"}}
+		]
+	}`
+
+	resourceUpdate := &ResourceUpdate{
+		Operation: OperationCreate,
+		State:     ResourceUpdateStateNotStarted,
+		DesiredState: pkgmodel.Resource{
+			Properties: json.RawMessage(userProps),
+			Schema:     pkgmodel.Schema{Fields: []string{"name", "networkInterfaces"}},
+		},
+	}
+
+	progress := &plugin.TrackedProgress{
+		ProgressResult: resource.ProgressResult{
+			Operation:          resource.OperationCreate,
+			OperationStatus:    resource.OperationStatusSuccess,
+			RequestID:          "test-request",
+			ResourceProperties: json.RawMessage(pluginProps),
+		},
+		StartTs:     util.TimeNow(),
+		ModifiedTs:  util.TimeNow().Add(10 * time.Second),
+		MaxAttempts: 3,
+	}
+
+	err := resourceUpdate.RecordProgress(progress)
+	require.NoError(t, err)
+	assert.Equal(t, ResourceUpdateStateSuccess, resourceUpdate.State)
+	assert.JSONEq(t, expectedProps, string(resourceUpdate.DesiredState.Properties))
+}
+
+// A $gen envelope echoed back by a plugin as a structured object (a provider
+// that round-trips resolvables, mirroring how a $res echo is handled) must
+// have its stale $hashed marker dropped once a fresh plaintext value is
+// adopted. Without a dedicated dispatch, mergeObject falls through to the
+// generic recursive field merge: mergePrimitive only rewrites a leaf when the
+// plugin's root document lacks that exact path, so "$value" (which the
+// plugin's echo does carry) is correctly absorbed by coincidence, but
+// "$hashed" (which the echo does NOT carry) is copied back from the user's
+// stored copy verbatim — leaving $hashed:true sitting next to a plaintext
+// $value. The persist transformer's idempotency guard then skips re-hashing
+// it, persisting the generated secret in cleartext while claiming it is
+// hashed.
+func Test_mergeRefsPreservingUserRefs_GenEnvelope_DropsStaleHashedOnFreshEcho(t *testing.T) {
+	oldHash := pkgmodel.ComputeValueHash("old-generated-value")
+	userProps := []byte(`{
+        "Password": {"$gen":true,"$generator":"2ABcDeFgHiJkLmNoPqRsTuVwXyZ","$output":"value","$visibility":"Opaque","$hashed":true,"$value":"` + oldHash + `"}
+    }`)
+	// The plugin echoes the envelope back with a fresh plaintext $value and no
+	// $hashed marker of its own — it has no notion of our at-rest hashing.
+	pluginProps := []byte(`{
+        "Password": {"$gen":true,"$generator":"2ABcDeFgHiJkLmNoPqRsTuVwXyZ","$output":"value","$visibility":"Opaque","$value":"fresh-plaintext-generated-value"}
+    }`)
+
+	merged, err := mergeRefsPreservingUserRefs(userProps, pluginProps, pkgmodel.Schema{}, false, nil)
+	require.NoError(t, err)
+
+	var mergedMap map[string]any
+	require.NoError(t, json.Unmarshal(merged, &mergedMap))
+
+	password, ok := mergedMap["Password"].(map[string]any)
+	require.True(t, ok, "Password must remain a $gen envelope")
+	assert.Equal(t, true, password["$gen"])
+	assert.Equal(t, "2ABcDeFgHiJkLmNoPqRsTuVwXyZ", password["$generator"], "$generator must be preserved")
+	assert.Equal(t, "fresh-plaintext-generated-value", password["$value"],
+		"the plugin's freshly echoed value must be absorbed onto the envelope")
+	_, hasHashed := password["$hashed"]
+	assert.False(t, hasHashed,
+		"a stale $hashed marker must not survive a fresh plaintext echo — the persist transformer must re-hash it")
+}
+
+// A $gen envelope whose stored copy already carries a hashed value and whose
+// plugin echo comes back empty (no ResourceProperties, or a Read-shaped merge
+// that never touched this field) must retain the stored hash: no
+// hash-of-hash, and the envelope is not corrupted into a bare scalar.
+func Test_mergeRefsPreservingUserRefs_GenEnvelope_EmptyPluginEchoPreservesHash(t *testing.T) {
+	storedHash := pkgmodel.ComputeValueHash("v1")
+	userProps := []byte(`{
+        "Password": {"$gen":true,"$generator":"2ABcDeFgHiJkLmNoPqRsTuVwXyZ","$output":"value","$hashed":true,"$value":"` + storedHash + `","$visibility":"Opaque"}
+    }`)
+	pluginProps := []byte(`{}`)
+
+	merged, err := mergeRefsPreservingUserRefs(userProps, pluginProps, pkgmodel.Schema{}, false, nil)
+	require.NoError(t, err)
+
+	var mergedMap map[string]any
+	require.NoError(t, json.Unmarshal(merged, &mergedMap))
+
+	password, ok := mergedMap["Password"].(map[string]any)
+	require.True(t, ok, "Password must remain a $gen envelope")
+	assert.Equal(t, storedHash, password["$value"],
+		"stored hash must be retained when the plugin echo carries nothing")
+	assert.Equal(t, true, password["$hashed"],
+		"$hashed must be retained (no hash-of-hash)")
+}
+
+// A plugin echo of explicit JSON null at the $gen's own path (as opposed to
+// the key being absent, which the sibling test above covers) must be treated
+// the same as "nothing usable was returned": the stored hash is retained,
+// not clobbered.
+func Test_mergeRefsPreservingUserRefs_GenEnvelope_NullPluginEchoPreservesHash(t *testing.T) {
+	storedHash := pkgmodel.ComputeValueHash("v1")
+	userProps := []byte(`{
+        "Password": {"$gen":true,"$generator":"2ABcDeFgHiJkLmNoPqRsTuVwXyZ","$output":"value","$hashed":true,"$value":"` + storedHash + `","$visibility":"Opaque"}
+    }`)
+	pluginProps := []byte(`{"Password": null}`)
+
+	merged, err := mergeRefsPreservingUserRefs(userProps, pluginProps, pkgmodel.Schema{}, false, nil)
+	require.NoError(t, err)
+
+	var mergedMap map[string]any
+	require.NoError(t, json.Unmarshal(merged, &mergedMap))
+
+	password, ok := mergedMap["Password"].(map[string]any)
+	require.True(t, ok, "Password must remain a $gen envelope")
+	assert.Equal(t, storedHash, password["$value"],
+		"stored hash must be retained when the plugin echoes explicit null")
+	assert.Equal(t, true, password["$hashed"],
+		"$hashed must be retained (no hash-of-hash)")
+}
+
+// A plugin echo of an empty string at the $gen's own path must likewise be
+// treated as "nothing usable was returned": the stored hash is retained, not
+// clobbered by an empty value.
+func Test_mergeRefsPreservingUserRefs_GenEnvelope_EmptyStringPluginEchoPreservesHash(t *testing.T) {
+	storedHash := pkgmodel.ComputeValueHash("v1")
+	userProps := []byte(`{
+        "Password": {"$gen":true,"$generator":"2ABcDeFgHiJkLmNoPqRsTuVwXyZ","$output":"value","$hashed":true,"$value":"` + storedHash + `","$visibility":"Opaque"}
+    }`)
+	pluginProps := []byte(`{"Password": ""}`)
+
+	merged, err := mergeRefsPreservingUserRefs(userProps, pluginProps, pkgmodel.Schema{}, false, nil)
+	require.NoError(t, err)
+
+	var mergedMap map[string]any
+	require.NoError(t, json.Unmarshal(merged, &mergedMap))
+
+	password, ok := mergedMap["Password"].(map[string]any)
+	require.True(t, ok, "Password must remain a $gen envelope")
+	assert.Equal(t, storedHash, password["$value"],
+		"stored hash must be retained when the plugin echoes an empty string")
+	assert.Equal(t, true, password["$hashed"],
+		"$hashed must be retained (no hash-of-hash)")
+}
